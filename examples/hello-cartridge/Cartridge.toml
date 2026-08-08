@@ -14,3 +14,4 @@ assets = true
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864
+timeout_ms = 30000

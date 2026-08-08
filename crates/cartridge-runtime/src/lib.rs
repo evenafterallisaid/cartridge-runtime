@@ -1,16 +1,18 @@
 mod host;
-mod trace;
 
-use std::path::Path;
+use std::{path::Path, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use cartridge_core::CartridgeArchive;
-use host::HostState;
-pub use trace::{
-    CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceEvent, TraceResult,
+pub use cartridge_trace::{
+    CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,
+    TraceEvent, TraceIdentity, TraceResult, TraceSummary,
 };
+use host::HostState;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
+
+const EPOCH_TICK_MS: u64 = 10;
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -25,8 +27,12 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
-        config.wasm_component_model(true).consume_fuel(true);
+        config
+            .wasm_component_model(true)
+            .consume_fuel(true)
+            .epoch_interruption(true);
         let engine = Engine::new(&config)?;
+        start_epoch_ticker(&engine)?;
         Ok(Self { engine })
     }
 
@@ -55,7 +61,7 @@ impl Runtime {
         args: &[String],
         trace: ExecutionTrace,
     ) -> Result<RunReport> {
-        trace.validate_invocation(&archive.manifest, args)?;
+        trace.validate_invocation(trace_identity(&archive.manifest), args)?;
         self.execute(archive, args, Some(trace))
     }
 
@@ -80,6 +86,7 @@ impl Runtime {
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(manifest.runtime.fuel)?;
+        store.set_epoch_deadline(timeout_ticks(manifest.runtime.timeout_ms));
 
         let instance = Cartridge::instantiate(&mut store, &component, &linker)
             .map_err(|error| anyhow!("the component could not be instantiated: {error}"))?;
@@ -100,13 +107,48 @@ impl Runtime {
             expected.compare(&trace_result)?;
         }
 
-        let trace = ExecutionTrace::new(&manifest, args, state.events, trace_result);
+        let trace = ExecutionTrace::new(
+            env!("CARGO_PKG_VERSION"),
+            trace_identity(&manifest),
+            args,
+            state.events,
+            trace_result,
+        );
         Ok(RunReport {
             cartridge: manifest.cartridge,
             output,
             fuel_consumed,
             trace,
         })
+    }
+}
+
+fn start_epoch_ticker(engine: &Engine) -> Result<()> {
+    let engine = engine.weak();
+    thread::Builder::new()
+        .name("cartridge-epoch".into())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
+                let Some(engine) = engine.upgrade() else {
+                    break;
+                };
+                engine.increment_epoch();
+            }
+        })
+        .context("could not start the runtime deadline thread")?;
+    Ok(())
+}
+
+fn timeout_ticks(timeout_ms: u64) -> u64 {
+    timeout_ms.div_ceil(EPOCH_TICK_MS)
+}
+
+fn trace_identity(manifest: &cartridge_core::PackageManifest) -> TraceIdentity<'_> {
+    TraceIdentity {
+        cartridge_id: &manifest.cartridge.id,
+        cartridge_version: &manifest.cartridge.version,
+        component_sha256: &manifest.integrity.component_sha256,
     }
 }
 
@@ -121,4 +163,38 @@ pub struct RunReport {
     pub output: String,
     pub fuel_consumed: u64,
     pub trace: ExecutionTrace,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_is_rounded_up_to_the_next_epoch() {
+        assert_eq!(timeout_ticks(1), 1);
+        assert_eq!(timeout_ticks(10), 1);
+        assert_eq!(timeout_ticks(11), 2);
+    }
+
+    #[test]
+    fn epoch_deadline_interrupts_compute() {
+        let runtime = Runtime::new().unwrap();
+        let module = wasmtime::Module::new(
+            &runtime.engine,
+            "(module (func (export \"spin\") (loop br 0)))",
+        )
+        .unwrap();
+        let mut store = Store::new(&runtime.engine, ());
+        store.set_fuel(u64::MAX).unwrap();
+        store.set_epoch_deadline(1);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+
+        let error = spin.call(&mut store, ()).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("interrupt"), "{message}");
+    }
 }

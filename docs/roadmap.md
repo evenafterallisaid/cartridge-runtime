@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: the 0.1 vertical slice is complete and the first 0.2 replay implementation is working locally. Release labels here describe compatibility milestones, not published versions.
+Current development state: the 0.1 vertical slice and 0.2 replay milestone are implemented. Runtime work is moving into 0.3 storage. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -704,12 +704,15 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Finish trace replay and first-divergence reporting.
-2. Move trace types into a dedicated crate once the format stabilizes.
-3. Add an epoch deadline so fuel is not the only interruption mechanism.
-4. Implement scoped key/value storage with an in-memory test backend.
-5. Add package-wide Merkle-style asset integrity.
-6. Create a minimal 2D window and input prototype behind new WIT packages.
-7. Build a small trace viewer after there is enough real trace data to design around.
+1. Implement scoped key/value storage with an in-memory test backend.
+2. Add package-wide Merkle-style asset integrity.
+3. Create a minimal 2D window and input prototype behind new WIT packages.
+4. Build a small trace viewer after there is enough real trace data to design around.
+
+Completed foundations:
+
+- trace replay and first-divergence reporting
+- standalone trace types, validation, summaries, and comparison
+- epoch deadlines alongside deterministic fuel limits
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

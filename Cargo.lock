@@ -187,6 +187,7 @@ dependencies = [
  "anyhow",
  "cartridge-core",
  "cartridge-runtime",
+ "cartridge-trace",
  "clap",
  "serde_json",
 ]
@@ -212,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cartridge-core",
+ "cartridge-trace",
  "hex",
  "rand",
  "serde",
@@ -220,6 +222,15 @@ dependencies = [
  "thiserror 2.0.20",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "cartridge-trace"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

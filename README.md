@@ -9,9 +9,10 @@ The project is deliberately small at this stage: it proves the complete path fro
 - WebAssembly Component Model guests built against a versioned WIT contract
 - Reproducible `.cartridge` packages with SHA-256 component verification
 - Manifest-declared clock, randomness, and packaged-asset capabilities
-- Fuel and linear-memory limits set by each cartridge manifest
-- `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, and `replay` commands
+- Fuel, linear-memory, and wall-time limits set by each cartridge manifest
+- `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
 - Deterministic trace recording, replay, and first-divergence detection
+- Standalone trace validation, summaries, and trace-to-trace diffing
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -43,6 +44,8 @@ cargo run -p cartridge-cli -- verify dist/hello.cartridge
 cargo run -p cartridge-cli -- deps dist/hello.cartridge
 cargo run -p cartridge-cli -- resolve dist/hello.cartridge
 cargo run -p cartridge-cli -- run dist/hello.cartridge --trace dist/hello.trace.json -- Clyde
+cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
+cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 ```
 
@@ -58,7 +61,8 @@ The initial API is intentionally narrow. Filesystem directories, network sockets
 
 ```text
 crates/cartridge-core/      package format, validation, and packing
-crates/cartridge-runtime/   Wasmtime host, permissions, limits, and traces
+crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
+crates/cartridge-trace/     versioned trace model, validation, and comparison
 crates/cartridge-cli/       pack, inspect, and run commands
 examples/hello-cartridge/   minimal Rust component and packaged asset
 wit/                        public guest/host contract

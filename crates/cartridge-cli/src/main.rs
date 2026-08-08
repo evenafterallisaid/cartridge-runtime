@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
-use cartridge_runtime::{ExecutionTrace, Runtime};
+use cartridge_runtime::Runtime;
+use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -67,6 +68,28 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// inspect and compare execution traces
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TraceCommand {
+    /// validate a trace and show its execution summary
+    Inspect {
+        trace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// find the first difference between two traces
+    Diff {
+        left: PathBuf,
+        right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -95,6 +118,10 @@ fn main() -> Result<()> {
             trace,
             args,
         } => replay_command(&package, &trace, &args),
+        Command::Trace { command } => match command {
+            TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
+            TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
+        },
     }
 }
 
@@ -192,10 +219,7 @@ fn run_command(package: &Path, trace: Option<&Path>, args: &[String]) -> Result<
 }
 
 fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
-    let bytes =
-        fs::read(trace).with_context(|| format!("could not read trace {}", trace.display()))?;
-    let trace: ExecutionTrace = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid trace {}", trace.display()))?;
+    let trace = read_trace(trace)?;
     let event_count = trace.events.len();
     let report = Runtime::new()?.replay_file(package, args, trace)?;
     println!("{}", report.output);
@@ -203,6 +227,86 @@ fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
         "replay matched {event_count} event(s), {} fuel",
         report.fuel_consumed
     );
+    Ok(())
+}
+
+fn trace_inspect_command(trace: &Path, json: bool) -> Result<()> {
+    let trace = read_trace(trace)?;
+    let summary = trace.summary();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    println!("{} {}", summary.cartridge_id, summary.cartridge_version);
+    println!("trace format: {}", summary.format_version);
+    println!("runtime: {}", summary.runtime_version);
+    println!("component sha256: {}", summary.component_sha256);
+    println!("args: {}", serde_json::to_string(&summary.args)?);
+    println!("events: {}", summary.event_count);
+    if summary.capabilities.is_empty() {
+        println!("capabilities: none");
+    } else {
+        println!("capabilities:");
+        for (capability, count) in summary.capabilities {
+            println!("  {capability}: {count}");
+        }
+    }
+    println!("output: {:?}", summary.result.output);
+    println!("fuel consumed: {}", summary.result.fuel_consumed);
+    Ok(())
+}
+
+fn trace_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
+    let left = read_trace(left)?;
+    let right = read_trace(right)?;
+    let comparison = left.compare(&right);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+        return Ok(());
+    }
+
+    if comparison.identical {
+        println!("traces are identical");
+    } else if let Some(difference) = comparison.difference {
+        print_trace_difference(&difference)?;
+    }
+    Ok(())
+}
+
+fn read_trace(path: &Path) -> Result<ExecutionTrace> {
+    let bytes =
+        fs::read(path).with_context(|| format!("could not read trace {}", path.display()))?;
+    let trace: ExecutionTrace = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid trace {}", path.display()))?;
+    trace
+        .validate()
+        .with_context(|| format!("invalid trace {}", path.display()))?;
+    Ok(trace)
+}
+
+fn print_trace_difference(difference: &TraceDifference) -> Result<()> {
+    match difference {
+        TraceDifference::Header { field, left, right } => {
+            println!("header differs at {field}");
+            println!("  left:  {}", serde_json::to_string(left)?);
+            println!("  right: {}", serde_json::to_string(right)?);
+        }
+        TraceDifference::Event {
+            sequence,
+            left,
+            right,
+        } => {
+            println!("first event difference at sequence {sequence}");
+            println!("  left:  {}", serde_json::to_string(left)?);
+            println!("  right: {}", serde_json::to_string(right)?);
+        }
+        TraceDifference::Result { field, left, right } => {
+            println!("result differs at {field}");
+            println!("  left:  {}", serde_json::to_string(left)?);
+            println!("  right: {}", serde_json::to_string(right)?);
+        }
+    }
     Ok(())
 }
 
@@ -220,6 +324,7 @@ fn print_manifest(archive: &CartridgeArchive) {
     );
     println!("fuel: {}", manifest.runtime.fuel);
     println!("memory: {} bytes", manifest.runtime.memory_bytes);
+    println!("timeout: {} ms", manifest.runtime.timeout_ms);
     println!("component sha256: {}", manifest.integrity.component_sha256);
     println!("dependencies: {}", manifest.dependencies.len());
     println!("provided services: {}", manifest.services.provides.len());

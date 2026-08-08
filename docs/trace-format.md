@@ -37,6 +37,18 @@ During execution, clock and random calls take their results from the next trace 
 
 Replay also fails when execution produces an extra event, leaves recorded events unused, changes its final output, or consumes a different amount of fuel.
 
+## Inspection and comparison
+
+Trace tooling does not compile or execute the cartridge:
+
+```sh
+cartridge trace inspect run.trace.json
+cartridge trace inspect run.trace.json --json
+cartridge trace diff first.trace.json second.trace.json
+```
+
+Inspection validates the header, component digest, zero-based event sequence, and capability labels before producing a summary. Comparison reports one difference at a time in execution order: invocation identity, the first changed event, then the final output or fuel use. The same comparison is available as structured JSON for future debugger and editor integrations.
+
 ## Compatibility
 
 The trace format is versioned independently from the cartridge archive and WIT API. A runtime must reject trace versions it does not understand. Additive fields are not silently ignored in v2 because traces are debugger inputs and accidental ambiguity is worse than an explicit conversion step.

@@ -3,6 +3,7 @@ members = [
     "crates/cartridge-cli",
     "crates/cartridge-core",
     "crates/cartridge-runtime",
+    "crates/cartridge-trace",
 ]
 exclude = ["examples/hello-cartridge"]
 resolver = "2"

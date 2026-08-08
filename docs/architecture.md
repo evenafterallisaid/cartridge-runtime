@@ -10,7 +10,7 @@ The current execution path is:
 .cartridge archive
   -> parse and validate manifest
   -> verify component and asset digests
-  -> configure permissions and limits
+  -> configure permissions, memory, fuel, and epoch deadline
   -> instantiate component with Wasmtime
   -> route WIT imports through HostState
   -> record events or inject and compare replay events
@@ -23,6 +23,8 @@ The component is untrusted. The host validates all paths, bounds random-data req
 WASI is linked for language-runtime compatibility, but it is not the cartridge permission model. The context has no terminal, environment, arguments, or preopened directories, and its network interfaces are disabled. When clock or randomness permission is absent, the corresponding WASI services use inert deterministic providers instead of host state. Cartridges should use `cartridge:api/host` when they need observable, traceable capability results.
 
 The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifests, unexpected component names, oversized files, and digest mismatches are rejected before execution.
+
+Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline, so a component blocked in compute cannot avoid interruption simply because its fuel budget is large. Epoch timing is deliberately coarse and is not part of deterministic replay.
 
 The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, while the host controls which imports are linked. A security review, signed packages, cache isolation, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.
 
@@ -54,6 +56,8 @@ The manifest and direct resolver are implemented. Live multi-instance wiring and
 ## Tracing and replay
 
 Every call through the cartridge capability API receives a monotonically increasing sequence number. Trace format v2 binds the recording to a component digest and argument list. During replay, nondeterministic clock and random results come from the trace; deterministic calls are recomputed and compared. Output, fuel usage, missing events, and extra events are checked after execution.
+
+Trace types live in `cartridge-trace`, which does not depend on Wasmtime or the package reader. This lets the CLI and future debugger validate, summarize, and compare recordings without loading executable code.
 
 Replay currently works at capability boundaries. The next debugger layer will add linear-memory checkpoints and state hashes, which are needed for reverse stepping inside longer executions.
 

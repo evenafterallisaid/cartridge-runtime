@@ -29,9 +29,10 @@ assets = true
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864
+timeout_ms = 30000
 ```
 
-The packer supplies the integrity block. Cartridge IDs use reverse-domain notation and versions follow Semantic Versioning.
+The packer supplies the integrity block. Cartridge IDs use reverse-domain notation and versions follow Semantic Versioning. Runtime limits include an instruction budget, a linear-memory ceiling, and a wall-time deadline between 1 millisecond and 5 minutes.
 
 ## Relationships
 

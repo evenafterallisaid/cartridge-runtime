@@ -12,7 +12,9 @@ pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
 const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +62,11 @@ impl PackageManifest {
                 MAX_MEMORY_BYTES / 1024 / 1024
             )));
         }
+        if !(1..=MAX_TIMEOUT_MS).contains(&self.runtime.timeout_ms) {
+            return Err(Error::Manifest(format!(
+                "runtime timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
+            )));
+        }
 
         if !self.integrity.component_sha256.is_empty()
             && !is_sha256(&self.integrity.component_sha256)
@@ -105,6 +112,7 @@ pub struct Permissions {
 pub struct RuntimeLimits {
     pub fuel: u64,
     pub memory_bytes: usize,
+    pub timeout_ms: u64,
 }
 
 impl Default for RuntimeLimits {
@@ -112,6 +120,7 @@ impl Default for RuntimeLimits {
         Self {
             fuel: DEFAULT_FUEL,
             memory_bytes: DEFAULT_MEMORY_BYTES,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
         }
     }
 }
@@ -383,6 +392,13 @@ mod tests {
     fn rejects_unbounded_memory() {
         let mut value = manifest();
         value.runtime.memory_bytes = usize::MAX;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_wall_time() {
+        let mut value = manifest();
+        value.runtime.timeout_ms = MAX_TIMEOUT_MS + 1;
         assert!(value.validate().is_err());
     }
 
