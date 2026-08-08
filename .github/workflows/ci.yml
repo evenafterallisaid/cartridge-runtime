@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test host
+        run: cargo test --workspace
+
+      - name: Build example component
+        run: cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
+
+      - name: Run end-to-end example
+        shell: bash
+        run: |
+          cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --assets examples/hello-cartridge/assets --output hello.cartridge
+          cargo run -p cartridge-cli -- inspect hello.cartridge
+          cargo run -p cartridge-cli -- verify hello.cartridge
+          cargo run -p cartridge-cli -- deps hello.cartridge
+          cargo run -p cartridge-cli -- resolve hello.cartridge
+          cargo run -p cartridge-cli -- run hello.cartridge --trace hello.trace.json -- CI
+          cargo run -p cartridge-cli -- replay hello.cartridge hello.trace.json -- CI

@@ -1,0 +1,19 @@
+package cartridge:api@0.1.0;
+
+interface host {
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    log: func(level: log-level, message: string);
+    wall-clock-ms: func() -> result<u64, string>;
+    random-bytes: func(length: u32) -> result<list<u8>, string>;
+    read-asset: func(path: string) -> result<list<u8>, string>;
+}
+world cartridge {
+    import host;
+    export run: func(args: list<string>) -> result<string, string>;
+}

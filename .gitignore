@@ -1,0 +1,8 @@
+target/
+/dist/
+*.cartridge
+*.trace.json
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
