@@ -8,11 +8,12 @@ The project is deliberately small at this stage: it proves the complete path fro
 
 - WebAssembly Component Model guests built against a versioned WIT contract
 - Reproducible `.cartridge` packages with SHA-256 component verification
-- Manifest-declared clock, randomness, and packaged-asset capabilities
+- Manifest-declared clock, randomness, packaged-asset, and scoped-storage capabilities
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
 - Deterministic trace recording, replay, and first-divergence detection
 - Standalone trace validation, summaries, and trace-to-trace diffing
+- Namespaced key/value storage with atomic quota checks and deterministic replay
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -62,6 +63,7 @@ The initial API is intentionally narrow. Filesystem directories, network sockets
 ```text
 crates/cartridge-core/      package format, validation, and packing
 crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
+crates/cartridge-storage/   isolated storage contract and in-memory backend
 crates/cartridge-trace/     versioned trace model, validation, and comparison
 crates/cartridge-cli/       pack, inspect, and run commands
 examples/hello-cartridge/   minimal Rust component and packaged asset
@@ -69,7 +71,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 

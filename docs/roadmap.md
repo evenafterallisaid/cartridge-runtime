@@ -111,13 +111,28 @@ Purpose: let useful applications remember data without exposing arbitrary files.
 Work:
 
 - key/value interface for settings and small state
+- opaque per-cartridge namespaces selected by the runtime
+- total-byte, key-count, and per-value quotas
+- ephemeral storage for tests
+- storage events in replay traces
+- replay reads from the trace without mutating live state
+- deterministic key listing
 - content-addressed blob interface for larger data
 - per-cartridge storage directories owned by the runtime
-- quotas, atomic writes, and migration hooks
-- ephemeral storage for tests
-- snapshot and restore commands
-- storage events in replay traces
-- deterministic test backend
+- crash-safe atomic writes and recovery
+- versioned migrations with dry runs and rollback points
+- portable snapshot, inspect, diff, and restore commands
+- optional snapshot encryption and redaction rules
+
+Delivery slices:
+
+1. In-memory key/value contract, namespace isolation, quotas, guest bindings, and replay semantics.
+2. Durable directory backend with locking, atomic replacement, corruption detection, and recovery tests on every CI platform.
+3. Canonical snapshot format with content digests, CLI export/import, and transactional restore.
+4. Migration plans that run against a temporary snapshot before committing changes.
+5. Content-addressed blobs, garbage collection, and references from key/value records.
+
+The first slice is implemented. The runtime deliberately does not pretend that ephemeral memory is persistence; CLI invocations will gain durable state only after the second slice passes crash-recovery tests.
 
 Exit criteria:
 
@@ -704,15 +719,17 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Implement scoped key/value storage with an in-memory test backend.
-2. Add package-wide Merkle-style asset integrity.
-3. Create a minimal 2D window and input prototype behind new WIT packages.
-4. Build a small trace viewer after there is enough real trace data to design around.
+1. Implement the durable storage backend and crash-recovery harness.
+2. Define the portable storage snapshot format and CLI commands.
+3. Add package-wide Merkle-style asset integrity.
+4. Create a minimal 2D window and input prototype behind new WIT packages.
+5. Build a small trace viewer after there is enough real trace data to design around.
 
 Completed foundations:
 
 - trace replay and first-divergence reporting
 - standalone trace types, validation, summaries, and comparison
 - epoch deadlines alongside deterministic fuel limits
+- isolated in-memory storage with quotas and side-effect-free replay
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

@@ -1,9 +1,10 @@
 mod host;
 
-use std::{path::Path, thread, time::Duration};
+use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use cartridge_core::CartridgeArchive;
+pub use cartridge_storage::{MemoryStorage, StorageBackend, StorageLimits, StorageUsage};
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,
     TraceEvent, TraceIdentity, TraceResult, TraceSummary,
@@ -22,10 +23,15 @@ wasmtime::component::bindgen!({
 #[derive(Debug)]
 pub struct Runtime {
     engine: Engine,
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl Runtime {
     pub fn new() -> Result<Self> {
+        Self::with_storage(Arc::new(MemoryStorage::new()))
+    }
+
+    pub fn with_storage(storage: Arc<dyn StorageBackend>) -> Result<Self> {
         let mut config = Config::new();
         config
             .wasm_component_model(true)
@@ -33,7 +39,7 @@ impl Runtime {
             .epoch_interruption(true);
         let engine = Engine::new(&config)?;
         start_epoch_ticker(&engine)?;
-        Ok(Self { engine })
+        Ok(Self { engine, storage })
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>, args: &[String]) -> Result<RunReport> {
@@ -82,7 +88,12 @@ impl Runtime {
         let expected_events = replay.map(|trace| trace.events);
         let mut store = Store::new(
             &self.engine,
-            HostState::new(&manifest, archive.assets, expected_events),
+            HostState::new(
+                &manifest,
+                archive.assets,
+                self.storage.clone(),
+                expected_events,
+            ),
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(manifest.runtime.fuel)?;

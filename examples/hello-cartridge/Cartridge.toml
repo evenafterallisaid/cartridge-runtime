@@ -10,8 +10,12 @@ description = "small end-to-end example cartridge"
 clock = true
 random = false
 assets = true
+storage = true
 
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864
 timeout_ms = 30000
+storage_bytes = 1048576
+storage_keys = 1024
+storage_value_bytes = 262144

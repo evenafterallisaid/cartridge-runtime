@@ -22,7 +22,7 @@ A trace is an executable record of one cartridge invocation. It identifies the e
 
 Each event receives a zero-based sequence number. An event contains a capability name, an operation name, and the value observable by the guest. Clock and random values are stored in full because replay must return the same inputs without consulting the live host.
 
-Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host.
+Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so replay does not consult live state; writes and deletes record their inputs and result without being applied again during replay.
 
 ## Replay
 
@@ -57,4 +57,4 @@ Runtime upgrades may change fuel accounting or capability behavior. A future tra
 
 ## Privacy
 
-Traces can contain command arguments, logs, random bytes, network responses, input events, and future storage results. They must be treated as potentially sensitive diagnostic files. Redaction and encrypted crash bundles are required before traces are convenient to share publicly.
+Traces can contain command arguments, logs, random bytes, storage values, network responses, and input events. They must be treated as potentially sensitive diagnostic files. Redaction and encrypted crash bundles are required before traces are convenient to share publicly.

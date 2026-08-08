@@ -12,8 +12,13 @@ pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
 const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_STORAGE_BYTES: usize = 1024 * 1024;
+const DEFAULT_STORAGE_KEYS: usize = 1024;
+const DEFAULT_STORAGE_VALUE_BYTES: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_STORAGE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_STORAGE_KEYS: usize = 100_000;
 const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +72,24 @@ impl PackageManifest {
                 "runtime timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
             )));
         }
+        if !(1..=MAX_STORAGE_BYTES).contains(&self.runtime.storage_bytes) {
+            return Err(Error::Manifest(format!(
+                "runtime storage_bytes must be between 1 and {MAX_STORAGE_BYTES}"
+            )));
+        }
+        if !(1..=MAX_STORAGE_KEYS).contains(&self.runtime.storage_keys) {
+            return Err(Error::Manifest(format!(
+                "runtime storage_keys must be between 1 and {MAX_STORAGE_KEYS}"
+            )));
+        }
+        if self.runtime.storage_value_bytes == 0
+            || self.runtime.storage_value_bytes > self.runtime.storage_bytes
+        {
+            return Err(Error::Manifest(
+                "runtime storage_value_bytes must be positive and no larger than storage_bytes"
+                    .into(),
+            ));
+        }
 
         if !self.integrity.component_sha256.is_empty()
             && !is_sha256(&self.integrity.component_sha256)
@@ -101,10 +124,12 @@ pub struct CartridgeMetadata {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Permissions {
     pub clock: bool,
     pub random: bool,
     pub assets: bool,
+    pub storage: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,6 +138,9 @@ pub struct RuntimeLimits {
     pub fuel: u64,
     pub memory_bytes: usize,
     pub timeout_ms: u64,
+    pub storage_bytes: usize,
+    pub storage_keys: usize,
+    pub storage_value_bytes: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -121,6 +149,9 @@ impl Default for RuntimeLimits {
             fuel: DEFAULT_FUEL,
             memory_bytes: DEFAULT_MEMORY_BYTES,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            storage_bytes: DEFAULT_STORAGE_BYTES,
+            storage_keys: DEFAULT_STORAGE_KEYS,
+            storage_value_bytes: DEFAULT_STORAGE_VALUE_BYTES,
         }
     }
 }
@@ -399,6 +430,14 @@ mod tests {
     fn rejects_unbounded_wall_time() {
         let mut value = manifest();
         value.runtime.timeout_ms = MAX_TIMEOUT_MS + 1;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_storage_value_limit_larger_than_the_quota() {
+        let mut value = manifest();
+        value.runtime.storage_bytes = 8;
+        value.runtime.storage_value_bytes = 9;
         assert!(value.validate().is_err());
     }
 

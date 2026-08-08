@@ -24,6 +24,8 @@ WASI is linked for language-runtime compatibility, but it is not the cartridge p
 
 The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifests, unexpected component names, oversized files, and digest mismatches are rejected before execution.
 
+Storage backends receive the validated cartridge id as an opaque namespace. Guests never choose a namespace or receive a host path. Per-value, key-count, and total-byte limits are checked before a write changes state. The current in-memory backend is deterministic and primarily intended for tests; it defines the same contract future durable backends must preserve.
+
 Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline, so a component blocked in compute cannot avoid interruption simply because its fuel budget is large. Epoch timing is deliberately coarse and is not part of deterministic replay.
 
 The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, while the host controls which imports are linked. A security review, signed packages, cache isolation, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.

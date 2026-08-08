@@ -319,12 +319,21 @@ fn print_manifest(archive: &CartridgeArchive) {
     }
     println!("assets: {}", archive.assets.len());
     println!(
-        "permissions: clock={}, random={}, assets={}",
-        manifest.permissions.clock, manifest.permissions.random, manifest.permissions.assets
+        "permissions: clock={}, random={}, assets={}, storage={}",
+        manifest.permissions.clock,
+        manifest.permissions.random,
+        manifest.permissions.assets,
+        manifest.permissions.storage
     );
     println!("fuel: {}", manifest.runtime.fuel);
     println!("memory: {} bytes", manifest.runtime.memory_bytes);
     println!("timeout: {} ms", manifest.runtime.timeout_ms);
+    println!("storage quota: {} bytes", manifest.runtime.storage_bytes);
+    println!("storage keys: {}", manifest.runtime.storage_keys);
+    println!(
+        "storage value limit: {} bytes",
+        manifest.runtime.storage_value_bytes
+    );
     println!("component sha256: {}", manifest.integrity.component_sha256);
     println!("dependencies: {}", manifest.dependencies.len());
     println!("provided services: {}", manifest.services.provides.len());

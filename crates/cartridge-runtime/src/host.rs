@@ -1,9 +1,13 @@
+mod storage;
+
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use cartridge_core::{PackageManifest, Permissions};
+use cartridge_storage::{StorageBackend, StorageLimits};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -25,6 +29,9 @@ pub(crate) struct HostState {
     pub(crate) limits: StoreLimits,
     permissions: Permissions,
     assets: BTreeMap<String, Vec<u8>>,
+    storage: Arc<dyn StorageBackend>,
+    storage_namespace: String,
+    storage_limits: StorageLimits,
     pub(crate) events: Vec<TraceEvent>,
     next_sequence: u64,
     replay: Option<ReplayCursor>,
@@ -35,6 +42,7 @@ impl HostState {
     pub(crate) fn new(
         manifest: &PackageManifest,
         assets: BTreeMap<String, Vec<u8>>,
+        storage: Arc<dyn StorageBackend>,
         replay_events: Option<Vec<TraceEvent>>,
     ) -> Self {
         let mut wasi = WasiCtxBuilder::new();
@@ -60,6 +68,13 @@ impl HostState {
             limits,
             permissions: manifest.permissions.clone(),
             assets,
+            storage,
+            storage_namespace: manifest.cartridge.id.clone(),
+            storage_limits: StorageLimits {
+                max_bytes: manifest.runtime.storage_bytes,
+                max_keys: manifest.runtime.storage_keys,
+                max_value_bytes: manifest.runtime.storage_value_bytes,
+            },
             events: Vec::new(),
             next_sequence: 0,
             replay: replay_events.map(ReplayCursor::new),
@@ -311,6 +326,22 @@ impl cartridge::api::host::Host for HostState {
         );
         Ok(bytes)
     }
+
+    fn storage_get(&mut self, key: String) -> Result<Option<Vec<u8>>, String> {
+        self.get_storage(&key)
+    }
+
+    fn storage_put(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        self.put_storage(&key, &value)
+    }
+
+    fn storage_delete(&mut self, key: String) -> Result<bool, String> {
+        self.delete_storage(&key)
+    }
+
+    fn storage_list(&mut self, prefix: String) -> Result<Vec<String>, String> {
+        self.list_storage(&prefix)
+    }
 }
 
 fn event_label(event: &TraceEvent) -> String {
@@ -334,6 +365,7 @@ fn is_safe_asset_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use cartridge_core::{CartridgeMetadata, Integrity, RuntimeLimits, Services};
+    use cartridge_storage::MemoryStorage;
 
     #[test]
     fn asset_paths_cannot_escape_the_package() {
@@ -345,7 +377,12 @@ mod tests {
 
     #[test]
     fn undeclared_capabilities_are_denied_and_traced() {
-        let mut state = HostState::new(&manifest(Permissions::default()), BTreeMap::new(), None);
+        let mut state = HostState::new(
+            &manifest(Permissions::default()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
 
         let result = cartridge::api::host::Host::random_bytes(&mut state, 8);
 
@@ -369,6 +406,7 @@ mod tests {
         let mut state = HostState::new(
             &manifest(permissions),
             BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
             Some(vec![event.clone()]),
         );
 
@@ -390,6 +428,7 @@ mod tests {
         let mut state = HostState::new(
             &manifest(Permissions::default()),
             BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
             Some(vec![expected]),
         );
 
@@ -417,7 +456,12 @@ mod tests {
             operation: "random-bytes".into(),
             outcome: json!({ "length": 4, "bytes": "01020304" }),
         };
-        let mut state = HostState::new(&manifest(permissions), BTreeMap::new(), Some(vec![event]));
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            Some(vec![event]),
+        );
 
         let bytes = cartridge::api::host::Host::random_bytes(&mut state, 4).unwrap();
 
@@ -436,12 +480,81 @@ mod tests {
         let mut state = HostState::new(
             &manifest(Permissions::default()),
             BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
             Some(vec![event]),
         );
 
         assert_eq!(
             state.finish_replay(),
             Err(ReplayError::EventsRemaining { remaining: 1 })
+        );
+    }
+
+    #[test]
+    fn storage_calls_share_the_cartridge_namespace() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        let mut state = HostState::new(&manifest(permissions), BTreeMap::new(), storage, None);
+
+        cartridge::api::host::Host::storage_put(
+            &mut state,
+            "settings/theme".into(),
+            b"dark".to_vec(),
+        )
+        .unwrap();
+        let value =
+            cartridge::api::host::Host::storage_get(&mut state, "settings/theme".into()).unwrap();
+
+        assert_eq!(value, Some(b"dark".to_vec()));
+        assert_eq!(state.events.len(), 2);
+        assert!(
+            state
+                .events
+                .iter()
+                .all(|event| event.capability == "storage")
+        );
+    }
+
+    #[test]
+    fn storage_replay_does_not_mutate_live_state() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let value = b"dark";
+        let event = TraceEvent {
+            sequence: 0,
+            capability: "storage".into(),
+            operation: "put".into(),
+            outcome: json!({
+                "key": "settings/theme",
+                "length": value.len(),
+                "sha256": hex::encode(Sha256::digest(value)),
+                "stored": true,
+            }),
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            storage.clone(),
+            Some(vec![event]),
+        );
+
+        cartridge::api::host::Host::storage_put(
+            &mut state,
+            "settings/theme".into(),
+            value.to_vec(),
+        )
+        .unwrap();
+
+        state.finish_replay().unwrap();
+        assert_eq!(
+            storage.get("dev.example.host", "settings/theme").unwrap(),
+            None
         );
     }
 

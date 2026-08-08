@@ -213,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cartridge-core",
+ "cartridge-storage",
  "cartridge-trace",
  "hex",
  "rand",
@@ -222,6 +223,14 @@ dependencies = [
  "thiserror 2.0.20",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "cartridge-storage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -12,6 +12,10 @@ interface host {
     wall-clock-ms: func() -> result<u64, string>;
     random-bytes: func(length: u32) -> result<list<u8>, string>;
     read-asset: func(path: string) -> result<list<u8>, string>;
+    storage-get: func(key: string) -> result<option<list<u8>>, string>;
+    storage-put: func(key: string, value: list<u8>) -> result<_, string>;
+    storage-delete: func(key: string) -> result<bool, string>;
+    storage-list: func(prefix: string) -> result<list<string>, string>;
 }
 world cartridge {
     import host;
