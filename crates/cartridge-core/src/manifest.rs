@@ -24,6 +24,9 @@ const MAX_STORAGE_KEYS: usize = 100_000;
 const MAX_STORAGE_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 const MAX_MIGRATIONS: usize = 256;
+const MAX_DEPENDENCIES: usize = 128;
+const MAX_SERVICES: usize = 128;
+const MAX_INTERFACES_PER_DEPENDENCY: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -54,11 +57,13 @@ impl PackageManifest {
         }
 
         validate_id(&self.cartridge.id)?;
-        if self.cartridge.name.trim().is_empty() || self.cartridge.name.chars().count() > 80 {
-            return Err(Error::Manifest(
-                "cartridge name must contain between 1 and 80 characters".into(),
-            ));
-        }
+        validate_human_text(&self.cartridge.name, "cartridge name", 80, false)?;
+        validate_human_text(
+            &self.cartridge.description,
+            "cartridge description",
+            240,
+            true,
+        )?;
         Version::parse(&self.cartridge.version)
             .map_err(|error| Error::Manifest(format!("version must be valid SemVer: {error}")))?;
 
@@ -335,6 +340,16 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 fn validate_relationships(manifest: &PackageManifest) -> Result<()> {
+    if manifest.dependencies.len() > MAX_DEPENDENCIES {
+        return Err(Error::Manifest(format!(
+            "a cartridge cannot declare more than {MAX_DEPENDENCIES} dependencies"
+        )));
+    }
+    if manifest.services.provides.len() > MAX_SERVICES {
+        return Err(Error::Manifest(format!(
+            "a cartridge cannot provide more than {MAX_SERVICES} services"
+        )));
+    }
     let mut aliases = BTreeSet::new();
     let mut dependency_ids = BTreeSet::new();
     for dependency in &manifest.dependencies {
@@ -357,12 +372,13 @@ fn validate_relationships(manifest: &PackageManifest) -> Result<()> {
                 dependency.alias
             )));
         }
-        if dependency.reason.chars().count() > 240 {
+        if dependency.interfaces.len() > MAX_INTERFACES_PER_DEPENDENCY {
             return Err(Error::Manifest(format!(
-                "dependency {} reason cannot exceed 240 characters",
+                "dependency {} cannot request more than {MAX_INTERFACES_PER_DEPENDENCY} interfaces",
                 dependency.alias
             )));
         }
+        validate_human_text(&dependency.reason, "dependency reason", 240, true)?;
         if !aliases.insert(&dependency.alias) {
             return Err(Error::Manifest(format!(
                 "duplicate dependency alias: {}",
@@ -392,12 +408,7 @@ fn validate_relationships(manifest: &PackageManifest) -> Result<()> {
     for service in &manifest.services.provides {
         validate_alias(&service.name, "service name")?;
         validate_interface(&service.interface)?;
-        if service.description.chars().count() > 240 {
-            return Err(Error::Manifest(format!(
-                "service {} description cannot exceed 240 characters",
-                service.name
-            )));
-        }
+        validate_human_text(&service.description, "service description", 240, true)?;
         if !names.insert(&service.name) {
             return Err(Error::Manifest(format!(
                 "duplicate provided service name: {}",
@@ -481,6 +492,18 @@ fn validate_alias(value: &str, field: &str) -> Result<()> {
         || value.ends_with('-')
     {
         return Err(Error::Manifest(format!("invalid {field}: {value:?}")));
+    }
+    Ok(())
+}
+
+fn validate_human_text(value: &str, field: &str, max: usize, allow_empty: bool) -> Result<()> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.chars().count() > max
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::Manifest(format!(
+            "{field} must contain at most {max} printable characters"
+        )));
     }
     Ok(())
 }
@@ -577,6 +600,34 @@ mod tests {
     fn rejects_unbounded_wall_time() {
         let mut value = manifest();
         value.runtime.timeout_ms = MAX_TIMEOUT_MS + 1;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_terminal_control_characters_in_display_text() {
+        let mut value = manifest();
+        value.cartridge.name = "trusted\u{1b}[2J".into();
+
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_description_and_relationship_counts() {
+        let mut value = manifest();
+        value.cartridge.description = "x".repeat(241);
+        assert!(value.validate().is_err());
+
+        value.cartridge.description.clear();
+        value.dependencies = (0..=MAX_DEPENDENCIES)
+            .map(|index| CartridgeDependency {
+                alias: format!("dependency-{index}"),
+                cartridge: format!("dev.example.dependency-{index}"),
+                version: "1".into(),
+                interfaces: vec!["example:service/run@1.0.0".into()],
+                optional: false,
+                reason: String::new(),
+            })
+            .collect();
         assert!(value.validate().is_err());
     }
 

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, Result, StorageBackend, StorageLimits, StorageSnapshot, StorageUsage, validate_key,
+    Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES, Result, StorageBackend,
+    StorageLimits, StorageSnapshot, StorageUsage, validate_entry_limits, validate_key,
     validate_limits, validate_namespace, validate_prefix,
 };
 
@@ -32,7 +33,11 @@ pub struct DirectoryStorage {
 
 impl DirectoryStorage {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        if root.as_ref().exists() {
+            reject_symlink(root.as_ref())?;
+        }
         fs::create_dir_all(root.as_ref())?;
+        reject_symlink(root.as_ref())?;
         Ok(Self {
             root: fs::canonicalize(root.as_ref())?,
         })
@@ -151,9 +156,16 @@ impl DirectoryStorage {
     ) -> Result<T> {
         validate_namespace(namespace)?;
         let directory = self.namespace_directory(namespace);
+        if directory.exists() {
+            reject_symlink(&directory)?;
+        }
         fs::create_dir_all(&directory)?;
+        reject_symlink(&directory)?;
         set_private_directory_permissions(&directory)?;
         let lock_path = directory.join("namespace.lock");
+        if lock_path.exists() {
+            reject_symlink(&lock_path)?;
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -170,6 +182,13 @@ impl DirectoryStorage {
         self.root
             .join(hex::encode(Sha256::digest(namespace.as_bytes())))
     }
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(Error::UnsafePath(path.display().to_string()));
+    }
+    Ok(())
 }
 
 fn acquire_lock(file: &File) -> Result<()> {
@@ -189,7 +208,8 @@ fn acquire_lock(file: &File) -> Result<()> {
 }
 
 impl StorageBackend for DirectoryStorage {
-    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+    fn prepare(&self, namespace: &str, state_schema: u32, limits: StorageLimits) -> Result<()> {
+        validate_limits(limits)?;
         self.with_namespace(namespace, |directory| {
             cleanup_pending(directory)?;
             let mut state = load_state(directory, namespace)?;
@@ -203,6 +223,7 @@ impl StorageBackend for DirectoryStorage {
                     actual: state.schema,
                 });
             }
+            validate_entry_limits(&state.entries, limits)?;
             Ok(())
         })
     }
@@ -466,9 +487,21 @@ fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
 
     let mut entries = BTreeMap::new();
     let mut bytes_used = 0usize;
+    if envelope.payload.entries.len() > MAX_STORAGE_KEYS {
+        return Err(Error::Corrupt(format!(
+            "{} contains too many keys",
+            path.display()
+        )));
+    }
     for (key, encoded) in envelope.payload.entries {
         validate_key(&key)
             .map_err(|_| Error::Corrupt(format!("{} contains an invalid key", path.display())))?;
+        if encoded.len() > MAX_STORAGE_VALUE_BYTES.saturating_mul(2) {
+            return Err(Error::Corrupt(format!(
+                "{} contains an oversized value",
+                path.display()
+            )));
+        }
         let value = hex::decode(encoded).map_err(|error| {
             Error::Corrupt(format!(
                 "{} contains invalid value data: {error}",
@@ -478,6 +511,12 @@ fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
         bytes_used = bytes_used
             .checked_add(value.len())
             .ok_or_else(|| Error::Corrupt(format!("{} has overflowing usage", path.display())))?;
+        if bytes_used > MAX_STORAGE_BYTES {
+            return Err(Error::Corrupt(format!(
+                "{} exceeds the global storage budget",
+                path.display()
+            )));
+        }
         entries.insert(key, value);
     }
     Ok(State {
@@ -661,13 +700,13 @@ mod tests {
     fn state_schema_survives_reopening_the_backend() {
         let directory = TestDirectory::new();
         let storage = DirectoryStorage::open(directory.path()).unwrap();
-        storage.prepare("dev.example.test", 2).unwrap();
+        storage.prepare("dev.example.test", 2, LIMITS).unwrap();
         storage
             .put("dev.example.test", "value", b"kept", LIMITS)
             .unwrap();
 
         let reopened = DirectoryStorage::open(directory.path()).unwrap();
-        reopened.prepare("dev.example.test", 2).unwrap();
+        reopened.prepare("dev.example.test", 2, LIMITS).unwrap();
         assert_eq!(
             reopened
                 .export_snapshot("dev.example.test")
@@ -676,7 +715,7 @@ mod tests {
             2
         );
         assert!(matches!(
-            reopened.prepare("dev.example.test", 3),
+            reopened.prepare("dev.example.test", 3, LIMITS),
             Err(Error::SchemaMismatch {
                 expected: 3,
                 actual: 2
@@ -707,13 +746,13 @@ mod tests {
         )
         .unwrap();
 
-        storage.prepare("dev.example.test", 0).unwrap();
+        storage.prepare("dev.example.test", 0, LIMITS).unwrap();
         assert_eq!(
             storage.get("dev.example.test", "value").unwrap(),
             Some(b"legacy".to_vec())
         );
         assert!(matches!(
-            storage.prepare("dev.example.test", 1),
+            storage.prepare("dev.example.test", 1, LIMITS),
             Err(Error::SchemaMismatch {
                 expected: 1,
                 actual: 0
@@ -867,6 +906,23 @@ mod tests {
         assert!(matches!(
             storage.plan_restore("dev.example.second", &snapshot, LIMITS),
             Err(Error::SnapshotIdentity { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_root_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            DirectoryStorage::open(&link),
+            Err(Error::UnsafePath { .. })
         ));
     }
 

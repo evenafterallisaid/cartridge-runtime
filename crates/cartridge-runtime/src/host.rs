@@ -23,16 +23,15 @@ use wasmtime_wasi_io::{
     poll::{DynPollable, Pollable, subscribe},
 };
 
-use crate::{ReplayError, TraceEvent, cartridge};
+use crate::{MAX_TRACE_BYTES, MAX_TRACE_EVENTS, ReplayError, TraceEvent, cartridge};
 
 const MAX_RANDOM_BYTES: u32 = 1024 * 1024;
 const MAX_LOG_CHARACTERS: usize = 16 * 1024;
-const MAX_TRACE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TRACE_EVENTS: usize = 100_000;
 const MAX_TABLE_ELEMENTS: usize = 1_000_000;
 const MAX_TABLES: usize = 8;
 const MAX_MEMORIES: usize = 4;
 const MAX_INSTANCES: usize = 32;
+const MAX_HOST_RESOURCES: usize = 1024;
 
 pub(crate) struct HostState {
     table: ResourceTable,
@@ -79,10 +78,13 @@ impl HostState {
             .tables(MAX_TABLES)
             .memories(MAX_MEMORIES)
             .instances(MAX_INSTANCES)
+            .trap_on_grow_failure(true)
             .build();
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(MAX_HOST_RESOURCES);
         let started_at = StdInstant::now();
         Self {
-            table: ResourceTable::new(),
+            table,
             wasi,
             limits,
             permissions: manifest.permissions.clone(),
@@ -591,8 +593,7 @@ mod tests {
     #[test]
     fn table_growth_is_bounded_independently_from_linear_memory() {
         let engine = wasmtime::Engine::default();
-        let module = wasmtime::Module::new(
-            &engine,
+        let wasm = wat::parse_str(
             "(module
                 (table 1 funcref)
                 (func (export \"grow\") (param i32) (result i32)
@@ -601,6 +602,7 @@ mod tests {
                     table.grow))",
         )
         .unwrap();
+        let module = wasmtime::Module::new(&engine, wasm).unwrap();
         let mut store = wasmtime::Store::new(
             &engine,
             HostState::new(
@@ -616,11 +618,11 @@ mod tests {
             .get_typed_func::<i32, i32>(&mut store, "grow")
             .unwrap();
 
-        assert_eq!(
-            grow.call(&mut store, i32::try_from(MAX_TABLE_ELEMENTS).unwrap(),)
-                .unwrap(),
-            -1
-        );
+        let error = grow
+            .call(&mut store, i32::try_from(MAX_TABLE_ELEMENTS).unwrap())
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("table"), "{message}");
     }
 
     #[test]

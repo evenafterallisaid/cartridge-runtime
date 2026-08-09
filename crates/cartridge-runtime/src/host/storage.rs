@@ -21,6 +21,18 @@ impl HostState {
         }
         match self.storage.get(&self.storage_namespace, key) {
             Ok(Some(bytes)) => {
+                if bytes.len() > self.storage_limits.max_value_bytes {
+                    let error = format!(
+                        "stored value exceeds the {}-byte runtime limit",
+                        self.storage_limits.max_value_bytes
+                    );
+                    self.record(
+                        "storage",
+                        "get",
+                        json!({ "key": key, "length": bytes.len(), "denied": error }),
+                    );
+                    return Err(error);
+                }
                 self.record(
                     "storage",
                     "get",
@@ -142,6 +154,18 @@ impl HostState {
         }
         match self.storage.list(&self.storage_namespace, prefix) {
             Ok(keys) => {
+                if keys.len() > self.storage_limits.max_keys {
+                    let error = format!(
+                        "stored key count exceeds the {}-key runtime limit",
+                        self.storage_limits.max_keys
+                    );
+                    self.record(
+                        "storage",
+                        "list",
+                        json!({ "prefix": prefix, "count": keys.len(), "denied": error }),
+                    );
+                    return Err(error);
+                }
                 self.record("storage", "list", json!({ "prefix": prefix, "keys": keys }));
                 Ok(keys)
             }

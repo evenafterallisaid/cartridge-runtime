@@ -17,9 +17,12 @@ pub use snapshot::{
 };
 
 pub const MAX_KEY_BYTES: usize = 256;
+pub const MAX_STORAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_STORAGE_KEYS: usize = 100_000;
+pub const MAX_STORAGE_VALUE_BYTES: usize = 8 * 1024 * 1024;
 
 pub trait StorageBackend: Debug + Send + Sync {
-    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()>;
+    fn prepare(&self, namespace: &str, state_schema: u32, limits: StorageLimits) -> Result<()>;
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>>;
     fn put(&self, namespace: &str, key: &str, value: &[u8], limits: StorageLimits) -> Result<()>;
     fn delete(&self, namespace: &str, key: &str) -> Result<bool>;
@@ -53,8 +56,9 @@ impl MemoryStorage {
 }
 
 impl StorageBackend for MemoryStorage {
-    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+    fn prepare(&self, namespace: &str, state_schema: u32, limits: StorageLimits) -> Result<()> {
         validate_namespace(namespace)?;
+        validate_limits(limits)?;
         let mut namespaces = self.namespaces.write().map_err(|_| Error::Unavailable)?;
         match namespaces.entry(namespace.to_owned()) {
             Entry::Vacant(entry) => {
@@ -70,6 +74,9 @@ impl StorageBackend for MemoryStorage {
                 });
             }
             Entry::Occupied(_) => {}
+        }
+        if let Some(namespace) = namespaces.get(namespace) {
+            validate_entry_limits(&namespace.entries, limits)?;
         }
         Ok(())
     }
@@ -211,6 +218,8 @@ pub enum Error {
     SchemaMismatch { expected: u32, actual: u32 },
     #[error("storage lock was not available within {milliseconds} ms")]
     LockTimeout { milliseconds: u64 },
+    #[error("storage path is not a private directory or regular file: {0}")]
+    UnsafePath(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -261,10 +270,48 @@ pub(crate) fn validate_limits(limits: StorageLimits) -> Result<()> {
         || limits.max_keys == 0
         || limits.max_value_bytes == 0
         || limits.max_value_bytes > limits.max_bytes
+        || limits.max_bytes > MAX_STORAGE_BYTES
+        || limits.max_keys > MAX_STORAGE_KEYS
+        || limits.max_value_bytes > MAX_STORAGE_VALUE_BYTES
     {
         return Err(Error::InvalidLimits);
     }
     Ok(())
+}
+
+pub(crate) fn validate_entry_limits(
+    entries: &BTreeMap<String, Vec<u8>>,
+    limits: StorageLimits,
+) -> Result<StorageUsage> {
+    validate_limits(limits)?;
+    if entries.len() > limits.max_keys {
+        return Err(Error::KeyLimitExceeded {
+            limit: limits.max_keys,
+        });
+    }
+    let mut bytes = 0usize;
+    for value in entries.values() {
+        if value.len() > limits.max_value_bytes {
+            return Err(Error::ValueTooLarge {
+                size: value.len(),
+                limit: limits.max_value_bytes,
+            });
+        }
+        bytes = bytes.checked_add(value.len()).ok_or(Error::QuotaExceeded {
+            size: usize::MAX,
+            limit: limits.max_bytes,
+        })?;
+    }
+    if bytes > limits.max_bytes {
+        return Err(Error::QuotaExceeded {
+            size: bytes,
+            limit: limits.max_bytes,
+        });
+    }
+    Ok(StorageUsage {
+        bytes,
+        keys: entries.len(),
+    })
 }
 
 #[cfg(test)]
@@ -300,14 +347,32 @@ mod tests {
     #[test]
     fn prepared_namespaces_reject_a_different_schema() {
         let storage = MemoryStorage::new();
-        storage.prepare("dev.example.test", 2).unwrap();
+        storage.prepare("dev.example.test", 2, LIMITS).unwrap();
 
         assert!(matches!(
-            storage.prepare("dev.example.test", 3),
+            storage.prepare("dev.example.test", 3, LIMITS),
             Err(Error::SchemaMismatch {
                 expected: 3,
                 actual: 2
             })
+        ));
+    }
+
+    #[test]
+    fn prepare_rejects_existing_state_over_a_lowered_quota() {
+        let storage = MemoryStorage::new();
+        storage
+            .put("dev.example.test", "value", &[0; 12], LIMITS)
+            .unwrap();
+        let lower = StorageLimits {
+            max_bytes: 8,
+            max_keys: 2,
+            max_value_bytes: 8,
+        };
+
+        assert!(matches!(
+            storage.prepare("dev.example.test", 0, lower),
+            Err(Error::QuotaExceeded { .. } | Error::ValueTooLarge { .. })
         ));
     }
 

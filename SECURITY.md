@@ -8,12 +8,13 @@ The intended boundary is documented in `docs/architecture.md`. Missing permissio
 
 ## Current hardening
 
-The runtime enforces decompressed archive budgets, bounded Wasm memories and tables, finite fuel and wall-clock budgets, bounded WASI waits, finite storage-lock waits, bounded traces and diagnostic inputs, and control-safe terminal output. Durable state, snapshots, and traces use private Unix permissions when created. Security regression fixtures run on Windows, macOS, and Linux in CI.
+The runtime enforces decompressed archive budgets, bounded Wasm memories, tables, and host resources, finite fuel and wall-clock budgets, bounded WASI waits, finite storage-lock waits, bounded traces and diagnostic inputs, and control-safe terminal output. Public CLI execution compiles and runs cartridges in a supervised helper process with a cleared, minimal environment and a hard parent-side deadline. Durable state, snapshots, and traces use private Unix permissions when created. Security regression fixtures run on Windows, macOS, and Linux in CI.
 
 These controls reduce denial-of-service and local data-exposure risks, but this remains a pre-alpha boundary. In particular:
 
 - cartridge ids are not authenticated until package signing and a trust store exist
-- component compilation is not yet isolated in a killable worker process
+- helper processes do not yet enter platform-native OS sandboxes or receive kernel-enforced memory and CPU quotas
+- applications embedding the `cartridge-runtime` library execute in process and must provide their own process boundary for hostile inputs
 - traces intentionally contain replay data, including storage reads, and must be treated as secrets
 - Unix file locking is advisory against unrelated processes with direct filesystem access
 

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, MemoryStorage, Result, StorageBackend, StorageLimits, StorageUsage, validate_key,
-    validate_limits, validate_namespace,
+    Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES, MemoryStorage, Result,
+    StorageBackend, StorageLimits, StorageUsage, validate_key, validate_limits, validate_namespace,
 };
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
@@ -43,7 +43,7 @@ impl SnapshotStorage {
         validate_limits(limits)?;
         let entries = snapshot.entries_for(cartridge_id)?;
         let storage = MemoryStorage::new();
-        storage.prepare(cartridge_id, snapshot.state_schema())?;
+        storage.prepare(cartridge_id, snapshot.state_schema(), limits)?;
         for (key, value) in entries {
             storage.put(cartridge_id, &key, &value, limits)?;
         }
@@ -79,7 +79,7 @@ impl SnapshotStorage {
 }
 
 impl StorageBackend for SnapshotStorage {
-    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+    fn prepare(&self, namespace: &str, state_schema: u32, limits: StorageLimits) -> Result<()> {
         self.check_namespace(namespace)?;
         if self.state_schema != state_schema {
             return Err(Error::SchemaMismatch {
@@ -87,7 +87,7 @@ impl StorageBackend for SnapshotStorage {
                 actual: self.state_schema,
             });
         }
-        self.storage.prepare(namespace, state_schema)
+        self.storage.prepare(namespace, state_schema, limits)
     }
 
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -140,6 +140,11 @@ impl StorageSnapshot {
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_FILE_BYTES {
+            return Err(Error::Corrupt(
+                "snapshot exceeds the input size limit".into(),
+            ));
+        }
         let snapshot: Self = serde_json::from_slice(bytes)
             .map_err(|error| Error::Corrupt(format!("snapshot is not valid JSON: {error}")))?;
         snapshot.validate()?;
@@ -264,13 +269,30 @@ impl StorageSnapshot {
     }
 
     fn decode_entries(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        if self.payload.entries.len() > MAX_STORAGE_KEYS {
+            return Err(Error::Corrupt("snapshot contains too many keys".into()));
+        }
         let mut decoded = BTreeMap::new();
+        let mut bytes = 0usize;
         for (key, encoded) in &self.payload.entries {
             validate_key(key)
                 .map_err(|_| Error::Corrupt(format!("snapshot contains invalid key {key:?}")))?;
+            if encoded.len() > MAX_STORAGE_VALUE_BYTES.saturating_mul(2) {
+                return Err(Error::Corrupt(format!(
+                    "snapshot value for {key:?} exceeds the value limit"
+                )));
+            }
             let value = hex::decode(encoded).map_err(|error| {
                 Error::Corrupt(format!("snapshot value for {key:?} is invalid: {error}"))
             })?;
+            bytes = bytes
+                .checked_add(value.len())
+                .ok_or_else(|| Error::Corrupt("snapshot usage overflowed".into()))?;
+            if bytes > MAX_STORAGE_BYTES {
+                return Err(Error::Corrupt(
+                    "snapshot exceeds the global storage budget".into(),
+                ));
+            }
             decoded.insert(key.clone(), value);
         }
         Ok(decoded)
@@ -514,9 +536,9 @@ mod tests {
             StorageSnapshot::from_entries("dev.example.test", 2, &BTreeMap::new()).unwrap();
         let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
 
-        branch.prepare("dev.example.test", 2).unwrap();
+        branch.prepare("dev.example.test", 2, LIMITS).unwrap();
         assert!(matches!(
-            branch.prepare("dev.example.test", 3),
+            branch.prepare("dev.example.test", 3, LIMITS),
             Err(Error::SchemaMismatch {
                 expected: 3,
                 actual: 2

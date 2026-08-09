@@ -10,17 +10,17 @@ pub use cartridge_storage::{
     StorageSnapshot, StorageSnapshotSummary, StorageUsage,
 };
 pub use cartridge_trace::{
-    CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,
+    CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, MAX_TRACE_BYTES, MAX_TRACE_DOCUMENT_BYTES,
+    MAX_TRACE_EVENTS, MAX_TRACE_OUTPUT_BYTES, ReplayError, TraceComparison, TraceDifference,
     TraceEvent, TraceIdentity, TraceResult, TraceSummary,
 };
 use host::{HostState, RuntimeMonotonic, RuntimeMonotonicView, RuntimePoll, RuntimePollView};
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, WasmBacktraceDetails};
 use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
 use wasmtime_wasi::p2::bindings::sync::io::poll;
 
 const EPOCH_TICK_MS: u64 = 10;
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -42,6 +42,20 @@ impl Runtime {
         let mut config = Config::new();
         config
             .wasm_component_model(true)
+            .wasm_component_model_gc(false)
+            .wasm_shared_everything_threads(false)
+            .wasm_memory64(false)
+            .wasm_multi_memory(false)
+            .wasm_gc(false)
+            .wasm_tail_call(false)
+            .wasm_relaxed_simd(false)
+            .wasm_stack_switching(false)
+            .wasm_custom_page_sizes(false)
+            .wasm_wide_arithmetic(false)
+            .debug_info(false)
+            .debug_symbols(false)
+            .generate_address_map(false)
+            .wasm_backtrace_details(WasmBacktraceDetails::Disable)
             .consume_fuel(true)
             .epoch_interruption(true);
         let engine = Engine::new(&config)?;
@@ -92,6 +106,7 @@ impl Runtime {
             self.storage.prepare(
                 &archive.manifest.cartridge.id,
                 archive.manifest.state.schema,
+                storage_limits(&archive.manifest),
             )?;
         }
         let component = Component::new(&self.engine, &archive.component)
@@ -132,9 +147,9 @@ impl Runtime {
         let result =
             call_result.map_err(|error| anyhow!("the component trapped while running: {error}"))?;
         let output = result.map_err(|message| anyhow!("cartridge returned an error: {message}"))?;
-        if output.len() > MAX_OUTPUT_BYTES {
+        if output.len() > MAX_TRACE_OUTPUT_BYTES {
             return Err(anyhow!(
-                "cartridge output exceeds the {MAX_OUTPUT_BYTES} byte limit"
+                "cartridge output exceeds the {MAX_TRACE_OUTPUT_BYTES} byte limit"
             ));
         }
         let fuel_consumed = manifest.runtime.fuel.saturating_sub(fuel_remaining);
@@ -191,6 +206,14 @@ fn trace_identity(manifest: &cartridge_core::PackageManifest) -> TraceIdentity<'
     }
 }
 
+fn storage_limits(manifest: &cartridge_core::PackageManifest) -> StorageLimits {
+    StorageLimits {
+        max_bytes: manifest.runtime.storage_bytes,
+        max_keys: manifest.runtime.storage_keys,
+        max_value_bytes: manifest.runtime.storage_value_bytes,
+    }
+}
+
 fn open_archive(path: impl AsRef<Path>) -> Result<CartridgeArchive> {
     CartridgeArchive::open(path.as_ref())
         .with_context(|| format!("could not open {}", path.as_ref().display()))
@@ -218,11 +241,8 @@ mod tests {
     #[test]
     fn epoch_deadline_interrupts_compute() {
         let runtime = Runtime::new().unwrap();
-        let module = wasmtime::Module::new(
-            &runtime.engine,
-            "(module (func (export \"spin\") (loop br 0)))",
-        )
-        .unwrap();
+        let wasm = wat::parse_str("(module (func (export \"spin\") (loop br 0)))").unwrap();
+        let module = wasmtime::Module::new(&runtime.engine, wasm).unwrap();
         let mut store = Store::new(&runtime.engine, ());
         store.set_fuel(u64::MAX).unwrap();
         store.set_epoch_deadline(1);

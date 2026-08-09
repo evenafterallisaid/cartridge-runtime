@@ -10,6 +10,7 @@ The current execution path is:
 .cartridge archive
   -> parse and validate manifest
   -> verify component and asset digests
+  -> launch a supervised helper with no inherited environment or stdin
   -> configure permissions, memory, fuel, and epoch deadline
   -> instantiate component with Wasmtime
   -> route WIT imports through HostState
@@ -30,7 +31,9 @@ Portable snapshots sit above the backend contract. They contain sorted key/value
 
 Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline during guest execution. WASI monotonic subscriptions are clamped to the same remaining deadline, so a guest cannot escape the budget by sleeping inside a host poll call. Storage lock acquisition also has a fixed upper bound. Epoch timing is deliberately coarse and is not part of deterministic replay.
 
-The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, while the host controls which imports are linked. A security review, signed packages, cache isolation, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.
+The public CLI treats component compilation and execution as untrusted work. It validates the bounded archive, launches a helper process with a cleared, minimal environment and no stdin, and kills that helper if startup plus the manifest deadline is exceeded. This contains compiler crashes and gives the CLI a deadline independent of guest and WASI control flow. The helper is a process boundary, not yet a platform-native sandbox: kernel memory and CPU quotas, restricted Windows tokens, macOS sandbox profiles, and Linux namespace/seccomp policies remain future work. Direct users of the runtime library stay in process by design.
+
+The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, the host controls which imports are linked, and the CLI adds a killable process boundary. Signed packages, cache isolation, kernel resource limits, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.
 
 ## Portability boundary
 

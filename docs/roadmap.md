@@ -772,11 +772,15 @@ Completed foundations:
 - state schemas persisted across memory, durable generations, and portable snapshots
 - validated manifest migration graphs and identity-bound ordered plans
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
+- supervised CLI workers for killable component compilation and execution
+- minimized Wasmtime features and explicit rejection of unused Wasm proposals
+- bounded package construction, snapshot decoding, durable-state decoding, and host resource tables
+- pinned CI actions, automated dependency updates, and RustSec advisory checks
 
 Security work immediately ahead:
 
 1. Bind package identity to developer signatures before treating cartridge ids as storage principals.
-2. Move component compilation and high-risk adapters into killable worker processes with operating-system limits.
+2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
 3. Add trace redaction profiles and encrypted support bundles.
 4. Add archive, manifest, snapshot, and trace fuzz targets seeded with the security regression corpus.
 

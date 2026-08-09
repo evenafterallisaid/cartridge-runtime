@@ -1,8 +1,13 @@
 use std::{
+    ffi::OsString,
     fs,
     io::Write,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, ExitCode, Stdio},
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,10 +15,12 @@ use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolv
 use cartridge_runtime::{
     DirectoryStorage, Runtime, SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
 };
-use cartridge_trace::{ExecutionTrace, TraceDifference};
+use cartridge_trace::{ExecutionTrace, MAX_TRACE_DOCUMENT_BYTES, TraceDifference};
 use clap::{Parser, Subcommand};
 
-const MAX_TRACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const WORKER_STARTUP_BUDGET: Duration = Duration::from_secs(10);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,6 +82,27 @@ enum Command {
     },
     /// replay a cartridge from a recorded trace
     Replay {
+        package: PathBuf,
+        trace: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    #[command(name = "__worker-run", hide = true)]
+    WorkerRun {
+        package: PathBuf,
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        #[arg(long, conflicts_with = "from_snapshot")]
+        state_dir: Option<PathBuf>,
+        #[arg(long, conflicts_with = "state_dir")]
+        from_snapshot: Option<PathBuf>,
+        #[arg(long, requires = "from_snapshot")]
+        snapshot_output: Option<PathBuf>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    #[command(name = "__worker-replay", hide = true)]
+    WorkerReplay {
         package: PathBuf,
         trace: PathBuf,
         #[arg(last = true)]
@@ -169,7 +197,17 @@ enum StorageCommand {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run_cli() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {}", terminal_safe(&format!("{error:#}")));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Command::Pack {
             manifest,
@@ -192,7 +230,7 @@ fn main() -> Result<()> {
             from_snapshot,
             snapshot_output,
             args,
-        } => run_command(
+        } => supervised_run_command(
             &package,
             trace.as_deref(),
             state_dir.as_deref(),
@@ -201,6 +239,26 @@ fn main() -> Result<()> {
             &args,
         ),
         Command::Replay {
+            package,
+            trace,
+            args,
+        } => supervised_replay_command(&package, &trace, &args),
+        Command::WorkerRun {
+            package,
+            trace,
+            state_dir,
+            from_snapshot,
+            snapshot_output,
+            args,
+        } => run_command(
+            &package,
+            trace.as_deref(),
+            state_dir.as_deref(),
+            from_snapshot.as_deref(),
+            snapshot_output.as_deref(),
+            &args,
+        ),
+        Command::WorkerReplay {
             package,
             trace,
             args,
@@ -240,6 +298,89 @@ fn main() -> Result<()> {
                 json,
             } => storage_migration_plan_command(&package, from_schema, json),
         },
+    }
+}
+
+fn supervised_run_command(
+    package: &Path,
+    trace: Option<&Path>,
+    state_dir: Option<&Path>,
+    from_snapshot: Option<&Path>,
+    snapshot_output: Option<&Path>,
+    args: &[String],
+) -> Result<()> {
+    let mut worker_args = vec![
+        OsString::from("__worker-run"),
+        package.as_os_str().to_owned(),
+    ];
+    push_path_option(&mut worker_args, "--trace", trace);
+    push_path_option(&mut worker_args, "--state-dir", state_dir);
+    push_path_option(&mut worker_args, "--from-snapshot", from_snapshot);
+    push_path_option(&mut worker_args, "--snapshot-output", snapshot_output);
+    push_worker_arguments(&mut worker_args, args);
+    supervise_worker(package, &worker_args)
+}
+
+fn supervised_replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
+    let mut worker_args = vec![
+        OsString::from("__worker-replay"),
+        package.as_os_str().to_owned(),
+        trace.as_os_str().to_owned(),
+    ];
+    push_worker_arguments(&mut worker_args, args);
+    supervise_worker(package, &worker_args)
+}
+
+fn push_path_option(arguments: &mut Vec<OsString>, name: &str, value: Option<&Path>) {
+    if let Some(value) = value {
+        arguments.push(OsString::from(name));
+        arguments.push(value.as_os_str().to_owned());
+    }
+}
+
+fn push_worker_arguments(arguments: &mut Vec<OsString>, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    arguments.push(OsString::from("--"));
+    arguments.extend(values.iter().map(OsString::from));
+}
+
+fn supervise_worker(package: &Path, arguments: &[OsString]) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not validate {} before execution", package.display()))?;
+    let execution_budget = Duration::from_millis(archive.manifest.runtime.timeout_ms);
+    drop(archive);
+    let deadline = Instant::now() + WORKER_STARTUP_BUDGET + execution_budget;
+    let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
+    let mut worker = ProcessCommand::new(executable)
+        .args(arguments)
+        .env_clear()
+        .env("CARTRIDGE_WORKER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("could not start the cartridge worker")?;
+
+    loop {
+        if let Some(status) = worker.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("cartridge worker exited with {status}"));
+        }
+        if Instant::now() >= deadline {
+            worker
+                .kill()
+                .context("could not terminate the cartridge worker")?;
+            let _ = worker.wait();
+            return Err(anyhow::anyhow!(
+                "cartridge worker exceeded its {} ms supervised deadline",
+                (WORKER_STARTUP_BUDGET + execution_budget).as_millis()
+            ));
+        }
+        thread::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -638,11 +779,11 @@ fn trace_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
 }
 
 fn read_trace(path: &Path) -> Result<ExecutionTrace> {
-    if fs::metadata(path)?.len() > MAX_TRACE_FILE_BYTES {
+    if fs::metadata(path)?.len() > MAX_TRACE_DOCUMENT_BYTES {
         bail!(
             "trace {} exceeds the {} byte input limit",
             path.display(),
-            MAX_TRACE_FILE_BYTES
+            MAX_TRACE_DOCUMENT_BYTES
         );
     }
     let bytes =
@@ -668,14 +809,20 @@ fn terminal_safe(value: &str) -> String {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".cartridge-output-{}-{sequence}.tmp",
+        std::process::id()
+    ));
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = options.open(&temporary)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -683,6 +830,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     file.write_all(bytes)?;
     file.sync_all()?;
+    drop(file);
+    if let Err(error) = fs::hard_link(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    fs::remove_file(temporary)?;
     Ok(())
 }
 

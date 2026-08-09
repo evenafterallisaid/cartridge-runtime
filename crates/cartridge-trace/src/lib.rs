@@ -5,6 +5,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const CURRENT_TRACE_FORMAT_VERSION: u32 = 2;
+pub const MAX_TRACE_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_TRACE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TRACE_EVENTS: usize = 100_000;
+pub const MAX_TRACE_OUTPUT_BYTES: usize = 1024 * 1024;
+
+const MAX_TRACE_ARGUMENTS: usize = 4096;
+const MAX_TRACE_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_TRACE_LABEL_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TraceIdentity<'a> {
@@ -54,13 +62,13 @@ impl ExecutionTrace {
                 expected: CURRENT_TRACE_FORMAT_VERSION,
             });
         }
-        if self.runtime_version.trim().is_empty() {
+        if !valid_label(&self.runtime_version) {
             return Err(invalid("runtime version is empty"));
         }
-        if self.cartridge_id.trim().is_empty() {
+        if !valid_label(&self.cartridge_id) {
             return Err(invalid("cartridge id is empty"));
         }
-        if self.cartridge_version.trim().is_empty() {
+        if !valid_label(&self.cartridge_version) {
             return Err(invalid("cartridge version is empty"));
         }
         if self.component_sha256.len() != 64
@@ -71,6 +79,21 @@ impl ExecutionTrace {
         {
             return Err(invalid("component sha256 is not a hexadecimal digest"));
         }
+        if self.args.len() > MAX_TRACE_ARGUMENTS {
+            return Err(invalid("trace contains too many arguments"));
+        }
+        let argument_bytes = self.args.iter().try_fold(0usize, |total, argument| {
+            total
+                .checked_add(argument.len())
+                .ok_or_else(|| invalid("trace argument size overflowed"))
+        })?;
+        if argument_bytes > MAX_TRACE_ARGUMENT_BYTES {
+            return Err(invalid("trace arguments exceed their byte budget"));
+        }
+        if self.events.len() > MAX_TRACE_EVENTS {
+            return Err(invalid("trace contains too many events"));
+        }
+        let mut trace_bytes = 0usize;
         for (index, event) in self.events.iter().enumerate() {
             let expected = u64::try_from(index)
                 .map_err(|_| invalid("trace contains more events than can be sequenced"))?;
@@ -80,12 +103,27 @@ impl ExecutionTrace {
                     event.sequence
                 )));
             }
-            if event.capability.trim().is_empty() {
+            if !valid_label(&event.capability) {
                 return Err(invalid(format!("event {index} has an empty capability")));
             }
-            if event.operation.trim().is_empty() {
+            if !valid_label(&event.operation) {
                 return Err(invalid(format!("event {index} has an empty operation")));
             }
+            let outcome_bytes = serde_json::to_vec(&event.outcome)
+                .map_err(|error| invalid(format!("event {index} is not serializable: {error}")))?
+                .len();
+            trace_bytes = trace_bytes
+                .checked_add(event.capability.len())
+                .and_then(|bytes| bytes.checked_add(event.operation.len()))
+                .and_then(|bytes| bytes.checked_add(outcome_bytes))
+                .and_then(|bytes| bytes.checked_add(128))
+                .ok_or_else(|| invalid("trace event size overflowed"))?;
+            if trace_bytes > MAX_TRACE_BYTES {
+                return Err(invalid("trace events exceed their byte budget"));
+            }
+        }
+        if self.result.output.len() > MAX_TRACE_OUTPUT_BYTES {
+            return Err(invalid("trace output exceeds its byte budget"));
         }
         Ok(())
     }
@@ -260,6 +298,12 @@ fn invalid(reason: impl Into<String>) -> ReplayError {
     ReplayError::InvalidTrace {
         reason: reason.into(),
     }
+}
+
+fn valid_label(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_TRACE_LABEL_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 fn check_identity(field: &'static str, expected: &str, actual: &str) -> Result<(), ReplayError> {
@@ -444,6 +488,28 @@ mod tests {
         assert!(matches!(
             comparison.difference,
             Some(TraceDifference::Event { sequence: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn control_characters_in_trace_labels_are_rejected() {
+        let mut trace = trace();
+        trace.events[0].operation = "write\u{1b}[2J".into();
+
+        assert!(matches!(
+            trace.validate(),
+            Err(ReplayError::InvalidTrace { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_trace_output_is_rejected() {
+        let mut trace = trace();
+        trace.result.output = "x".repeat(MAX_TRACE_OUTPUT_BYTES + 1);
+
+        assert!(matches!(
+            trace.validate(),
+            Err(ReplayError::InvalidTrace { .. })
         ));
     }
 }

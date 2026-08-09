@@ -21,10 +21,10 @@ impl Default for PackageLimits {
     fn default() -> Self {
         Self {
             manifest_bytes: 1024 * 1024,
-            component_bytes: 64 * 1024 * 1024,
-            asset_bytes: 32 * 1024 * 1024,
-            total_bytes: 256 * 1024 * 1024,
-            entries: 4096,
+            component_bytes: 32 * 1024 * 1024,
+            asset_bytes: 16 * 1024 * 1024,
+            total_bytes: 128 * 1024 * 1024,
+            entries: 1024,
         }
     }
 }
