@@ -129,10 +129,11 @@ Delivery slices:
 1. In-memory key/value contract, namespace isolation, quotas, guest bindings, and replay semantics.
 2. Durable directory backend with locking, immutable generation commits, corruption detection, and recovery tests on every CI platform.
 3. Canonical snapshot format with content digests, CLI export/inspect/diff, dry runs, and transactional restore.
-4. Migration plans that run against a temporary snapshot before committing changes.
-5. Content-addressed blobs, garbage collection, and references from key/value records.
+4. Isolated snapshot branches for speculative execution and migration rehearsals.
+5. Migration plans that run against a snapshot branch before committing changes.
+6. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first three slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. The next slice builds migrations as pure snapshot transformations before allowing them to commit.
+The first four slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. A cartridge can now run against an isolated snapshot branch and export the result without touching durable state. The next slice adds explicit schema versions and migration plans on top of that execution primitive.
 
 Migration design constraints:
 
@@ -148,6 +149,20 @@ Migration design constraints:
 - migration compatibility is tested on snapshots from every released schema
 
 Later snapshot work includes selective exports, encrypted envelopes, signed backups, blob references, streaming import for large state, and redaction policies for support bundles. None of those should change the guest key/value ABI.
+
+### Scouted platform opportunities
+
+These directions fit the existing architecture, but their order follows the maturity of the standards they build on:
+
+- **Atomic state transactions.** Add compare-and-swap and bounded batch operations before exposing multi-key migrations to guests. The WASI key/value proposal already separates single-key, atomic, batch, and watch interfaces, which gives Cartridge a useful compatibility target without forcing one backend model.
+- **Reactive state watch streams.** Allow a cartridge to subscribe to changes it has authority to observe, with coalescing, bounded queues, and trace events. This belongs after async host calls and composition supervision so a slow consumer cannot stall storage commits.
+- **Streaming content-addressed blobs.** Store large values as deduplicated chunks addressed by digest, keep small references in key/value state, and trace digests rather than payloads. The guest API should use component-model streams instead of buffering complete objects into linear memory.
+- **State-and-trace capsules.** Bind a source snapshot, execution trace, package digest, and result snapshot into one inspectable crash or test artifact. Snapshot branches make the first version possible without memory checkpointing.
+- **Parallel scenario matrices.** Fan out many runs from one immutable snapshot, then compare outputs, traces, fuel, and state diffs. This can become `cartridge test --matrix` once branch execution and a test manifest exist.
+- **Portable interpreter fallback.** Investigate a Pulley backend for architectures where native code generation is unavailable or undesirable. It should complement, not replace, Wasmtime's compiled path and needs independent performance and sandbox measurements.
+- **Async component services.** Adopt Component Model Preview 3 futures, streams, cancellation, and backpressure when the toolchain stabilizes. This unlocks long-lived cartridge services, blob streaming, watches, networking, and composition without inventing a private async ABI.
+
+Standards tracked for this work include the official [WASI key/value proposal](https://github.com/WebAssembly/wasi-keyvalue), [WASI blobstore proposal](https://github.com/WebAssembly/wasi-blobstore), [Component Model repository](https://github.com/WebAssembly/component-model), and [Pulley RFC](https://github.com/bytecodealliance/rfcs/blob/main/accepted/pulley.md).
 
 Exit criteria:
 
@@ -735,11 +750,13 @@ A capability is not complete when its host function works once. It is complete w
 The next concrete sequence is:
 
 1. Add manifest state schema versions and a migration-plan format.
-2. Run migrations against isolated snapshot overlays with automatic rollback points.
-3. Add content-addressed blobs and snapshot references for larger state.
-4. Add package-wide Merkle-style asset integrity.
-5. Create a minimal 2D window and input prototype behind new WIT packages.
-6. Build a small trace viewer after there is enough real trace data to design around.
+2. Run migrations against isolated snapshot branches with automatic rollback points.
+3. Bind branch runs to trace and state digests for reproducible test capsules.
+4. Add compare-and-swap and bounded atomic batch operations.
+5. Add content-addressed blobs, streaming access, and snapshot references for larger state.
+6. Add package-wide Merkle-style asset integrity.
+7. Create a minimal 2D window and input prototype behind new WIT packages.
+8. Build a small trace viewer after there is enough real trace data to design around.
 
 Completed foundations:
 
@@ -749,5 +766,6 @@ Completed foundations:
 - isolated in-memory storage with quotas and side-effect-free replay
 - checksummed durable generations, process locking, status, and recovery
 - portable snapshot export, inspection, diffing, dry runs, and transactional restore
+- isolated snapshot branch execution with optional result export
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

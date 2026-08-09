@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
-    DirectoryStorage, Runtime, SnapshotDifference, StorageBackend, StorageLimits, StorageSnapshot,
+    DirectoryStorage, Runtime, SnapshotDifference, SnapshotStorage, StorageBackend, StorageLimits,
+    StorageSnapshot,
 };
 use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
@@ -61,8 +62,12 @@ enum Command {
         package: PathBuf,
         #[arg(long)]
         trace: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_snapshot")]
         state_dir: Option<PathBuf>,
+        #[arg(long, conflicts_with = "state_dir")]
+        from_snapshot: Option<PathBuf>,
+        #[arg(long, requires = "from_snapshot")]
+        snapshot_output: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -174,8 +179,17 @@ fn main() -> Result<()> {
             package,
             trace,
             state_dir,
+            from_snapshot,
+            snapshot_output,
             args,
-        } => run_command(&package, trace.as_deref(), state_dir.as_deref(), &args),
+        } => run_command(
+            &package,
+            trace.as_deref(),
+            state_dir.as_deref(),
+            from_snapshot.as_deref(),
+            snapshot_output.as_deref(),
+            &args,
+        ),
         Command::Replay {
             package,
             trace,
@@ -297,13 +311,31 @@ fn run_command(
     package: &Path,
     trace: Option<&Path>,
     state_dir: Option<&Path>,
+    from_snapshot: Option<&Path>,
+    snapshot_output: Option<&Path>,
     args: &[String],
 ) -> Result<()> {
-    let runtime = match state_dir {
-        Some(path) => Runtime::with_storage(Arc::new(DirectoryStorage::open(path)?))?,
-        None => Runtime::new()?,
+    let mut branch = None;
+    let report = if let Some(path) = from_snapshot {
+        let archive = CartridgeArchive::open(package)
+            .with_context(|| format!("could not inspect {}", package.display()))?;
+        let snapshot = StorageSnapshot::read(path)
+            .with_context(|| format!("could not read snapshot {}", path.display()))?;
+        let storage = Arc::new(SnapshotStorage::from_snapshot(
+            &snapshot,
+            &archive.manifest.cartridge.id,
+            storage_limits(&archive.manifest),
+        )?);
+        let runtime = Runtime::with_storage(storage.clone())?;
+        branch = Some(storage);
+        runtime.run(archive, args)?
+    } else {
+        let runtime = match state_dir {
+            Some(path) => Runtime::with_storage(Arc::new(DirectoryStorage::open(path)?))?,
+            None => Runtime::new()?,
+        };
+        runtime.run_file(package, args)?
     };
-    let report = runtime.run_file(package, args)?;
     println!("{}", report.output);
     eprintln!("fuel consumed: {}", report.fuel_consumed);
     if let Some(path) = trace {
@@ -312,6 +344,19 @@ fn run_command(
         }
         fs::write(path, serde_json::to_vec_pretty(&report.trace)?)?;
         eprintln!("trace: {}", path.display());
+    }
+    if let Some(path) = snapshot_output {
+        let snapshot = branch
+            .context("snapshot output requires a snapshot branch")?
+            .export_snapshot()?;
+        let summary = snapshot.summary()?;
+        snapshot.write_new(path)?;
+        eprintln!(
+            "snapshot: {} key(s), {} bytes -> {}",
+            summary.entries,
+            summary.bytes,
+            path.display()
+        );
     }
     Ok(())
 }

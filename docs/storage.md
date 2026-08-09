@@ -41,12 +41,16 @@ Traces may contain private storage values and should be treated as sensitive fil
 
 `DirectoryStorage` persists the same contract beneath a caller-selected root. Namespace directory names are SHA-256 digests of cartridge ids. Each operation takes an exclusive operating-system file lock, so separate runtime processes cannot interleave read-modify-write commits.
 
+`SnapshotStorage` creates a private in-memory branch from a portable snapshot. The input snapshot is immutable, and no durable namespace is opened. A branch can be discarded after execution or exported as a new snapshot, which makes it suitable for migration rehearsals, test matrices, and debugging with edited inputs.
+
 ```sh
 cartridge run app.cartridge --state-dir ./state -- first-run
 cartridge storage status app.cartridge --state-dir ./state
 cartridge storage recover app.cartridge --state-dir ./state
 cartridge storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
 cartridge storage inspect backup.cartridge-state.json
+cartridge run app.cartridge --from-snapshot backup.cartridge-state.json \
+  --snapshot-output branch.cartridge-state.json -- experiment
 cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
 ```
 
@@ -54,4 +58,4 @@ State commits are immutable generations. The backend flushes a new temporary sna
 
 The internal generation files are a recovery mechanism, not the portable snapshot format. Export produces a separately versioned envelope containing only cartridge identity and sorted key/value data. Snapshot comparison reports changed keys, lengths, and digests without printing values. Restore rejects another cartridge's snapshot and any state that exceeds the package limits, then replaces the namespace in one generation.
 
-Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. This is also the foundation for migrations: a future migration runner can transform a snapshot, compare the result, validate quotas, and commit through the existing restore path.
+Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. Snapshot branches complete the other half of the migration foundation: a future migration runner can transform isolated state, compare the result, validate quotas, and commit through the existing restore path.

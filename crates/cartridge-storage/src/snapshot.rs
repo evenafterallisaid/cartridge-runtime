@@ -9,7 +9,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Result, StorageUsage, validate_key, validate_namespace};
+use crate::{
+    Error, MemoryStorage, Result, StorageBackend, StorageLimits, StorageUsage, validate_key,
+    validate_limits, validate_namespace,
+};
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
@@ -22,6 +25,81 @@ static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct StorageSnapshot {
     payload: SnapshotPayload,
     payload_sha256: String,
+}
+
+#[derive(Debug)]
+pub struct SnapshotStorage {
+    cartridge_id: String,
+    storage: MemoryStorage,
+}
+
+impl SnapshotStorage {
+    pub fn from_snapshot(
+        snapshot: &StorageSnapshot,
+        cartridge_id: &str,
+        limits: StorageLimits,
+    ) -> Result<Self> {
+        validate_limits(limits)?;
+        let entries = snapshot.entries_for(cartridge_id)?;
+        let storage = MemoryStorage::new();
+        for (key, value) in entries {
+            storage.put(cartridge_id, &key, &value, limits)?;
+        }
+        Ok(Self {
+            cartridge_id: cartridge_id.to_owned(),
+            storage,
+        })
+    }
+
+    pub fn export_snapshot(&self) -> Result<StorageSnapshot> {
+        let mut entries = BTreeMap::new();
+        for key in self.storage.list(&self.cartridge_id, "")? {
+            let value = self
+                .storage
+                .get(&self.cartridge_id, &key)?
+                .ok_or_else(|| Error::Corrupt(format!("snapshot branch lost key {key:?}")))?;
+            entries.insert(key, value);
+        }
+        StorageSnapshot::from_entries(&self.cartridge_id, &entries)
+    }
+
+    fn check_namespace(&self, namespace: &str) -> Result<()> {
+        validate_namespace(namespace)?;
+        if namespace != self.cartridge_id {
+            return Err(Error::SnapshotIdentity {
+                expected: self.cartridge_id.clone(),
+                actual: namespace.to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl StorageBackend for SnapshotStorage {
+    fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        self.check_namespace(namespace)?;
+        self.storage.get(namespace, key)
+    }
+
+    fn put(&self, namespace: &str, key: &str, value: &[u8], limits: StorageLimits) -> Result<()> {
+        self.check_namespace(namespace)?;
+        self.storage.put(namespace, key, value, limits)
+    }
+
+    fn delete(&self, namespace: &str, key: &str) -> Result<bool> {
+        self.check_namespace(namespace)?;
+        self.storage.delete(namespace, key)
+    }
+
+    fn list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
+        self.check_namespace(namespace)?;
+        self.storage.list(namespace, prefix)
+    }
+
+    fn usage(&self, namespace: &str) -> Result<StorageUsage> {
+        self.check_namespace(namespace)?;
+        self.storage.usage(namespace)
+    }
 }
 
 impl StorageSnapshot {
@@ -265,6 +343,12 @@ fn temporary_path(directory: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    const LIMITS: StorageLimits = StorageLimits {
+        max_bytes: 64,
+        max_keys: 4,
+        max_value_bytes: 32,
+    };
+
     fn snapshot(value: &[u8]) -> StorageSnapshot {
         StorageSnapshot::from_entries(
             "dev.example.test",
@@ -326,5 +410,37 @@ mod tests {
                     .into(),
             }
         );
+    }
+
+    #[test]
+    fn snapshot_branches_export_changes_without_changing_the_source() {
+        let source = snapshot(b"dark");
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+
+        branch
+            .put("dev.example.test", "settings/theme", b"light", LIMITS)
+            .unwrap();
+        branch
+            .put("dev.example.test", "session/count", b"1", LIMITS)
+            .unwrap();
+
+        let result = branch.export_snapshot().unwrap();
+        assert!(!source.compare(&result).unwrap().identical);
+        assert_eq!(
+            source.entries_for("dev.example.test").unwrap(),
+            BTreeMap::from([("settings/theme".into(), b"dark".to_vec())])
+        );
+        assert_eq!(result.summary().unwrap().entries, 2);
+    }
+
+    #[test]
+    fn snapshot_branches_reject_other_namespaces() {
+        let branch =
+            SnapshotStorage::from_snapshot(&snapshot(b"dark"), "dev.example.test", LIMITS).unwrap();
+
+        assert!(matches!(
+            branch.get("dev.example.other", "settings/theme"),
+            Err(Error::SnapshotIdentity { .. })
+        ));
     }
 }

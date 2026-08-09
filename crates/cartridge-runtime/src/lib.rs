@@ -6,8 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use cartridge_core::CartridgeArchive;
 pub use cartridge_storage::{
     DirectoryStorage, MemoryStorage, RecoveryReport, RestorePlan, SnapshotComparison,
-    SnapshotDifference, SnapshotEntry, StorageBackend, StorageLimits, StorageSnapshot,
-    StorageSnapshotSummary, StorageUsage,
+    SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend, StorageLimits,
+    StorageSnapshot, StorageSnapshotSummary, StorageUsage,
 };
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,

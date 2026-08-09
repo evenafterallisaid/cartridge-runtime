@@ -12,7 +12,8 @@ use thiserror::Error;
 
 pub use directory::{DirectoryStorage, RecoveryReport, RestorePlan};
 pub use snapshot::{
-    SnapshotComparison, SnapshotDifference, SnapshotEntry, StorageSnapshot, StorageSnapshotSummary,
+    SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageSnapshot,
+    StorageSnapshotSummary,
 };
 
 pub const MAX_KEY_BYTES: usize = 256;

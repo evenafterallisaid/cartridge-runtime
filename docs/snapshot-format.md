@@ -50,3 +50,14 @@ cartridge storage restore app.cartridge backup.cartridge-state.json \
 The runtime rejects cross-cartridge restores, oversized values, excessive key counts, and quota overflow before acquiring a commit. A dry run compares current and proposed state without mutation. A committed restore takes the namespace lock and writes the complete snapshot as one new durable generation, leaving the previous generation as its rollback point.
 
 Export refuses to overwrite an existing output file. Snapshots may contain private application data and are not encrypted in v1; they should be protected like any other backup.
+
+## Isolated branch execution
+
+A cartridge can run against a private copy of a snapshot without reading or changing durable state:
+
+```sh
+cartridge run app.cartridge --from-snapshot before.cartridge-state.json \
+  --snapshot-output after.cartridge-state.json -- scenario-a
+```
+
+The runtime validates cartridge identity and current manifest quotas before execution. Writes, deletes, and quota usage apply only to the branch. If `--snapshot-output` is omitted, the branch is discarded; if supplied, the final state is written as a new snapshot without overwriting an existing file. The input can therefore be reused across a test matrix and compared with every result.
