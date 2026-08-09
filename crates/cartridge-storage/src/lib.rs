@@ -1,3 +1,5 @@
+mod directory;
+
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     fmt::Debug,
@@ -6,6 +8,8 @@ use std::{
 
 use serde::Serialize;
 use thiserror::Error;
+
+pub use directory::{DirectoryStorage, RecoveryReport};
 
 pub const MAX_KEY_BYTES: usize = 256;
 
@@ -149,7 +153,7 @@ struct Namespace {
     bytes: usize,
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid storage namespace: {0:?}")]
     InvalidNamespace(String),
@@ -165,11 +169,19 @@ pub enum Error {
     KeyLimitExceeded { limit: usize },
     #[error("storage backend is unavailable")]
     Unavailable,
+    #[error("storage data is corrupt: {0}")]
+    Corrupt(String),
+    #[error("storage has no valid state to recover")]
+    NoRecoverableState,
+    #[error("storage I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("storage serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn validate_namespace(namespace: &str) -> Result<()> {
+pub(crate) fn validate_namespace(namespace: &str) -> Result<()> {
     if namespace.is_empty()
         || namespace.len() > 128
         || !namespace.bytes().all(|byte| {
@@ -181,7 +193,7 @@ fn validate_namespace(namespace: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_key(key: &str) -> Result<()> {
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty()
         || key.len() > MAX_KEY_BYTES
         || key.starts_with('/')
@@ -202,7 +214,7 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_prefix(prefix: &str) -> Result<()> {
+pub(crate) fn validate_prefix(prefix: &str) -> Result<()> {
     if prefix.is_empty() {
         return Ok(());
     }
@@ -210,7 +222,7 @@ fn validate_prefix(prefix: &str) -> Result<()> {
     validate_key(prefix)
 }
 
-fn validate_limits(limits: StorageLimits) -> Result<()> {
+pub(crate) fn validate_limits(limits: StorageLimits) -> Result<()> {
     if limits.max_bytes == 0
         || limits.max_keys == 0
         || limits.max_value_bytes == 0

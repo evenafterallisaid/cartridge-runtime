@@ -127,12 +127,12 @@ Work:
 Delivery slices:
 
 1. In-memory key/value contract, namespace isolation, quotas, guest bindings, and replay semantics.
-2. Durable directory backend with locking, atomic replacement, corruption detection, and recovery tests on every CI platform.
+2. Durable directory backend with locking, immutable generation commits, corruption detection, and recovery tests on every CI platform.
 3. Canonical snapshot format with content digests, CLI export/import, and transactional restore.
 4. Migration plans that run against a temporary snapshot before committing changes.
 5. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first slice is implemented. The runtime deliberately does not pretend that ephemeral memory is persistence; CLI invocations will gain durable state only after the second slice passes crash-recovery tests.
+The first two slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. The next slice defines portable snapshots without exposing the internal journal format as a compatibility promise.
 
 Exit criteria:
 
@@ -719,8 +719,8 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Implement the durable storage backend and crash-recovery harness.
-2. Define the portable storage snapshot format and CLI commands.
+1. Define the portable storage snapshot format and CLI export/import commands.
+2. Add migration dry runs and transactional restore.
 3. Add package-wide Merkle-style asset integrity.
 4. Create a minimal 2D window and input prototype behind new WIT packages.
 5. Build a small trace viewer after there is enough real trace data to design around.
@@ -731,5 +731,6 @@ Completed foundations:
 - standalone trace types, validation, summaries, and comparison
 - epoch deadlines alongside deterministic fuel limits
 - isolated in-memory storage with quotas and side-effect-free replay
+- checksummed durable generations, process locking, status, and recovery
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

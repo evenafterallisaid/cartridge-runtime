@@ -35,8 +35,18 @@ During replay, reads return the recorded bytes. Writes and deletes are checked a
 
 Traces may contain private storage values and should be treated as sensitive files.
 
-## Current backend
+## Backends
 
-`MemoryStorage` is shared by runs made through the same `Runtime` instance. It is deterministic, thread-safe, and useful for tests and embedders that provide their own lifecycle. The CLI creates one runtime per process, so its state is intentionally ephemeral for now.
+`MemoryStorage` is shared by runs made through the same `Runtime` instance. It is deterministic, thread-safe, and useful for tests and embedders that provide their own lifecycle. CLI runs without `--state-dir` intentionally remain ephemeral.
 
-The durable backend will use runtime-owned directories, process locking, crash-safe replacement, explicit corruption detection, and recovery tests on Windows, macOS, and Linux. Snapshot and migration commands will be built on that backend rather than encoding persistence assumptions into the guest ABI.
+`DirectoryStorage` persists the same contract beneath a caller-selected root. Namespace directory names are SHA-256 digests of cartridge ids. Each operation takes an exclusive operating-system file lock, so separate runtime processes cannot interleave read-modify-write commits.
+
+```sh
+cartridge run app.cartridge --state-dir ./state -- first-run
+cartridge storage status app.cartridge --state-dir ./state
+cartridge storage recover app.cartridge --state-dir ./state
+```
+
+State commits are immutable generations. The backend flushes a new temporary snapshot, renames it to a previously unused generation, and retains the prior valid generation. Incomplete temporary files are ignored and removed by the next write. Every generation contains a digest over its canonical payload; corrupt committed generations block normal access until explicit recovery quarantines them.
+
+The internal generation files are a recovery mechanism, not the future portable snapshot format. Snapshot and migration commands will use a separately versioned interchange format rather than making journal layout part of the guest ABI.

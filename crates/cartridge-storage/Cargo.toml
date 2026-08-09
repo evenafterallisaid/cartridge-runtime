@@ -6,7 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fs4 = "1.1.0"
+hex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

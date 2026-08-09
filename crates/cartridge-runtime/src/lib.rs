@@ -4,7 +4,9 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use cartridge_core::CartridgeArchive;
-pub use cartridge_storage::{MemoryStorage, StorageBackend, StorageLimits, StorageUsage};
+pub use cartridge_storage::{
+    DirectoryStorage, MemoryStorage, RecoveryReport, StorageBackend, StorageLimits, StorageUsage,
+};
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,
     TraceEvent, TraceIdentity, TraceResult, TraceSummary,

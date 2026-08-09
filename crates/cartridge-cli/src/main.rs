@@ -1,11 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
-use cartridge_runtime::Runtime;
+use cartridge_runtime::{DirectoryStorage, Runtime, StorageBackend};
 use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
 
@@ -58,6 +59,8 @@ enum Command {
         package: PathBuf,
         #[arg(long)]
         trace: Option<PathBuf>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -73,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         command: TraceCommand,
     },
+    /// inspect and recover durable cartridge state
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,6 +95,26 @@ enum TraceCommand {
     Diff {
         left: PathBuf,
         right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// show durable state usage for a cartridge
+    Status {
+        package: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// quarantine corrupt state and return to the newest valid generation
+    Recover {
+        package: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -111,8 +139,9 @@ fn main() -> Result<()> {
         Command::Run {
             package,
             trace,
+            state_dir,
             args,
-        } => run_command(&package, trace.as_deref(), &args),
+        } => run_command(&package, trace.as_deref(), state_dir.as_deref(), &args),
         Command::Replay {
             package,
             trace,
@@ -121,6 +150,18 @@ fn main() -> Result<()> {
         Command::Trace { command } => match command {
             TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
             TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
+        },
+        Command::Storage { command } => match command {
+            StorageCommand::Status {
+                package,
+                state_dir,
+                json,
+            } => storage_status_command(&package, &state_dir, json),
+            StorageCommand::Recover {
+                package,
+                state_dir,
+                json,
+            } => storage_recover_command(&package, &state_dir, json),
         },
     }
 }
@@ -204,8 +245,17 @@ fn resolve_command(root: &Path, candidates: &[PathBuf], json: bool) -> Result<()
     Ok(())
 }
 
-fn run_command(package: &Path, trace: Option<&Path>, args: &[String]) -> Result<()> {
-    let report = Runtime::new()?.run_file(package, args)?;
+fn run_command(
+    package: &Path,
+    trace: Option<&Path>,
+    state_dir: Option<&Path>,
+    args: &[String],
+) -> Result<()> {
+    let runtime = match state_dir {
+        Some(path) => Runtime::with_storage(Arc::new(DirectoryStorage::open(path)?))?,
+        None => Runtime::new()?,
+    };
+    let report = runtime.run_file(package, args)?;
     println!("{}", report.output);
     eprintln!("fuel consumed: {}", report.fuel_consumed);
     if let Some(path) = trace {
@@ -214,6 +264,48 @@ fn run_command(package: &Path, trace: Option<&Path>, args: &[String]) -> Result<
         }
         fs::write(path, serde_json::to_vec_pretty(&report.trace)?)?;
         eprintln!("trace: {}", path.display());
+    }
+    Ok(())
+}
+
+fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let storage = DirectoryStorage::open(state_dir)?;
+    let usage = storage.usage(&archive.manifest.cartridge.id)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "cartridge_id": archive.manifest.cartridge.id,
+                "state_dir": storage.root(),
+                "usage": usage,
+            }))?
+        );
+    } else {
+        println!("{}", archive.manifest.cartridge.id);
+        println!("state directory: {}", storage.root().display());
+        println!("keys: {}", usage.keys);
+        println!("bytes: {}", usage.bytes);
+    }
+    Ok(())
+}
+
+fn storage_recover_command(package: &Path, state_dir: &Path, json: bool) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let storage = DirectoryStorage::open(state_dir)?;
+    let report = storage.recover(&archive.manifest.cartridge.id)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("recovered {}", archive.manifest.cartridge.id);
+        match report.valid_generation {
+            Some(generation) => println!("active generation: {generation}"),
+            None => println!("active generation: empty"),
+        }
+        println!("quarantined: {}", report.quarantined.len());
+        println!("discarded pending: {}", report.discarded_pending);
     }
     Ok(())
 }

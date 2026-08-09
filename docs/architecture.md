@@ -24,7 +24,7 @@ WASI is linked for language-runtime compatibility, but it is not the cartridge p
 
 The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifests, unexpected component names, oversized files, and digest mismatches are rejected before execution.
 
-Storage backends receive the validated cartridge id as an opaque namespace. Guests never choose a namespace or receive a host path. Per-value, key-count, and total-byte limits are checked before a write changes state. The current in-memory backend is deterministic and primarily intended for tests; it defines the same contract future durable backends must preserve.
+Storage backends receive the validated cartridge id as an opaque namespace. Guests never choose a namespace or receive a host path. Per-value, key-count, and total-byte limits are checked before a write changes state. The in-memory backend is deterministic and useful for tests. The directory backend hashes namespace names, serializes writers with an operating-system file lock, and commits immutable checksummed generations while retaining one rollback point.
 
 Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline, so a component blocked in compute cannot avoid interruption simply because its fuel budget is large. Epoch timing is deliberately coarse and is not part of deterministic replay.
 

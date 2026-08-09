@@ -20,6 +20,11 @@ impl bindings::Guest for HelloCartridge {
 
         let message = read_asset("message.txt")?;
         let message = String::from_utf8(message).map_err(|error| error.to_string())?;
+        let previous_name = storage_get("session/last-user")?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| "none".into());
         storage_put("session/last-user", name.as_bytes())?;
         let stored_name = storage_get("session/last-user")?
             .ok_or_else(|| "stored name disappeared".to_owned())?;
@@ -33,6 +38,9 @@ impl bindings::Guest for HelloCartridge {
             return Err("stored name was not listed".into());
         }
         let timestamp = wall_clock_ms()?;
-        Ok(format!("{} {name} (host time: {timestamp} ms)", message.trim()))
+        Ok(format!(
+            "{} {name} (previous: {previous_name}, host time: {timestamp} ms)",
+            message.trim()
+        ))
     }
 }
