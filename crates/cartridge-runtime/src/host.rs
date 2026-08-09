@@ -3,7 +3,7 @@ mod storage;
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use cartridge_core::{PackageManifest, Permissions};
@@ -11,17 +11,28 @@ use cartridge_storage::{StorageBackend, StorageLimits};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use wasmtime::component::ResourceTable;
+use wasmtime::component::{HasData, Resource, ResourceTable};
 use wasmtime::{StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{
     WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-    clocks::{HostMonotonicClock, HostWallClock},
+    clocks::HostWallClock,
+    p2::bindings::{clocks::monotonic_clock, sync::io::poll},
+};
+use wasmtime_wasi_io::{
+    async_trait,
+    poll::{DynPollable, Pollable, subscribe},
 };
 
 use crate::{ReplayError, TraceEvent, cartridge};
 
 const MAX_RANDOM_BYTES: u32 = 1024 * 1024;
 const MAX_LOG_CHARACTERS: usize = 16 * 1024;
+const MAX_TRACE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRACE_EVENTS: usize = 100_000;
+const MAX_TABLE_ELEMENTS: usize = 1_000_000;
+const MAX_TABLES: usize = 8;
+const MAX_MEMORIES: usize = 4;
+const MAX_INSTANCES: usize = 32;
 
 pub(crate) struct HostState {
     table: ResourceTable,
@@ -33,9 +44,13 @@ pub(crate) struct HostState {
     storage_namespace: String,
     storage_limits: StorageLimits,
     pub(crate) events: Vec<TraceEvent>,
+    trace_bytes: usize,
+    trace_limit_reached: bool,
     next_sequence: u64,
     replay: Option<ReplayCursor>,
     divergence: Option<ReplayError>,
+    started_at: StdInstant,
+    deadline: StdInstant,
 }
 
 impl HostState {
@@ -50,8 +65,7 @@ impl HostState {
             .allow_udp(false)
             .allow_ip_name_lookup(false);
         if !manifest.permissions.clock {
-            wasi.wall_clock(FrozenWallClock)
-                .monotonic_clock(FrozenMonotonicClock);
+            wasi.wall_clock(FrozenWallClock);
         }
         if !manifest.permissions.random {
             wasi.secure_random(StdRng::seed_from_u64(0))
@@ -61,7 +75,12 @@ impl HostState {
         let wasi = wasi.build();
         let limits = StoreLimitsBuilder::new()
             .memory_size(manifest.runtime.memory_bytes)
+            .table_elements(MAX_TABLE_ELEMENTS)
+            .tables(MAX_TABLES)
+            .memories(MAX_MEMORIES)
+            .instances(MAX_INSTANCES)
             .build();
+        let started_at = StdInstant::now();
         Self {
             table: ResourceTable::new(),
             wasi,
@@ -76,9 +95,13 @@ impl HostState {
                 max_value_bytes: manifest.runtime.storage_value_bytes,
             },
             events: Vec::new(),
+            trace_bytes: 0,
+            trace_limit_reached: false,
             next_sequence: 0,
             replay: replay_events.map(ReplayCursor::new),
             divergence: None,
+            started_at,
+            deadline: started_at + Duration::from_millis(manifest.runtime.timeout_ms),
         }
     }
 
@@ -96,6 +119,25 @@ impl HostState {
     }
 
     fn record(&mut self, capability: &str, operation: &str, outcome: Value) {
+        if self.trace_limit_reached {
+            return;
+        }
+        let event_bytes = capability
+            .len()
+            .saturating_add(operation.len())
+            .saturating_add(serde_json::to_vec(&outcome).map_or(usize::MAX, |value| value.len()))
+            .saturating_add(128);
+        let next_trace_bytes = self.trace_bytes.saturating_add(event_bytes);
+        if self.events.len() >= MAX_TRACE_EVENTS || next_trace_bytes > MAX_TRACE_BYTES {
+            self.trace_limit_reached = true;
+            if self.divergence.is_none() {
+                self.divergence = Some(ReplayError::TraceLimitExceeded {
+                    events: self.events.len(),
+                    bytes: self.trace_bytes,
+                });
+            }
+            return;
+        }
         let actual = TraceEvent {
             sequence: self.next_sequence,
             capability: capability.to_owned(),
@@ -122,6 +164,7 @@ impl HostState {
             self.set_divergence(reason);
         }
         self.events.push(actual);
+        self.trace_bytes = next_trace_bytes;
         self.next_sequence += 1;
     }
 
@@ -183,15 +226,135 @@ impl HostWallClock for FrozenWallClock {
     }
 }
 
-struct FrozenMonotonicClock;
+pub(crate) struct RuntimeMonotonic;
 
-impl HostMonotonicClock for FrozenMonotonicClock {
-    fn resolution(&self) -> u64 {
-        1
+impl HasData for RuntimeMonotonic {
+    type Data<'a> = RuntimeMonotonicView<'a>;
+}
+
+pub(crate) struct RuntimeMonotonicView<'a> {
+    pub(crate) state: &'a mut HostState,
+}
+
+impl monotonic_clock::Host for RuntimeMonotonicView<'_> {
+    fn now(&mut self) -> wasmtime::Result<u64> {
+        Ok(self.monotonic_now())
     }
 
-    fn now(&self) -> u64 {
-        0
+    fn resolution(&mut self) -> wasmtime::Result<u64> {
+        Ok(1)
+    }
+
+    fn subscribe_instant(&mut self, when: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        self.subscribe(when.saturating_sub(self.monotonic_now()))
+    }
+
+    fn subscribe_duration(&mut self, duration: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        self.subscribe(duration)
+    }
+}
+
+impl RuntimeMonotonicView<'_> {
+    fn monotonic_now(&self) -> u64 {
+        if self.state.permissions.clock {
+            self.state
+                .started_at
+                .elapsed()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        } else {
+            0
+        }
+    }
+
+    fn subscribe(&mut self, requested_nanoseconds: u64) -> wasmtime::Result<Resource<DynPollable>> {
+        let remaining = self
+            .state
+            .deadline
+            .saturating_duration_since(StdInstant::now());
+        let delay = bounded_delay(requested_nanoseconds, remaining);
+        let deadline = tokio::time::Instant::now() + delay;
+        let resource = self.state.table.push(BoundedDeadline { deadline })?;
+        subscribe(&mut self.state.table, resource)
+    }
+}
+
+fn bounded_delay(requested_nanoseconds: u64, remaining: Duration) -> Duration {
+    Duration::from_nanos(requested_nanoseconds).min(remaining)
+}
+
+struct BoundedDeadline {
+    deadline: tokio::time::Instant,
+}
+
+#[async_trait]
+impl Pollable for BoundedDeadline {
+    async fn ready(&mut self) {
+        tokio::time::sleep_until(self.deadline).await;
+    }
+}
+
+pub(crate) struct RuntimePoll;
+
+impl HasData for RuntimePoll {
+    type Data<'a> = RuntimePollView<'a>;
+}
+
+pub(crate) struct RuntimePollView<'a> {
+    pub(crate) state: &'a mut HostState,
+}
+
+impl RuntimePollView<'_> {
+    fn check_deadline(&self) -> wasmtime::Result<()> {
+        if StdInstant::now() >= self.state.deadline {
+            return Err(wasmtime::Error::msg(
+                "cartridge wall-clock deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl poll::Host for RuntimePollView<'_> {
+    fn poll(&mut self, pollables: Vec<Resource<DynPollable>>) -> wasmtime::Result<Vec<u32>> {
+        let ready = wasmtime_wasi::runtime::in_tokio(
+            wasmtime_wasi_io::bindings::wasi::io::poll::Host::poll(
+                &mut self.state.table,
+                pollables,
+            ),
+        )?;
+        self.check_deadline()?;
+        Ok(ready)
+    }
+}
+
+impl poll::HostPollable for RuntimePollView<'_> {
+    fn block(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<()> {
+        wasmtime_wasi::runtime::in_tokio(
+            wasmtime_wasi_io::bindings::wasi::io::poll::HostPollable::block(
+                &mut self.state.table,
+                pollable,
+            ),
+        )?;
+        self.check_deadline()
+    }
+
+    fn ready(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<bool> {
+        self.check_deadline()?;
+        wasmtime_wasi::runtime::in_tokio(
+            wasmtime_wasi_io::bindings::wasi::io::poll::HostPollable::ready(
+                &mut self.state.table,
+                pollable,
+            ),
+        )
+    }
+
+    fn drop(&mut self, pollable: Resource<DynPollable>) -> wasmtime::Result<()> {
+        wasmtime_wasi_io::bindings::wasi::io::poll::HostPollable::drop(
+            &mut self.state.table,
+            pollable,
+        )
     }
 }
 
@@ -206,6 +369,9 @@ impl WasiView for HostState {
 
 impl cartridge::api::host::Host for HostState {
     fn log(&mut self, level: cartridge::api::host::LogLevel, message: String) {
+        if self.trace_limit_reached {
+            return;
+        }
         let message: String = message.chars().take(MAX_LOG_CHARACTERS).collect();
         let label = match level {
             cartridge::api::host::LogLevel::Debug => "debug",
@@ -213,7 +379,7 @@ impl cartridge::api::host::Host for HostState {
             cartridge::api::host::LogLevel::Warn => "warn",
             cartridge::api::host::LogLevel::Error => "error",
         };
-        eprintln!("[{label}] {message}");
+        eprintln!("[{label}] {}", terminal_safe(&message));
         self.record(
             "log",
             "write",
@@ -344,6 +510,18 @@ impl cartridge::api::host::Host for HostState {
     }
 }
 
+fn terminal_safe(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 fn event_label(event: &TraceEvent) -> String {
     format!(
         "event {} {}.{} with {}",
@@ -373,6 +551,76 @@ mod tests {
         assert!(!is_safe_asset_path("../secret"));
         assert!(!is_safe_asset_path("C:/secret"));
         assert!(!is_safe_asset_path("images\\icon.png"));
+    }
+
+    #[test]
+    fn wasi_waits_are_clamped_to_the_runtime_deadline() {
+        let remaining = Duration::from_millis(250);
+
+        assert_eq!(bounded_delay(u64::MAX, remaining), remaining);
+        assert_eq!(bounded_delay(1_000, remaining), Duration::from_micros(1));
+    }
+
+    #[test]
+    fn terminal_controls_are_escaped() {
+        assert_eq!(terminal_safe("ok\u{1b}[2J\nnext"), "ok\\u{1b}[2J\\nnext");
+    }
+
+    #[test]
+    fn trace_growth_stops_at_the_byte_budget() {
+        let mut state = HostState::new(
+            &manifest(Permissions::default()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+
+        state.record(
+            "test",
+            "large",
+            json!({ "value": "x".repeat(MAX_TRACE_BYTES) }),
+        );
+
+        assert!(state.events.is_empty());
+        assert!(matches!(
+            state.finish_replay(),
+            Err(ReplayError::TraceLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn table_growth_is_bounded_independently_from_linear_memory() {
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(
+            &engine,
+            "(module
+                (table 1 funcref)
+                (func (export \"grow\") (param i32) (result i32)
+                    ref.null func
+                    local.get 0
+                    table.grow))",
+        )
+        .unwrap();
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostState::new(
+                &manifest(Permissions::default()),
+                BTreeMap::new(),
+                Arc::new(MemoryStorage::new()),
+                None,
+            ),
+        );
+        store.limiter(|state| &mut state.limits);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .unwrap();
+
+        assert_eq!(
+            grow.call(&mut store, i32::try_from(MAX_TABLE_ELEMENTS).unwrap(),)
+                .unwrap(),
+            -1
+        );
     }
 
     #[test]

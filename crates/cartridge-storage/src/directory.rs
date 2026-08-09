@@ -1,17 +1,16 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
-use fs4::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-#[cfg(unix)]
-use std::fs::File;
 
 use crate::{
     Error, Result, StorageBackend, StorageLimits, StorageSnapshot, StorageUsage, validate_key,
@@ -20,7 +19,9 @@ use crate::{
 
 const DISK_FORMAT_VERSION: u32 = 2;
 const RETAINED_GENERATIONS: usize = 2;
-const MAX_STATE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+const MAX_STATE_FILE_BYTES: u64 = 144 * 1024 * 1024;
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -151,6 +152,7 @@ impl DirectoryStorage {
         validate_namespace(namespace)?;
         let directory = self.namespace_directory(namespace);
         fs::create_dir_all(&directory)?;
+        set_private_directory_permissions(&directory)?;
         let lock_path = directory.join("namespace.lock");
         let lock = OpenOptions::new()
             .read(true)
@@ -158,7 +160,7 @@ impl DirectoryStorage {
             .create(true)
             .truncate(false)
             .open(lock_path)?;
-        FileExt::lock(&lock)?;
+        acquire_lock(&lock)?;
         let result = operation(&directory);
         drop(lock);
         result
@@ -167,6 +169,22 @@ impl DirectoryStorage {
     fn namespace_directory(&self, namespace: &str) -> PathBuf {
         self.root
             .join(hex::encode(Sha256::digest(namespace.as_bytes())))
+    }
+}
+
+fn acquire_lock(file: &File) -> Result<()> {
+    let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+    loop {
+        match FileExt::try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(Error::LockTimeout {
+                    milliseconds: u64::try_from(LOCK_WAIT_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(LOCK_RETRY_INTERVAL),
+        }
     }
 }
 
@@ -497,10 +515,7 @@ fn commit_state(directory: &Path, namespace: &str, mut state: State) -> Result<(
     let encoded = serde_json::to_vec(&envelope)?;
     let final_path = directory.join(state_file_name(state.generation));
     let temporary = unique_path(directory, "pending", "tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut file = open_private_new(&temporary)?;
     file.write_all(&encoded)?;
     file.sync_all()?;
     drop(file);
@@ -511,6 +526,28 @@ fn commit_state(directory: &Path, namespace: &str, mut state: State) -> Result<(
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     value == &T::default()
+}
+
+fn open_private_new(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = fs::metadata(path)?;
+    Ok(())
 }
 
 fn state_files(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
@@ -757,6 +794,29 @@ mod tests {
             first.list("dev.example.test", "").unwrap(),
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn contended_locks_fail_within_a_fixed_budget() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        let namespace = storage.namespace_directory("dev.example.test");
+        fs::create_dir_all(&namespace).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(namespace.join("namespace.lock"))
+            .unwrap();
+        FileExt::lock(&held).unwrap();
+        let started = Instant::now();
+
+        assert!(matches!(
+            storage.usage("dev.example.test"),
+            Err(Error::LockTimeout { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

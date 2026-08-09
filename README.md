@@ -10,6 +10,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Reproducible `.cartridge` packages with SHA-256 component verification
 - Manifest-declared clock, randomness, packaged-asset, and scoped-storage capabilities
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
+- Bounded archive inflation, Wasm tables, WASI waits, traces, and storage-lock acquisition
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
 - Deterministic trace recording, replay, and first-divergence detection
 - Standalone trace validation, summaries, and trace-to-trace diffing

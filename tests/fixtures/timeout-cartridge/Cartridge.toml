@@ -1,0 +1,14 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.timeout-fixture"
+name = "Timeout Fixture"
+version = "0.1.0"
+
+[permissions]
+clock = false
+
+[runtime]
+fuel = 10000000
+memory_bytes = 67108864
+timeout_ms = 200

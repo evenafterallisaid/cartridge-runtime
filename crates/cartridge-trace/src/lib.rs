@@ -92,10 +92,12 @@ impl ExecutionTrace {
 
     pub fn validate_invocation(
         &self,
+        runtime_version: &str,
         identity: TraceIdentity<'_>,
         args: &[String],
     ) -> Result<(), ReplayError> {
         self.validate()?;
+        check_identity("runtime version", &self.runtime_version, runtime_version)?;
         check_identity("cartridge id", &self.cartridge_id, identity.cartridge_id)?;
         check_identity(
             "cartridge version",
@@ -244,6 +246,8 @@ pub enum ReplayError {
     Divergence { sequence: u64, reason: String },
     #[error("trace contains {remaining} unconsumed event(s) after execution")]
     EventsRemaining { remaining: usize },
+    #[error("trace budget exceeded after {events} event(s) and {bytes} byte(s)")]
+    TraceLimitExceeded { events: usize, bytes: usize },
     #[error("replay {field} mismatch: expected {expected:?}, got {actual:?}")]
     ResultMismatch {
         field: &'static str,
@@ -404,10 +408,28 @@ mod tests {
         };
 
         let error = trace
-            .validate_invocation(identity, &["two".to_owned()])
+            .validate_invocation("0.1.0", identity, &["two".to_owned()])
             .unwrap_err();
 
         assert!(matches!(error, ReplayError::InvocationMismatch { .. }));
+    }
+
+    #[test]
+    fn invocation_requires_the_recorded_runtime_version() {
+        let trace = trace();
+        let identity = TraceIdentity {
+            cartridge_id: "dev.example.trace",
+            cartridge_version: "0.1.0",
+            component_sha256: &"a".repeat(64),
+        };
+
+        assert!(matches!(
+            trace.validate_invocation("0.2.0", identity, &["one".to_owned()]),
+            Err(ReplayError::IdentityMismatch {
+                field: "runtime version",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -16,7 +16,7 @@ use crate::{
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
-const MAX_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 144 * 1024 * 1024;
 
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -169,10 +169,7 @@ impl StorageSnapshot {
         }
         let directory = parent.unwrap_or_else(|| Path::new("."));
         let temporary = temporary_path(directory);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut file = open_private_new(&temporary)?;
         file.write_all(&serde_json::to_vec_pretty(self)?)?;
         file.sync_all()?;
         drop(file);
@@ -380,6 +377,17 @@ fn temporary_path(directory: &Path) -> PathBuf {
         ".cartridge-snapshot-{}-{sequence}.tmp",
         std::process::id()
     ))
+}
+
+fn open_private_new(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]

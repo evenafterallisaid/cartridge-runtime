@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use sha2::{Digest, Sha256};
@@ -10,6 +11,8 @@ use walkdir::WalkDir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{Error, PackageManifest, Result, normalize_relative_path};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct PackOptions {
@@ -61,7 +64,11 @@ pub fn pack(options: &PackOptions) -> Result<PackageManifest> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    fs::rename(&temporary, &options.output)?;
+    if let Err(error) = fs::hard_link(&temporary, &options.output) {
+        let _ = fs::remove_file(&temporary);
+        return Err(Error::Io(error));
+    }
+    fs::remove_file(&temporary)?;
     Ok(manifest)
 }
 
@@ -85,8 +92,15 @@ fn collect_assets(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             .map_err(|error| Error::Archive(error.to_string()))?;
         let path = relative
             .components()
-            .map(|part| part.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
+            .map(|part| {
+                part.as_os_str().to_str().ok_or_else(|| {
+                    Error::Archive(format!(
+                        "asset path is not valid UTF-8: {}",
+                        entry.path().display()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
             .join("/");
         let path = normalize_relative_path(&path)?;
         assets.insert(path, fs::read(entry.path())?);
@@ -100,7 +114,7 @@ fn write_archive(
     component: &[u8],
     assets: &BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
-    let file = File::create(path)?;
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -119,14 +133,16 @@ fn write_archive(
 }
 
 fn temporary_path(output: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut path = output.as_os_str().to_owned();
-    path.push(".tmp");
+    path.push(format!(".{}-{sequence}.tmp", std::process::id()));
     PathBuf::from(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     #[test]
     fn rejects_non_wasm_component() {
@@ -156,5 +172,39 @@ version = "0.1.0"
             output: directory.path().join("bad.cartridge"),
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn packing_does_not_overwrite_an_existing_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("Cartridge.toml");
+        let component = directory.path().join("component.wasm");
+        let output = directory.path().join("kept.cartridge");
+        File::create(&manifest)
+            .unwrap()
+            .write_all(
+                br#"format_version = 1
+[cartridge]
+id = "dev.example.safe-pack"
+name = "Safe Pack"
+version = "0.1.0"
+"#,
+            )
+            .unwrap();
+        File::create(&component)
+            .unwrap()
+            .write_all(b"\0asm\x01\0\0\0")
+            .unwrap();
+        fs::write(&output, b"keep me").unwrap();
+
+        let result = pack(&PackOptions {
+            manifest,
+            component,
+            assets: None,
+            output: output.clone(),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(output).unwrap(), b"keep me");
     }
 }

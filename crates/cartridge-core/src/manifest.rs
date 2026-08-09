@@ -17,9 +17,11 @@ const DEFAULT_STORAGE_BYTES: usize = 1024 * 1024;
 const DEFAULT_STORAGE_KEYS: usize = 1024;
 const DEFAULT_STORAGE_VALUE_BYTES: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
-const MAX_STORAGE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_FUEL: u64 = 1_000_000_000_000;
+const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_STORAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORAGE_KEYS: usize = 100_000;
+const MAX_STORAGE_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 const MAX_MIGRATIONS: usize = 256;
 
@@ -60,10 +62,10 @@ impl PackageManifest {
         Version::parse(&self.cartridge.version)
             .map_err(|error| Error::Manifest(format!("version must be valid SemVer: {error}")))?;
 
-        if self.runtime.fuel == 0 {
-            return Err(Error::Manifest(
-                "runtime fuel must be greater than zero".into(),
-            ));
+        if !(1..=MAX_FUEL).contains(&self.runtime.fuel) {
+            return Err(Error::Manifest(format!(
+                "runtime fuel must be between 1 and {MAX_FUEL}"
+            )));
         }
         if !(1024 * 1024..=MAX_MEMORY_BYTES).contains(&self.runtime.memory_bytes) {
             return Err(Error::Manifest(format!(
@@ -88,11 +90,11 @@ impl PackageManifest {
         }
         if self.runtime.storage_value_bytes == 0
             || self.runtime.storage_value_bytes > self.runtime.storage_bytes
+            || self.runtime.storage_value_bytes > MAX_STORAGE_VALUE_BYTES
         {
-            return Err(Error::Manifest(
-                "runtime storage_value_bytes must be positive and no larger than storage_bytes"
-                    .into(),
-            ));
+            return Err(Error::Manifest(format!(
+                "runtime storage_value_bytes must be positive, no larger than storage_bytes, and at most {MAX_STORAGE_VALUE_BYTES}"
+            )));
         }
 
         validate_state(self)?;
@@ -561,6 +563,13 @@ mod tests {
     fn rejects_unbounded_memory() {
         let mut value = manifest();
         value.runtime.memory_bytes = usize::MAX;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_fuel() {
+        let mut value = manifest();
+        value.runtime.fuel = u64::MAX;
         assert!(value.validate().is_err());
     }
 

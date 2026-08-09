@@ -75,19 +75,20 @@ impl CartridgeArchive {
                     "archive entry is too large: {name}"
                 )));
             }
-            total_size = total_size
-                .checked_add(entry.size())
-                .ok_or_else(|| Error::Archive("archive size overflow".into()))?;
-            if total_size > limits.total_bytes {
+            let remaining = limits.total_bytes.saturating_sub(total_size);
+            if entry.size() > remaining {
                 return Err(Error::Archive(
                     "archive exceeds the total uncompressed size limit".into(),
                 ));
             }
-
-            let capacity = usize::try_from(entry.size())
-                .map_err(|_| Error::Archive(format!("archive entry is too large: {name}")))?;
-            let mut bytes = Vec::with_capacity(capacity);
-            entry.read_to_end(&mut bytes)?;
+            let declared_size = entry.size();
+            let bytes = read_bounded_entry(&mut entry, declared_size, limit.min(remaining), &name)?;
+            total_size =
+                total_size
+                    .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                        Error::Archive(format!("archive entry is too large: {name}"))
+                    })?)
+                    .ok_or_else(|| Error::Archive("archive size overflow".into()))?;
             entries.insert(name, bytes);
         }
 
@@ -122,6 +123,33 @@ impl CartridgeArchive {
             assets,
         })
     }
+}
+
+fn read_bounded_entry(
+    reader: &mut impl Read,
+    declared_size: u64,
+    limit: u64,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let capacity = usize::try_from(declared_size.min(limit))
+        .map_err(|_| Error::Archive(format!("archive entry is too large: {name}")))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let actual_size = u64::try_from(bytes.len())
+        .map_err(|_| Error::Archive(format!("archive entry is too large: {name}")))?;
+    if actual_size > limit {
+        return Err(Error::Archive(format!(
+            "archive entry exceeded its decompressed size limit: {name}"
+        )));
+    }
+    if actual_size != declared_size {
+        return Err(Error::Archive(format!(
+            "archive entry size does not match its contents: {name}"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn verify_component(manifest: &PackageManifest, component: &[u8]) -> Result<()> {
@@ -166,6 +194,8 @@ fn verify_assets(manifest: &PackageManifest, assets: &BTreeMap<String, Vec<u8>>)
 mod tests {
     use super::*;
     use crate::{CartridgeMetadata, Integrity, Permissions, RuntimeLimits, Services, StateConfig};
+    use std::io::{Cursor, Write};
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     #[test]
     fn rejects_a_component_that_changed_after_packing() {
@@ -224,5 +254,57 @@ mod tests {
 
         assert!(verify_assets(&manifest, &valid).is_ok());
         assert!(verify_assets(&manifest, &tampered).is_err());
+    }
+
+    #[test]
+    fn bounded_reads_reject_more_data_than_the_declared_size() {
+        let mut input = std::io::Cursor::new(vec![0_u8; 1024]);
+
+        assert!(matches!(
+            read_bounded_entry(&mut input, 1, 512, "component.wasm"),
+            Err(Error::Archive(message)) if message.contains("decompressed size limit")
+        ));
+    }
+
+    #[test]
+    fn bounded_reads_reject_declared_size_mismatches() {
+        let mut input = std::io::Cursor::new(vec![0_u8; 16]);
+
+        assert!(matches!(
+            read_bounded_entry(&mut input, 1, 512, "component.wasm"),
+            Err(Error::Archive(message)) if message.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn zip_metadata_cannot_hide_inflated_bytes() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                COMPONENT_PATH,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(&vec![0_u8; 64 * 1024]).unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+
+        let local = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x03\x04")
+            .unwrap();
+        bytes[local + 22..local + 26].copy_from_slice(&1_u32.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.size(), 1);
+        assert!(matches!(
+            read_bounded_entry(&mut entry, 1, 1024, COMPONENT_PATH),
+            Err(Error::Archive(message)) if message.contains("decompressed size limit")
+        ));
     }
 }

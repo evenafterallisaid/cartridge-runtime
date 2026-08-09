@@ -209,6 +209,8 @@ pub enum Error {
     SnapshotIdentity { expected: String, actual: String },
     #[error("state uses schema {actual}; expected schema {expected}")]
     SchemaMismatch { expected: u32, actual: u32 },
+    #[error("storage lock was not available within {milliseconds} ms")]
+    LockTimeout { milliseconds: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

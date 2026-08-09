@@ -771,5 +771,13 @@ Completed foundations:
 - isolated snapshot branch execution with optional result export
 - state schemas persisted across memory, durable generations, and portable snapshots
 - validated manifest migration graphs and identity-bound ordered plans
+- bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
+
+Security work immediately ahead:
+
+1. Bind package identity to developer signatures before treating cartridge ids as storage principals.
+2. Move component compilation and high-risk adapters into killable worker processes with operating-system limits.
+3. Add trace redaction profiles and encrypted support bundles.
+4. Add archive, manifest, snapshot, and trace fuzz targets seeded with the security regression corpus.
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

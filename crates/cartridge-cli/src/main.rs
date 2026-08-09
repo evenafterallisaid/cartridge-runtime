@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,6 +12,8 @@ use cartridge_runtime::{
 };
 use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
+
+const MAX_TRACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -348,13 +351,13 @@ fn run_command(
         };
         runtime.run_file(package, args)?
     };
-    println!("{}", report.output);
+    println!("{}", terminal_safe(&report.output));
     eprintln!("fuel consumed: {}", report.fuel_consumed);
     if let Some(path) = trace {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_vec_pretty(&report.trace)?)?;
+        write_private(path, &serde_json::to_vec_pretty(&report.trace)?)?;
         eprintln!("trace: {}", path.display());
     }
     if let Some(path) = snapshot_output {
@@ -582,7 +585,7 @@ fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
     let trace = read_trace(trace)?;
     let event_count = trace.events.len();
     let report = Runtime::new()?.replay_file(package, args, trace)?;
-    println!("{}", report.output);
+    println!("{}", terminal_safe(&report.output));
     eprintln!(
         "replay matched {event_count} event(s), {} fuel",
         report.fuel_consumed
@@ -635,6 +638,13 @@ fn trace_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
 }
 
 fn read_trace(path: &Path) -> Result<ExecutionTrace> {
+    if fs::metadata(path)?.len() > MAX_TRACE_FILE_BYTES {
+        bail!(
+            "trace {} exceeds the {} byte input limit",
+            path.display(),
+            MAX_TRACE_FILE_BYTES
+        );
+    }
     let bytes =
         fs::read(path).with_context(|| format!("could not read trace {}", path.display()))?;
     let trace: ExecutionTrace = serde_json::from_slice(&bytes)
@@ -643,6 +653,37 @@ fn read_trace(path: &Path) -> Result<ExecutionTrace> {
         .validate()
         .with_context(|| format!("invalid trace {}", path.display()))?;
     Ok(trace)
+}
+
+fn terminal_safe(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn print_trace_difference(difference: &TraceDifference) -> Result<()> {

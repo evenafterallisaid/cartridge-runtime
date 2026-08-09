@@ -13,11 +13,14 @@ pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, ReplayError, TraceComparison, TraceDifference,
     TraceEvent, TraceIdentity, TraceResult, TraceSummary,
 };
-use host::HostState;
+use host::{HostState, RuntimeMonotonic, RuntimeMonotonicView, RuntimePoll, RuntimePollView};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
+use wasmtime_wasi::p2::bindings::sync::io::poll;
 
 const EPOCH_TICK_MS: u64 = 10;
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -71,7 +74,11 @@ impl Runtime {
         args: &[String],
         trace: ExecutionTrace,
     ) -> Result<RunReport> {
-        trace.validate_invocation(trace_identity(&archive.manifest), args)?;
+        trace.validate_invocation(
+            env!("CARGO_PKG_VERSION"),
+            trace_identity(&archive.manifest),
+            args,
+        )?;
         self.execute(archive, args, Some(trace))
     }
 
@@ -91,6 +98,12 @@ impl Runtime {
             .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+        linker.allow_shadowing(true);
+        monotonic_clock::add_to_linker::<_, RuntimeMonotonic>(&mut linker, |state| {
+            RuntimeMonotonicView { state }
+        })?;
+        poll::add_to_linker::<_, RuntimePoll>(&mut linker, |state| RuntimePollView { state })?;
+        linker.allow_shadowing(false);
         Cartridge::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
         let manifest = archive.manifest;
@@ -119,6 +132,11 @@ impl Runtime {
         let result =
             call_result.map_err(|error| anyhow!("the component trapped while running: {error}"))?;
         let output = result.map_err(|message| anyhow!("cartridge returned an error: {message}"))?;
+        if output.len() > MAX_OUTPUT_BYTES {
+            return Err(anyhow!(
+                "cartridge output exceeds the {MAX_OUTPUT_BYTES} byte limit"
+            ));
+        }
         let fuel_consumed = manifest.runtime.fuel.saturating_sub(fuel_remaining);
         let trace_result = TraceResult {
             output: output.clone(),

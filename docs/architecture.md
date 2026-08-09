@@ -18,17 +18,17 @@ The current execution path is:
 
 ## Trust boundaries
 
-The component is untrusted. The host validates all paths, bounds random-data requests, limits WebAssembly fuel and memory, and never extracts archive entries onto disk. Packaged assets are held in memory and addressed by normalized relative paths.
+The component is untrusted. The host validates all paths, bounds random-data requests, caps fuel, linear memory, table elements, table count, memory count, instance count, trace growth, and final output, and never extracts archive entries onto disk. Packaged assets are held in memory and addressed by normalized relative paths.
 
 WASI is linked for language-runtime compatibility, but it is not the cartridge permission model. The context has no terminal, environment, arguments, or preopened directories, and its network interfaces are disabled. When clock or randomness permission is absent, the corresponding WASI services use inert deterministic providers instead of host state. Cartridges should use `cartridge:api/host` when they need observable, traceable capability results.
 
-The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifests, unexpected component names, oversized files, and digest mismatches are rejected before execution.
+The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifests, unexpected component names, oversized files, declared-size mismatches, and digest mismatches are rejected before execution. Entry and total limits are enforced while data is decompressed rather than trusting ZIP metadata.
 
 Storage backends receive the validated cartridge id as an opaque namespace. Guests never choose a namespace or receive a host path. Per-value, key-count, and total-byte limits are checked before a write changes state. The in-memory backend is deterministic and useful for tests. The directory backend hashes namespace names, serializes writers with an operating-system file lock, and commits immutable checksummed generations while retaining one rollback point.
 
 Portable snapshots sit above the backend contract. They contain sorted key/value state and cartridge identity, but no host path, lock, journal generation, timestamp, or platform metadata. Restore validates identity, integrity, and quotas before replacing a namespace in one locked generation. Dry runs use the same plan without committing it.
 
-Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline, so a component blocked in compute cannot avoid interruption simply because its fuel budget is large. Epoch timing is deliberately coarse and is not part of deterministic replay.
+Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline during guest execution. WASI monotonic subscriptions are clamped to the same remaining deadline, so a guest cannot escape the budget by sleeping inside a host poll call. Storage lock acquisition also has a fixed upper bound. Epoch timing is deliberately coarse and is not part of deterministic replay.
 
 The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, while the host controls which imports are linked. A security review, signed packages, cache isolation, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.
 
@@ -59,7 +59,7 @@ The manifest and direct resolver are implemented. Live multi-instance wiring and
 
 ## Tracing and replay
 
-Every call through the cartridge capability API receives a monotonically increasing sequence number. Trace format v2 binds the recording to a component digest and argument list. During replay, nondeterministic clock and random results come from the trace; deterministic calls are recomputed and compared. Output, fuel usage, missing events, and extra events are checked after execution.
+Every call through the cartridge capability API receives a monotonically increasing sequence number. Trace format v2 binds the recording to a runtime version, component digest, and argument list. During replay, nondeterministic clock and random results come from the trace; deterministic calls are recomputed and compared. Output, fuel usage, missing events, extra events, and trace growth limits are checked after execution.
 
 Trace types live in `cartridge-trace`, which does not depend on Wasmtime or the package reader. This lets the CLI and future debugger validate, summarize, and compare recordings without loading executable code.
 

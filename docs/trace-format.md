@@ -35,7 +35,7 @@ The runtime validates these fields before compiling the component:
 
 During execution, clock and random calls take their results from the next trace event. Deterministic calls such as logs and asset reads are executed normally and compared with the recorded event. The runtime stops at the first different sequence and reports the expected and actual operations or values.
 
-Replay also fails when execution produces an extra event, leaves recorded events unused, changes its final output, or consumes a different amount of fuel.
+Replay also fails when the runtime version differs, execution produces an extra event, leaves recorded events unused, changes its final output, consumes a different amount of fuel, or exceeds the trace budget.
 
 ## Inspection and comparison
 
@@ -57,4 +57,4 @@ Runtime upgrades may change fuel accounting or capability behavior. A future tra
 
 ## Privacy
 
-Traces can contain command arguments, logs, random bytes, storage values, network responses, and input events. They must be treated as potentially sensitive diagnostic files. Redaction and encrypted crash bundles are required before traces are convenient to share publicly.
+Traces can contain command arguments, logs, random bytes, storage values, network responses, and input events. They are created with private Unix permissions but must still be treated as sensitive diagnostic files. Redaction and encrypted crash bundles are required before traces are convenient to share publicly.

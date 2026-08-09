@@ -35,6 +35,9 @@ jobs:
       - name: Build example component
         run: cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
+      - name: Build timeout regression component
+        run: cargo build --manifest-path tests/fixtures/timeout-cartridge/Cargo.toml --target wasm32-wasip2 --release
+
       - name: Run end-to-end example
         shell: bash
         run: |
@@ -61,3 +64,26 @@ jobs:
           cargo run -p cartridge-cli -- trace inspect hello.trace.json
           cargo run -p cartridge-cli -- trace diff hello.trace.json hello.trace.json
           cargo run -p cartridge-cli -- replay hello.cartridge hello.trace.json -- CI
+          cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
+          binary=target/debug/cartridge
+          if [ -x target/debug/cartridge.exe ]; then binary=target/debug/cartridge.exe; fi
+          set +e
+          "$binary" run timeout.cartridge &
+          runtime_pid=$!
+          for attempt in {1..30}; do
+            if ! kill -0 "$runtime_pid" 2>/dev/null; then
+              wait "$runtime_pid"
+              runtime_status=$?
+              set -e
+              if [ "$runtime_status" -eq 0 ]; then
+                echo "timeout fixture unexpectedly completed"
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 0.1
+          done
+          kill "$runtime_pid" 2>/dev/null
+          wait "$runtime_pid" 2>/dev/null
+          echo "timeout fixture escaped the runtime deadline"
+          exit 1
