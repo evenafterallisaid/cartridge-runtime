@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
+pub const MIGRATION_PLAN_FORMAT_VERSION: u32 = 1;
 
 const DEFAULT_FUEL: u64 = 10_000_000;
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -20,6 +21,7 @@ const MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_STORAGE_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_STORAGE_KEYS: usize = 100_000;
 const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+const MAX_MIGRATIONS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +32,8 @@ pub struct PackageManifest {
     pub permissions: Permissions,
     #[serde(default)]
     pub runtime: RuntimeLimits,
+    #[serde(default, skip_serializing_if = "StateConfig::is_empty")]
+    pub state: StateConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<CartridgeDependency>,
     #[serde(default, skip_serializing_if = "Services::is_empty")]
@@ -91,6 +95,8 @@ impl PackageManifest {
             ));
         }
 
+        validate_state(self)?;
+
         if !self.integrity.component_sha256.is_empty()
             && !is_sha256(&self.integrity.component_sha256)
         {
@@ -109,6 +115,45 @@ impl PackageManifest {
         }
         validate_relationships(self)?;
         Ok(())
+    }
+
+    pub fn migration_plan(&self, source_schema: u32) -> Result<MigrationPlan> {
+        self.validate()?;
+        if source_schema > self.state.schema {
+            return Err(Error::Manifest(format!(
+                "state schema {source_schema} is newer than package schema {}",
+                self.state.schema
+            )));
+        }
+
+        let migrations: BTreeMap<_, _> = self
+            .state
+            .migrations
+            .iter()
+            .map(|migration| (migration.from, migration))
+            .collect();
+        let mut current = source_schema;
+        let mut steps = Vec::new();
+        while current < self.state.schema {
+            let migration = migrations.get(&current).ok_or_else(|| {
+                Error::Manifest(format!(
+                    "no migration path from state schema {source_schema} to {}",
+                    self.state.schema
+                ))
+            })?;
+            steps.push((*migration).clone());
+            current = migration.to;
+        }
+
+        Ok(MigrationPlan {
+            format_version: MIGRATION_PLAN_FORMAT_VERSION,
+            cartridge_id: self.cartridge.id.clone(),
+            cartridge_version: self.cartridge.version.clone(),
+            component_sha256: self.integrity.component_sha256.clone(),
+            source_schema,
+            target_schema: self.state.schema,
+            steps,
+        })
     }
 }
 
@@ -154,6 +199,41 @@ impl Default for RuntimeLimits {
             storage_value_bytes: DEFAULT_STORAGE_VALUE_BYTES,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StateConfig {
+    pub schema: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub migrations: Vec<StateMigration>,
+}
+
+impl StateConfig {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.schema == 0 && self.migrations.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateMigration {
+    pub name: String,
+    pub from: u32,
+    pub to: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationPlan {
+    pub format_version: u32,
+    pub cartridge_id: String,
+    pub cartridge_version: String,
+    pub component_sha256: String,
+    pub source_schema: u32,
+    pub target_schema: u32,
+    pub steps: Vec<StateMigration>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -332,6 +412,63 @@ fn validate_relationships(manifest: &PackageManifest) -> Result<()> {
     Ok(())
 }
 
+fn validate_state(manifest: &PackageManifest) -> Result<()> {
+    if manifest.state.schema > 0 && !manifest.permissions.storage {
+        return Err(Error::Manifest(
+            "state schema requires permissions.storage = true".into(),
+        ));
+    }
+    if manifest.state.migrations.len() > MAX_MIGRATIONS {
+        return Err(Error::Manifest(format!(
+            "state cannot declare more than {MAX_MIGRATIONS} migrations"
+        )));
+    }
+
+    let mut names = BTreeSet::new();
+    let mut sources = BTreeMap::new();
+    for migration in &manifest.state.migrations {
+        validate_alias(&migration.name, "migration name")?;
+        if !names.insert(&migration.name) {
+            return Err(Error::Manifest(format!(
+                "duplicate migration name: {}",
+                migration.name
+            )));
+        }
+        if migration.from >= migration.to {
+            return Err(Error::Manifest(format!(
+                "migration {} must increase the state schema",
+                migration.name
+            )));
+        }
+        if migration.to > manifest.state.schema {
+            return Err(Error::Manifest(format!(
+                "migration {} targets schema {} beyond package schema {}",
+                migration.name, migration.to, manifest.state.schema
+            )));
+        }
+        if sources.insert(migration.from, migration).is_some() {
+            return Err(Error::Manifest(format!(
+                "more than one migration starts at schema {}",
+                migration.from
+            )));
+        }
+    }
+
+    for migration in &manifest.state.migrations {
+        let mut current = migration.to;
+        while current < manifest.state.schema {
+            let next = sources.get(&current).ok_or_else(|| {
+                Error::Manifest(format!(
+                    "migration {} does not lead to package schema {}",
+                    migration.name, manifest.state.schema
+                ))
+            })?;
+            current = next.to;
+        }
+    }
+    Ok(())
+}
+
 fn validate_alias(value: &str, field: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 48
@@ -401,6 +538,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
             dependencies: Vec::new(),
             services: Services::default(),
             integrity: Integrity::default(),
@@ -488,5 +626,77 @@ mod tests {
         });
 
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn builds_a_deterministic_migration_plan() {
+        let mut value = manifest();
+        value.permissions.storage = true;
+        value.state = StateConfig {
+            schema: 3,
+            migrations: vec![
+                StateMigration {
+                    name: "add-profile".into(),
+                    from: 0,
+                    to: 1,
+                },
+                StateMigration {
+                    name: "split-settings".into(),
+                    from: 1,
+                    to: 3,
+                },
+            ],
+        };
+
+        let plan = value.migration_plan(0).unwrap();
+        assert_eq!(plan.source_schema, 0);
+        assert_eq!(plan.target_schema, 3);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].name, "split-settings");
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_incomplete_migration_graphs() {
+        let mut value = manifest();
+        value.permissions.storage = true;
+        value.state = StateConfig {
+            schema: 3,
+            migrations: vec![
+                StateMigration {
+                    name: "first".into(),
+                    from: 0,
+                    to: 1,
+                },
+                StateMigration {
+                    name: "other".into(),
+                    from: 0,
+                    to: 2,
+                },
+            ],
+        };
+
+        assert!(value.validate().is_err());
+
+        value.state.migrations.pop();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn reports_when_a_supported_migration_path_does_not_start_early_enough() {
+        let mut value = manifest();
+        value.permissions.storage = true;
+        value.state = StateConfig {
+            schema: 2,
+            migrations: vec![StateMigration {
+                name: "upgrade-settings".into(),
+                from: 1,
+                to: 2,
+            }],
+        };
+
+        value.validate().unwrap();
+        assert!(value.migration_plan(0).is_err());
+        assert_eq!(value.migration_plan(1).unwrap().steps.len(), 1);
+        assert!(value.migration_plan(2).unwrap().steps.is_empty());
     }
 }

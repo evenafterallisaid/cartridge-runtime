@@ -14,7 +14,7 @@ use crate::{
     validate_limits, validate_namespace,
 };
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 
@@ -30,6 +30,7 @@ pub struct StorageSnapshot {
 #[derive(Debug)]
 pub struct SnapshotStorage {
     cartridge_id: String,
+    state_schema: u32,
     storage: MemoryStorage,
 }
 
@@ -42,11 +43,13 @@ impl SnapshotStorage {
         validate_limits(limits)?;
         let entries = snapshot.entries_for(cartridge_id)?;
         let storage = MemoryStorage::new();
+        storage.prepare(cartridge_id, snapshot.state_schema())?;
         for (key, value) in entries {
             storage.put(cartridge_id, &key, &value, limits)?;
         }
         Ok(Self {
             cartridge_id: cartridge_id.to_owned(),
+            state_schema: snapshot.state_schema(),
             storage,
         })
     }
@@ -60,7 +63,7 @@ impl SnapshotStorage {
                 .ok_or_else(|| Error::Corrupt(format!("snapshot branch lost key {key:?}")))?;
             entries.insert(key, value);
         }
-        StorageSnapshot::from_entries(&self.cartridge_id, &entries)
+        StorageSnapshot::from_entries(&self.cartridge_id, self.state_schema, &entries)
     }
 
     fn check_namespace(&self, namespace: &str) -> Result<()> {
@@ -76,6 +79,17 @@ impl SnapshotStorage {
 }
 
 impl StorageBackend for SnapshotStorage {
+    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+        self.check_namespace(namespace)?;
+        if self.state_schema != state_schema {
+            return Err(Error::SchemaMismatch {
+                expected: state_schema,
+                actual: self.state_schema,
+            });
+        }
+        self.storage.prepare(namespace, state_schema)
+    }
+
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
         self.check_namespace(namespace)?;
         self.storage.get(namespace, key)
@@ -105,12 +119,14 @@ impl StorageBackend for SnapshotStorage {
 impl StorageSnapshot {
     pub(crate) fn from_entries(
         cartridge_id: &str,
+        state_schema: u32,
         entries: &BTreeMap<String, Vec<u8>>,
     ) -> Result<Self> {
         validate_namespace(cartridge_id)?;
         let payload = SnapshotPayload {
             format_version: SNAPSHOT_FORMAT_VERSION,
             cartridge_id: cartridge_id.to_owned(),
+            state_schema,
             entries: entries
                 .iter()
                 .map(|(key, value)| (key.clone(), hex::encode(value)))
@@ -169,11 +185,16 @@ impl StorageSnapshot {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.payload.format_version != SNAPSHOT_FORMAT_VERSION {
+        if !matches!(self.payload.format_version, 1 | SNAPSHOT_FORMAT_VERSION) {
             return Err(Error::Corrupt(format!(
-                "unsupported snapshot format {}; expected {SNAPSHOT_FORMAT_VERSION}",
+                "unsupported snapshot format {}; expected 1 or {SNAPSHOT_FORMAT_VERSION}",
                 self.payload.format_version
             )));
+        }
+        if self.payload.format_version == 1 && self.payload.state_schema != 0 {
+            return Err(Error::Corrupt(
+                "snapshot format 1 cannot declare a state schema".into(),
+            ));
         }
         validate_namespace(&self.payload.cartridge_id)
             .map_err(|_| Error::Corrupt("snapshot has an invalid cartridge id".into()))?;
@@ -190,6 +211,11 @@ impl StorageSnapshot {
         &self.payload.cartridge_id
     }
 
+    #[must_use]
+    pub fn state_schema(&self) -> u32 {
+        self.payload.state_schema
+    }
+
     pub fn summary(&self) -> Result<StorageSnapshotSummary> {
         self.validate()?;
         let entries = self.decode_entries()?;
@@ -197,6 +223,7 @@ impl StorageSnapshot {
         Ok(StorageSnapshotSummary {
             format_version: self.payload.format_version,
             cartridge_id: self.payload.cartridge_id.clone(),
+            state_schema: self.payload.state_schema,
             entries: usage.keys,
             bytes: usage.bytes,
             payload_sha256: self.payload_sha256.clone(),
@@ -206,13 +233,18 @@ impl StorageSnapshot {
     pub fn compare(&self, other: &Self) -> Result<SnapshotComparison> {
         self.validate()?;
         other.validate()?;
-        let difference = if self.cartridge_id() == other.cartridge_id() {
-            first_entry_difference(&self.decode_entries()?, &other.decode_entries()?)
-        } else {
+        let difference = if self.cartridge_id() != other.cartridge_id() {
             Some(SnapshotDifference::Identity {
                 left: self.cartridge_id().to_owned(),
                 right: other.cartridge_id().to_owned(),
             })
+        } else if self.state_schema() != other.state_schema() {
+            Some(SnapshotDifference::Schema {
+                left: self.state_schema(),
+                right: other.state_schema(),
+            })
+        } else {
+            first_entry_difference(&self.decode_entries()?, &other.decode_entries()?)
         };
         Ok(SnapshotComparison {
             identical: difference.is_none(),
@@ -253,6 +285,8 @@ impl StorageSnapshot {
 struct SnapshotPayload {
     format_version: u32,
     cartridge_id: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    state_schema: u32,
     entries: BTreeMap<String, String>,
 }
 
@@ -260,6 +294,7 @@ struct SnapshotPayload {
 pub struct StorageSnapshotSummary {
     pub format_version: u32,
     pub cartridge_id: String,
+    pub state_schema: u32,
     pub entries: usize,
     pub bytes: usize,
     pub payload_sha256: String,
@@ -279,6 +314,10 @@ pub enum SnapshotDifference {
         left: String,
         right: String,
     },
+    Schema {
+        left: u32,
+        right: u32,
+    },
     Entry {
         key: String,
         left: Option<SnapshotEntry>,
@@ -294,6 +333,10 @@ pub struct SnapshotEntry {
 
 fn payload_digest(payload: &SnapshotPayload) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(payload)?)))
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 fn usage(entries: &BTreeMap<String, Vec<u8>>) -> Result<StorageUsage> {
@@ -352,6 +395,7 @@ mod tests {
     fn snapshot(value: &[u8]) -> StorageSnapshot {
         StorageSnapshot::from_entries(
             "dev.example.test",
+            0,
             &BTreeMap::from([("settings/theme".into(), value.to_vec())]),
         )
         .unwrap()
@@ -394,6 +438,17 @@ mod tests {
     }
 
     #[test]
+    fn comparison_reports_schema_changes_before_entry_changes() {
+        let left = StorageSnapshot::from_entries("dev.example.test", 1, &BTreeMap::new()).unwrap();
+        let right = StorageSnapshot::from_entries("dev.example.test", 2, &BTreeMap::new()).unwrap();
+
+        assert_eq!(
+            left.compare(&right).unwrap().difference,
+            Some(SnapshotDifference::Schema { left: 1, right: 2 })
+        );
+    }
+
+    #[test]
     fn portable_v1_fixture_remains_compatible() {
         let snapshot =
             StorageSnapshot::from_slice(include_bytes!("../tests/fixtures/snapshot-v1.json"))
@@ -404,6 +459,7 @@ mod tests {
             StorageSnapshotSummary {
                 format_version: 1,
                 cartridge_id: "dev.example.test".into(),
+                state_schema: 0,
                 entries: 1,
                 bytes: 4,
                 payload_sha256: "3e2cf42a40fed75311308f325de48929568683b15387be177818ed2dd9fa41c7"
@@ -441,6 +497,22 @@ mod tests {
         assert!(matches!(
             branch.get("dev.example.other", "settings/theme"),
             Err(Error::SnapshotIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_branches_require_the_recorded_schema() {
+        let source =
+            StorageSnapshot::from_entries("dev.example.test", 2, &BTreeMap::new()).unwrap();
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+
+        branch.prepare("dev.example.test", 2).unwrap();
+        assert!(matches!(
+            branch.prepare("dev.example.test", 3),
+            Err(Error::SchemaMismatch {
+                expected: 3,
+                actual: 2
+            })
         ));
     }
 }

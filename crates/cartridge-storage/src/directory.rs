@@ -18,7 +18,7 @@ use crate::{
     validate_limits, validate_namespace, validate_prefix,
 };
 
-const DISK_FORMAT_VERSION: u32 = 1;
+const DISK_FORMAT_VERSION: u32 = 2;
 const RETAINED_GENERATIONS: usize = 2;
 const MAX_STATE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 
@@ -87,7 +87,7 @@ impl DirectoryStorage {
     pub fn export_snapshot(&self, namespace: &str) -> Result<StorageSnapshot> {
         self.with_namespace(namespace, |directory| {
             let state = load_state(directory, namespace)?;
-            StorageSnapshot::from_entries(namespace, &state.entries)
+            StorageSnapshot::from_entries(namespace, state.schema, &state.entries)
         })
     }
 
@@ -101,7 +101,12 @@ impl DirectoryStorage {
         validate_restore_limits(&entries, limits)?;
         self.with_namespace(namespace, |directory| {
             let current = load_state(directory, namespace)?;
-            build_restore_plan(&current.entries, &entries)
+            build_restore_plan(
+                current.schema,
+                &current.entries,
+                snapshot.state_schema(),
+                &entries,
+            )
         })
     }
 
@@ -116,13 +121,19 @@ impl DirectoryStorage {
         self.with_namespace(namespace, |directory| {
             cleanup_pending(directory)?;
             let current = load_state(directory, namespace)?;
-            let plan = build_restore_plan(&current.entries, &entries)?;
+            let plan = build_restore_plan(
+                current.schema,
+                &current.entries,
+                snapshot.state_schema(),
+                &entries,
+            )?;
             if plan.changed() {
                 commit_state(
                     directory,
                     namespace,
                     State {
                         generation: current.generation,
+                        schema: snapshot.state_schema(),
                         usage: plan.snapshot,
                         entries,
                     },
@@ -160,6 +171,24 @@ impl DirectoryStorage {
 }
 
 impl StorageBackend for DirectoryStorage {
+    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+        self.with_namespace(namespace, |directory| {
+            cleanup_pending(directory)?;
+            let mut state = load_state(directory, namespace)?;
+            if state.generation == 0 {
+                state.schema = state_schema;
+                return commit_state(directory, namespace, state);
+            }
+            if state.schema != state_schema {
+                return Err(Error::SchemaMismatch {
+                    expected: state_schema,
+                    actual: state.schema,
+                });
+            }
+            Ok(())
+        })
+    }
+
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
         self.with_namespace(namespace, |directory| {
@@ -246,6 +275,7 @@ impl StorageBackend for DirectoryStorage {
 #[derive(Clone, Debug, Default)]
 struct State {
     generation: u64,
+    schema: u32,
     entries: BTreeMap<String, Vec<u8>>,
     usage: StorageUsage,
 }
@@ -256,6 +286,8 @@ struct DiskPayload {
     format_version: u32,
     namespace: String,
     generation: u64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    state_schema: u32,
     entries: BTreeMap<String, String>,
 }
 
@@ -275,6 +307,8 @@ pub struct RecoveryReport {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RestorePlan {
+    pub current_schema: u32,
+    pub snapshot_schema: u32,
     pub current: StorageUsage,
     pub snapshot: StorageUsage,
     pub added: usize,
@@ -286,7 +320,10 @@ pub struct RestorePlan {
 impl RestorePlan {
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.added != 0 || self.replaced != 0 || self.removed != 0
+        self.current_schema != self.snapshot_schema
+            || self.added != 0
+            || self.replaced != 0
+            || self.removed != 0
     }
 }
 
@@ -335,7 +372,9 @@ fn validate_restore_limits(
 }
 
 fn build_restore_plan(
+    current_schema: u32,
     current: &BTreeMap<String, Vec<u8>>,
+    snapshot_schema: u32,
     snapshot: &BTreeMap<String, Vec<u8>>,
 ) -> Result<RestorePlan> {
     let mut added = 0;
@@ -353,6 +392,8 @@ fn build_restore_plan(
         .filter(|key| !snapshot.contains_key(*key))
         .count();
     Ok(RestorePlan {
+        current_schema,
+        snapshot_schema,
         current: state_usage(current)?,
         snapshot: state_usage(snapshot)?,
         added,
@@ -394,9 +435,10 @@ fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
             path.display()
         )));
     }
-    if envelope.payload.format_version != DISK_FORMAT_VERSION
+    if !matches!(envelope.payload.format_version, 1 | DISK_FORMAT_VERSION)
         || envelope.payload.namespace != namespace
         || envelope.payload.generation != generation
+        || (envelope.payload.format_version == 1 && envelope.payload.state_schema != 0)
     {
         return Err(Error::Corrupt(format!(
             "{} has mismatched state identity",
@@ -422,6 +464,7 @@ fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
     }
     Ok(State {
         generation,
+        schema: envelope.payload.state_schema,
         usage: StorageUsage {
             bytes: bytes_used,
             keys: entries.len(),
@@ -439,6 +482,7 @@ fn commit_state(directory: &Path, namespace: &str, mut state: State) -> Result<(
         format_version: DISK_FORMAT_VERSION,
         namespace: namespace.to_owned(),
         generation: state.generation,
+        state_schema: state.schema,
         entries: state
             .entries
             .iter()
@@ -463,6 +507,10 @@ fn commit_state(directory: &Path, namespace: &str, mut state: State) -> Result<(
     fs::rename(&temporary, &final_path)?;
     sync_directory(directory)?;
     prune_generations(directory)
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 fn state_files(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
@@ -570,6 +618,70 @@ mod tests {
             reopened.get("dev.example.test", "settings/theme").unwrap(),
             Some(b"dark".to_vec())
         );
+    }
+
+    #[test]
+    fn state_schema_survives_reopening_the_backend() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage.prepare("dev.example.test", 2).unwrap();
+        storage
+            .put("dev.example.test", "value", b"kept", LIMITS)
+            .unwrap();
+
+        let reopened = DirectoryStorage::open(directory.path()).unwrap();
+        reopened.prepare("dev.example.test", 2).unwrap();
+        assert_eq!(
+            reopened
+                .export_snapshot("dev.example.test")
+                .unwrap()
+                .state_schema(),
+            2
+        );
+        assert!(matches!(
+            reopened.prepare("dev.example.test", 3),
+            Err(Error::SchemaMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn durable_v1_generations_remain_compatible_as_schema_zero() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        let namespace = storage.namespace_directory("dev.example.test");
+        fs::create_dir_all(&namespace).unwrap();
+        let payload = DiskPayload {
+            format_version: 1,
+            namespace: "dev.example.test".into(),
+            generation: 1,
+            state_schema: 0,
+            entries: BTreeMap::from([("value".into(), hex::encode(b"legacy"))]),
+        };
+        let envelope = DiskEnvelope {
+            payload_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&payload).unwrap())),
+            payload,
+        };
+        fs::write(
+            namespace.join(state_file_name(1)),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        storage.prepare("dev.example.test", 0).unwrap();
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"legacy".to_vec())
+        );
+        assert!(matches!(
+            storage.prepare("dev.example.test", 1),
+            Err(Error::SchemaMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
     }
 
     #[test]

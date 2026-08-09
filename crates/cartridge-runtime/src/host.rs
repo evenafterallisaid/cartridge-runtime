@@ -364,7 +364,7 @@ fn is_safe_asset_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cartridge_core::{CartridgeMetadata, Integrity, RuntimeLimits, Services};
+    use cartridge_core::{CartridgeMetadata, Integrity, RuntimeLimits, Services, StateConfig};
     use cartridge_storage::MemoryStorage;
 
     #[test]
@@ -569,6 +569,7 @@ mod tests {
             },
             permissions,
             runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
             dependencies: Vec::new(),
             services: Services::default(),
             integrity: Integrity::default(),

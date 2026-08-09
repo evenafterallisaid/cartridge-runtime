@@ -165,7 +165,7 @@ fn verify_assets(manifest: &PackageManifest, assets: &BTreeMap<String, Vec<u8>>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CartridgeMetadata, Integrity, Permissions, RuntimeLimits, Services};
+    use crate::{CartridgeMetadata, Integrity, Permissions, RuntimeLimits, Services, StateConfig};
 
     #[test]
     fn rejects_a_component_that_changed_after_packing() {
@@ -180,6 +180,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
             dependencies: Vec::new(),
             services: Services::default(),
             integrity: Integrity {
@@ -208,6 +209,7 @@ mod tests {
                 ..Permissions::default()
             },
             runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
             dependencies: Vec::new(),
             services: Services::default(),
             integrity: Integrity::default(),

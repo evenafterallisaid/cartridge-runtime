@@ -166,7 +166,7 @@ mod tests {
     use super::*;
     use crate::{
         CartridgeDependency, CartridgeMetadata, Integrity, Permissions, ProvidedService,
-        RuntimeLimits, Services,
+        RuntimeLimits, Services, StateConfig,
     };
 
     #[test]
@@ -238,6 +238,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
             dependencies: Vec::new(),
             services: Services::default(),
             integrity: Integrity::default(),

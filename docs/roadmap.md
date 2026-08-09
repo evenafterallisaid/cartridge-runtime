@@ -130,10 +130,11 @@ Delivery slices:
 2. Durable directory backend with locking, immutable generation commits, corruption detection, and recovery tests on every CI platform.
 3. Canonical snapshot format with content digests, CLI export/inspect/diff, dry runs, and transactional restore.
 4. Isolated snapshot branches for speculative execution and migration rehearsals.
-5. Migration plans that run against a snapshot branch before committing changes.
-6. Content-addressed blobs, garbage collection, and references from key/value records.
+5. Manifest state schemas and deterministic migration-plan validation.
+6. Migration execution against a snapshot branch before committing changes.
+7. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first four slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. A cartridge can now run against an isolated snapshot branch and export the result without touching durable state. The next slice adds explicit schema versions and migration plans on top of that execution primitive.
+The first five slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can build an identity-bound ordered plan without executing the component. The next slice executes those plans against isolated branches.
 
 Migration design constraints:
 
@@ -749,14 +750,15 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Add manifest state schema versions and a migration-plan format.
-2. Run migrations against isolated snapshot branches with automatic rollback points.
-3. Bind branch runs to trace and state digests for reproducible test capsules.
-4. Add compare-and-swap and bounded atomic batch operations.
-5. Add content-addressed blobs, streaming access, and snapshot references for larger state.
-6. Add package-wide Merkle-style asset integrity.
-7. Create a minimal 2D window and input prototype behind new WIT packages.
-8. Build a small trace viewer after there is enough real trace data to design around.
+1. Define the migration execution WIT contract and run validated steps against isolated snapshot branches.
+2. Validate every intermediate schema, quota, and state digest before a single durable commit.
+3. Add automatic rollback snapshots and explicit migration commit/recovery commands.
+4. Bind branch runs to trace and state digests for reproducible test capsules.
+5. Add compare-and-swap and bounded atomic batch operations.
+6. Add content-addressed blobs, streaming access, and snapshot references for larger state.
+7. Add package-wide Merkle-style asset integrity.
+8. Create a minimal 2D window and input prototype behind new WIT packages.
+9. Build a small trace viewer after there is enough real trace data to design around.
 
 Completed foundations:
 
@@ -767,5 +769,7 @@ Completed foundations:
 - checksummed durable generations, process locking, status, and recovery
 - portable snapshot export, inspection, diffing, dry runs, and transactional restore
 - isolated snapshot branch execution with optional result export
+- state schemas persisted across memory, durable generations, and portable snapshots
+- validated manifest migration graphs and identity-bound ordered plans
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

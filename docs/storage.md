@@ -27,6 +27,8 @@ Each manifest sets three limits:
 
 The backend calculates the complete post-write usage before changing the map. A failed replacement leaves the previous value intact. Listing uses lexical order so tests and traces do not depend on hash-map iteration.
 
+The manifest also declares the state schema expected by the component. Live execution prepares the namespace for that schema and refuses to run when existing state or a snapshot branch has a different version. This turns a package upgrade with old state into an explicit migration problem instead of undefined guest behavior.
+
 ## Recording and replay
 
 Storage is observable state and therefore part of deterministic replay. Live reads record the returned bytes, length, and digest. Live writes record the key, value length, digest, and outcome. Deletes and listings record their result.
@@ -49,6 +51,7 @@ cartridge storage status app.cartridge --state-dir ./state
 cartridge storage recover app.cartridge --state-dir ./state
 cartridge storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
 cartridge storage inspect backup.cartridge-state.json
+cartridge storage migration-plan app.cartridge --from-schema 0
 cartridge run app.cartridge --from-snapshot backup.cartridge-state.json \
   --snapshot-output branch.cartridge-state.json -- experiment
 cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run

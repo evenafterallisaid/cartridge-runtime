@@ -4,11 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
-    DirectoryStorage, Runtime, SnapshotDifference, SnapshotStorage, StorageBackend, StorageLimits,
-    StorageSnapshot,
+    DirectoryStorage, Runtime, SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
 };
 use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
@@ -157,6 +156,14 @@ enum StorageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// build the ordered migration path to the package's current schema
+    MigrationPlan {
+        package: PathBuf,
+        #[arg(long)]
+        from_schema: u32,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -224,6 +231,11 @@ fn main() -> Result<()> {
                 dry_run,
                 json,
             } => storage_restore_command(&package, &snapshot, &state_dir, dry_run, json),
+            StorageCommand::MigrationPlan {
+                package,
+                from_schema,
+                json,
+            } => storage_migration_plan_command(&package, from_schema, json),
         },
     }
 }
@@ -365,21 +377,28 @@ fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Resul
     let archive = CartridgeArchive::open(package)
         .with_context(|| format!("could not inspect {}", package.display()))?;
     let storage = DirectoryStorage::open(state_dir)?;
-    let usage = storage.usage(&archive.manifest.cartridge.id)?;
+    let summary = storage
+        .export_snapshot(&archive.manifest.cartridge.id)?
+        .summary()?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "cartridge_id": archive.manifest.cartridge.id,
                 "state_dir": storage.root(),
-                "usage": usage,
+                "state_schema": summary.state_schema,
+                "usage": {
+                    "bytes": summary.bytes,
+                    "keys": summary.entries,
+                },
             }))?
         );
     } else {
         println!("{}", archive.manifest.cartridge.id);
         println!("state directory: {}", storage.root().display());
-        println!("keys: {}", usage.keys);
-        println!("bytes: {}", usage.bytes);
+        println!("state schema: {}", summary.state_schema);
+        println!("keys: {}", summary.entries);
+        println!("bytes: {}", summary.bytes);
     }
     Ok(())
 }
@@ -428,6 +447,7 @@ fn storage_inspect_command(path: &Path, json: bool) -> Result<()> {
     } else {
         println!("{}", summary.cartridge_id);
         println!("snapshot format: {}", summary.format_version);
+        println!("state schema: {}", summary.state_schema);
         println!("entries: {}", summary.entries);
         println!("bytes: {}", summary.bytes);
         println!("payload sha256: {}", summary.payload_sha256);
@@ -452,6 +472,11 @@ fn storage_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
                 println!("  left:  {left}");
                 println!("  right: {right}");
             }
+            SnapshotDifference::Schema { left, right } => {
+                println!("state schema differs");
+                println!("  left:  {left}");
+                println!("  right: {right}");
+            }
             SnapshotDifference::Entry { key, left, right } => {
                 println!("first entry difference at {key}");
                 println!("  left:  {}", serde_json::to_string(&left)?);
@@ -472,6 +497,13 @@ fn storage_restore_command(
     let archive = CartridgeArchive::open(package)
         .with_context(|| format!("could not inspect {}", package.display()))?;
     let snapshot = StorageSnapshot::read(snapshot)?;
+    if snapshot.state_schema() != archive.manifest.state.schema {
+        bail!(
+            "snapshot uses state schema {}; package expects schema {}; build and execute a migration plan first",
+            snapshot.state_schema(),
+            archive.manifest.state.schema
+        );
+    }
     let storage = DirectoryStorage::open(state_dir)?;
     let limits = storage_limits(&archive.manifest);
     let plan = if dry_run {
@@ -499,9 +531,41 @@ fn storage_restore_command(
         println!("removed: {}", plan.removed);
         println!("unchanged: {}", plan.unchanged);
         println!(
+            "state schema: {} -> {}",
+            plan.current_schema, plan.snapshot_schema
+        );
+        println!(
             "usage: {} key(s), {} bytes -> {} key(s), {} bytes",
             plan.current.keys, plan.current.bytes, plan.snapshot.keys, plan.snapshot.bytes
         );
+    }
+    Ok(())
+}
+
+fn storage_migration_plan_command(package: &Path, from_schema: u32, json: bool) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let plan = archive.manifest.migration_plan(from_schema)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("{}", plan.cartridge_id);
+        println!("package version: {}", plan.cartridge_version);
+        println!(
+            "state schema: {} -> {}",
+            plan.source_schema, plan.target_schema
+        );
+        if plan.steps.is_empty() {
+            println!("migrations: none");
+        } else {
+            println!("migrations:");
+            for migration in plan.steps {
+                println!(
+                    "  {}: {} -> {}",
+                    migration.name, migration.from, migration.to
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -630,6 +694,8 @@ fn print_manifest(archive: &CartridgeArchive) {
         "storage value limit: {} bytes",
         manifest.runtime.storage_value_bytes
     );
+    println!("state schema: {}", manifest.state.schema);
+    println!("state migrations: {}", manifest.state.migrations.len());
     println!("component sha256: {}", manifest.integrity.component_sha256);
     println!("dependencies: {}", manifest.dependencies.len());
     println!("provided services: {}", manifest.services.provides.len());

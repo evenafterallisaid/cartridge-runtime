@@ -5,8 +5,9 @@ mod resolver;
 
 pub use archive::{CartridgeArchive, PackageLimits};
 pub use manifest::{
-    CURRENT_FORMAT_VERSION, CartridgeDependency, CartridgeMetadata, Integrity, PackageManifest,
-    Permissions, ProvidedService, RuntimeLimits, ServiceVisibility, Services,
+    CURRENT_FORMAT_VERSION, CartridgeDependency, CartridgeMetadata, Integrity,
+    MIGRATION_PLAN_FORMAT_VERSION, MigrationPlan, PackageManifest, Permissions, ProvidedService,
+    RuntimeLimits, ServiceVisibility, Services, StateConfig, StateMigration,
 };
 pub use pack::{PackOptions, pack};
 pub use resolver::{

@@ -1,4 +1,4 @@
-# Durable storage format v1
+# Durable storage format v2
 
 The directory backend stores one isolated journal directory per cartridge namespace:
 
@@ -20,9 +20,10 @@ Each committed file contains an envelope:
 ```json
 {
   "payload": {
-    "format_version": 1,
+    "format_version": 2,
     "namespace": "dev.example.app",
     "generation": 8,
+    "state_schema": 3,
     "entries": {
       "settings/theme": "6461726b"
     }
@@ -31,7 +32,7 @@ Each committed file contains an envelope:
 }
 ```
 
-Values use lowercase hexadecimal encoding. Keys are sorted because the payload uses an ordered map. `payload_sha256` is calculated over the compact JSON serialization of `payload`, making accidental modification detectable before values are returned to a cartridge.
+Values use lowercase hexadecimal encoding. Keys are sorted because the payload uses an ordered map. `payload_sha256` is calculated over the compact JSON serialization of `payload`, making accidental modification detectable before values are returned to a cartridge. Version 1 generations remain readable and are treated as schema `0`; every new commit uses version 2.
 
 ## Commit protocol
 

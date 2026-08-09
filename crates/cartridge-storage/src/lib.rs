@@ -19,6 +19,7 @@ pub use snapshot::{
 pub const MAX_KEY_BYTES: usize = 256;
 
 pub trait StorageBackend: Debug + Send + Sync {
+    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()>;
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>>;
     fn put(&self, namespace: &str, key: &str, value: &[u8], limits: StorageLimits) -> Result<()>;
     fn delete(&self, namespace: &str, key: &str) -> Result<bool>;
@@ -52,6 +53,27 @@ impl MemoryStorage {
 }
 
 impl StorageBackend for MemoryStorage {
+    fn prepare(&self, namespace: &str, state_schema: u32) -> Result<()> {
+        validate_namespace(namespace)?;
+        let mut namespaces = self.namespaces.write().map_err(|_| Error::Unavailable)?;
+        match namespaces.entry(namespace.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Namespace {
+                    state_schema,
+                    ..Namespace::default()
+                });
+            }
+            Entry::Occupied(entry) if entry.get().state_schema != state_schema => {
+                return Err(Error::SchemaMismatch {
+                    expected: state_schema,
+                    actual: entry.get().state_schema,
+                });
+            }
+            Entry::Occupied(_) => {}
+        }
+        Ok(())
+    }
+
     fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
         validate_namespace(namespace)?;
         validate_key(key)?;
@@ -154,6 +176,7 @@ impl StorageBackend for MemoryStorage {
 
 #[derive(Debug, Default)]
 struct Namespace {
+    state_schema: u32,
     entries: BTreeMap<String, Vec<u8>>,
     bytes: usize,
 }
@@ -184,6 +207,8 @@ pub enum Error {
     Serialization(#[from] serde_json::Error),
     #[error("snapshot belongs to {actual}; expected {expected}")]
     SnapshotIdentity { expected: String, actual: String },
+    #[error("state uses schema {actual}; expected schema {expected}")]
+    SchemaMismatch { expected: u32, actual: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -268,6 +293,20 @@ mod tests {
             storage.get("dev.example.two", "name").unwrap(),
             Some(b"two".to_vec())
         );
+    }
+
+    #[test]
+    fn prepared_namespaces_reject_a_different_schema() {
+        let storage = MemoryStorage::new();
+        storage.prepare("dev.example.test", 2).unwrap();
+
+        assert!(matches!(
+            storage.prepare("dev.example.test", 3),
+            Err(Error::SchemaMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
     }
 
     #[test]

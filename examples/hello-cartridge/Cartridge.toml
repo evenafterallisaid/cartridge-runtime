@@ -19,3 +19,11 @@ timeout_ms = 30000
 storage_bytes = 1048576
 storage_keys = 1024
 storage_value_bytes = 262144
+
+[state]
+schema = 1
+
+[[state.migrations]]
+name = "initialize-state"
+from = 0
+to = 1

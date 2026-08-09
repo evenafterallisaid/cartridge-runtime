@@ -81,6 +81,12 @@ impl Runtime {
         args: &[String],
         replay: Option<ExecutionTrace>,
     ) -> Result<RunReport> {
+        if replay.is_none() && archive.manifest.permissions.storage {
+            self.storage.prepare(
+                &archive.manifest.cartridge.id,
+                archive.manifest.state.schema,
+            )?;
+        }
         let component = Component::new(&self.engine, &archive.component)
             .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
         let mut linker = Linker::new(&self.engine);
