@@ -53,6 +53,21 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub(crate) fn snapshot_entries(
+        &self,
+        namespace: &str,
+        limits: StorageLimits,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
+        validate_namespace(namespace)?;
+        validate_limits(limits)?;
+        let namespaces = self.namespaces.read().map_err(|_| Error::Unavailable)?;
+        let entries = namespaces
+            .get(namespace)
+            .map_or_else(BTreeMap::new, |namespace| namespace.entries.clone());
+        validate_entry_limits(&entries, limits)?;
+        Ok(entries)
+    }
 }
 
 impl StorageBackend for MemoryStorage {
@@ -220,6 +235,8 @@ pub enum Error {
     LockTimeout { milliseconds: u64 },
     #[error("storage path is not a private directory or regular file: {0}")]
     UnsafePath(String),
+    #[error("state schema transition must increase: {from} -> {to}")]
+    InvalidSchemaTransition { from: u32, to: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -134,7 +134,7 @@ Delivery slices:
 6. Migration execution against a snapshot branch before committing changes.
 7. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first five slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can build an identity-bound ordered plan without executing the component. The next slice executes those plans against isolated branches.
+The first six slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI executes those plans step by step against fresh isolated branches without touching durable state. The next slice adds automatic rollback capture and an explicit one-generation commit.
 
 Migration design constraints:
 
@@ -750,15 +750,13 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Define the migration execution WIT contract and run validated steps against isolated snapshot branches.
-2. Validate every intermediate schema, quota, and state digest before a single durable commit.
-3. Add automatic rollback snapshots and explicit migration commit/recovery commands.
-4. Bind branch runs to trace and state digests for reproducible test capsules.
-5. Add compare-and-swap and bounded atomic batch operations.
-6. Add content-addressed blobs, streaming access, and snapshot references for larger state.
-7. Add package-wide Merkle-style asset integrity.
-8. Create a minimal 2D window and input prototype behind new WIT packages.
-9. Build a small trace viewer after there is enough real trace data to design around.
+1. Add automatic rollback snapshots and explicit migration commit/recovery commands.
+2. Bind branch runs to trace and state digests for reproducible test capsules.
+3. Add compare-and-swap and bounded atomic batch operations.
+4. Add content-addressed blobs, streaming access, and snapshot references for larger state.
+5. Add package-wide Merkle-style asset integrity.
+6. Create a minimal 2D window and input prototype behind new WIT packages.
+7. Build a small trace viewer after there is enough real trace data to design around.
 
 Completed foundations:
 
@@ -771,6 +769,7 @@ Completed foundations:
 - isolated snapshot branch execution with optional result export
 - state schemas persisted across memory, durable generations, and portable snapshots
 - validated manifest migration graphs and identity-bound ordered plans
+- isolated multi-step migration rehearsals with intermediate schema and quota validation
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals

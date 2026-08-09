@@ -38,7 +38,7 @@ pub(crate) struct HostState {
     wasi: WasiCtx,
     pub(crate) limits: StoreLimits,
     permissions: Permissions,
-    assets: BTreeMap<String, Vec<u8>>,
+    assets: Arc<BTreeMap<String, Vec<u8>>>,
     storage: Arc<dyn StorageBackend>,
     storage_namespace: String,
     storage_limits: StorageLimits,
@@ -55,7 +55,7 @@ pub(crate) struct HostState {
 impl HostState {
     pub(crate) fn new(
         manifest: &PackageManifest,
-        assets: BTreeMap<String, Vec<u8>>,
+        assets: impl Into<Arc<BTreeMap<String, Vec<u8>>>>,
         storage: Arc<dyn StorageBackend>,
         replay_events: Option<Vec<TraceEvent>>,
     ) -> Self {
@@ -88,7 +88,7 @@ impl HostState {
             wasi,
             limits,
             permissions: manifest.permissions.clone(),
-            assets,
+            assets: assets.into(),
             storage,
             storage_namespace: manifest.cartridge.id.clone(),
             storage_limits: StorageLimits {

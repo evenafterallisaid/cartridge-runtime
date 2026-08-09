@@ -34,8 +34,27 @@ A plan records its own format version, cartridge identity and version, component
 
 An empty plan means the source is already current. It does not mean arbitrary old state is compatible.
 
-## Runtime boundary
+## Execution
 
 Live runs prepare storage for the manifest schema before component execution. Memory, directory, and snapshot-backed state reject a different schema. Durable generation format v1 and snapshot format v1 are still readable and are interpreted as schema `0`.
 
-Migration execution is the next storage slice. It will run each planned step against an isolated snapshot branch, produce a new snapshot tagged with the destination schema, validate the result, and only then allow one transactional durable commit. The planner does not pretend those execution guarantees exist yet.
+A migratable component targets the `migratable-cartridge` WIT world and exports:
+
+```wit
+migrate: func(name: string, source: u32, target: u32) -> result<_, string>;
+```
+
+The runtime supplies all three values from the validated manifest plan. The guest cannot choose or skip a schema edge.
+
+Execute a rehearsal from a portable snapshot:
+
+```sh
+cartridge storage migrate app.cartridge old.cartridge-state.json \
+  --output migrated.cartridge-state.json
+```
+
+Every step starts with a fresh in-memory branch made from the preceding validated snapshot and a fresh Wasmtime store. A successful step may export only the exact destination schema declared by the plan. The intermediate snapshot is checked for identity, integrity, key count, total bytes, and per-value limits before it becomes input to the next step. A trap, guest error, quota failure, missing export, or deadline leaves the source snapshot unchanged and creates no output file.
+
+Migration execution uses the package's normal capability policy and storage quota. Each step receives its own fuel and wall-time budget. A plan is limited to 64 executed steps and ten minutes of declared aggregate wall time, and the CLI runs the entire rehearsal in a killable helper process with a separate parent deadline.
+
+This command deliberately does not touch durable state. Automatic rollback capture and a one-generation migration commit are the next storage slice; until then, operators inspect the resulting snapshot and use the existing explicit restore command.

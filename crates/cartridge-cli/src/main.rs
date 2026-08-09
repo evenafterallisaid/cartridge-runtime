@@ -13,7 +13,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
-    DirectoryStorage, Runtime, SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
+    DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS, Runtime,
+    SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
 };
 use cartridge_trace::{ExecutionTrace, MAX_TRACE_DOCUMENT_BYTES, TraceDifference};
 use clap::{Parser, Subcommand};
@@ -108,6 +109,15 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    #[command(name = "__worker-migrate", hide = true)]
+    WorkerMigrate {
+        package: PathBuf,
+        snapshot: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// inspect and compare execution traces
     Trace {
         #[command(subcommand)]
@@ -195,6 +205,15 @@ enum StorageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// execute a migration plan against an isolated snapshot branch
+    Migrate {
+        package: PathBuf,
+        snapshot: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -250,54 +269,79 @@ fn run_cli() -> Result<()> {
             from_snapshot,
             snapshot_output,
             args,
-        } => run_command(
-            &package,
-            trace.as_deref(),
-            state_dir.as_deref(),
-            from_snapshot.as_deref(),
-            snapshot_output.as_deref(),
-            &args,
-        ),
+        } => {
+            require_worker_context()?;
+            run_command(
+                &package,
+                trace.as_deref(),
+                state_dir.as_deref(),
+                from_snapshot.as_deref(),
+                snapshot_output.as_deref(),
+                &args,
+            )
+        }
         Command::WorkerReplay {
             package,
             trace,
             args,
-        } => replay_command(&package, &trace, &args),
+        } => {
+            require_worker_context()?;
+            replay_command(&package, &trace, &args)
+        }
+        Command::WorkerMigrate {
+            package,
+            snapshot,
+            output,
+            json,
+        } => {
+            require_worker_context()?;
+            storage_migrate_command(&package, &snapshot, &output, json)
+        }
         Command::Trace { command } => match command {
             TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
             TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
         },
-        Command::Storage { command } => match command {
-            StorageCommand::Status {
-                package,
-                state_dir,
-                json,
-            } => storage_status_command(&package, &state_dir, json),
-            StorageCommand::Recover {
-                package,
-                state_dir,
-                json,
-            } => storage_recover_command(&package, &state_dir, json),
-            StorageCommand::Export {
-                package,
-                state_dir,
-                output,
-            } => storage_export_command(&package, &state_dir, &output),
-            StorageCommand::Inspect { snapshot, json } => storage_inspect_command(&snapshot, json),
-            StorageCommand::Diff { left, right, json } => storage_diff_command(&left, &right, json),
-            StorageCommand::Restore {
-                package,
-                snapshot,
-                state_dir,
-                dry_run,
-                json,
-            } => storage_restore_command(&package, &snapshot, &state_dir, dry_run, json),
-            StorageCommand::MigrationPlan {
-                package,
-                from_schema,
-                json,
-            } => storage_migration_plan_command(&package, from_schema, json),
-        },
+        Command::Storage { command } => run_storage_command(command),
+    }
+}
+
+fn run_storage_command(command: StorageCommand) -> Result<()> {
+    match command {
+        StorageCommand::Status {
+            package,
+            state_dir,
+            json,
+        } => storage_status_command(&package, &state_dir, json),
+        StorageCommand::Recover {
+            package,
+            state_dir,
+            json,
+        } => storage_recover_command(&package, &state_dir, json),
+        StorageCommand::Export {
+            package,
+            state_dir,
+            output,
+        } => storage_export_command(&package, &state_dir, &output),
+        StorageCommand::Inspect { snapshot, json } => storage_inspect_command(&snapshot, json),
+        StorageCommand::Diff { left, right, json } => storage_diff_command(&left, &right, json),
+        StorageCommand::Restore {
+            package,
+            snapshot,
+            state_dir,
+            dry_run,
+            json,
+        } => storage_restore_command(&package, &snapshot, &state_dir, dry_run, json),
+        StorageCommand::MigrationPlan {
+            package,
+            from_schema,
+            json,
+        } => storage_migration_plan_command(&package, from_schema, json),
+        StorageCommand::Migrate {
+            package,
+            snapshot,
+            output,
+            json,
+        } => supervised_migrate_command(&package, &snapshot, &output, json),
     }
 }
 
@@ -318,7 +362,7 @@ fn supervised_run_command(
     push_path_option(&mut worker_args, "--from-snapshot", from_snapshot);
     push_path_option(&mut worker_args, "--snapshot-output", snapshot_output);
     push_worker_arguments(&mut worker_args, args);
-    supervise_worker(package, &worker_args)
+    supervise_worker(package, &worker_args, None)
 }
 
 fn supervised_replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
@@ -328,7 +372,63 @@ fn supervised_replay_command(package: &Path, trace: &Path, args: &[String]) -> R
         trace.as_os_str().to_owned(),
     ];
     push_worker_arguments(&mut worker_args, args);
-    supervise_worker(package, &worker_args)
+    supervise_worker(package, &worker_args, None)
+}
+
+fn supervised_migrate_command(
+    package: &Path,
+    snapshot: &Path,
+    output: &Path,
+    json: bool,
+) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not validate {} before migration", package.display()))?;
+    let source = StorageSnapshot::read(snapshot)
+        .with_context(|| format!("could not validate {} before migration", snapshot.display()))?;
+    if source.cartridge_id() != archive.manifest.cartridge.id {
+        bail!(
+            "snapshot belongs to {}; package belongs to {}",
+            source.cartridge_id(),
+            archive.manifest.cartridge.id
+        );
+    }
+    let plan = archive.manifest.migration_plan(source.state_schema())?;
+    if plan.steps.len() > MAX_MIGRATION_STEPS_PER_RUN {
+        bail!(
+            "migration plan contains {} steps; maximum is {MAX_MIGRATION_STEPS_PER_RUN}",
+            plan.steps.len()
+        );
+    }
+    let budget_steps = u64::try_from(plan.steps.len().max(1)).unwrap_or(u64::MAX);
+    let budget_ms = archive
+        .manifest
+        .runtime
+        .timeout_ms
+        .checked_mul(budget_steps)
+        .context("migration timeout budget overflowed")?;
+    if budget_ms > MAX_MIGRATION_TOTAL_TIMEOUT_MS {
+        bail!(
+            "migration timeout budget is {budget_ms} ms; maximum is {MAX_MIGRATION_TOTAL_TIMEOUT_MS} ms"
+        );
+    }
+    drop(plan);
+    drop(source);
+    drop(archive);
+    let mut worker_args = vec![
+        OsString::from("__worker-migrate"),
+        package.as_os_str().to_owned(),
+        snapshot.as_os_str().to_owned(),
+        OsString::from("--output"),
+        output.as_os_str().to_owned(),
+    ];
+    if json {
+        worker_args.push(OsString::from("--json"));
+    }
+    supervise_worker(
+        package,
+        &worker_args,
+        Some(Duration::from_millis(budget_ms)),
+    )
 }
 
 fn push_path_option(arguments: &mut Vec<OsString>, name: &str, value: Option<&Path>) {
@@ -346,10 +446,15 @@ fn push_worker_arguments(arguments: &mut Vec<OsString>, values: &[String]) {
     arguments.extend(values.iter().map(OsString::from));
 }
 
-fn supervise_worker(package: &Path, arguments: &[OsString]) -> Result<()> {
+fn supervise_worker(
+    package: &Path,
+    arguments: &[OsString],
+    execution_budget: Option<Duration>,
+) -> Result<()> {
     let archive = CartridgeArchive::open(package)
         .with_context(|| format!("could not validate {} before execution", package.display()))?;
-    let execution_budget = Duration::from_millis(archive.manifest.runtime.timeout_ms);
+    let execution_budget = execution_budget
+        .unwrap_or_else(|| Duration::from_millis(archive.manifest.runtime.timeout_ms));
     drop(archive);
     let deadline = Instant::now() + WORKER_STARTUP_BUDGET + execution_budget;
     let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
@@ -382,6 +487,13 @@ fn supervise_worker(package: &Path, arguments: &[OsString]) -> Result<()> {
         }
         thread::sleep(WORKER_POLL_INTERVAL);
     }
+}
+
+fn require_worker_context() -> Result<()> {
+    if std::env::var_os("CARTRIDGE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        bail!("internal worker commands cannot be invoked directly");
+    }
+    Ok(())
 }
 
 fn pack_command(
@@ -710,6 +822,51 @@ fn storage_migration_plan_command(package: &Path, from_schema: u32, json: bool) 
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn storage_migrate_command(package: &Path, source: &Path, output: &Path, json: bool) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let source = StorageSnapshot::read(source)
+        .with_context(|| format!("could not read snapshot {}", source.display()))?;
+    let report = Runtime::new()?.migrate(archive, source)?;
+    let summary = report.snapshot.summary()?;
+    report.snapshot.write_new(output)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": report.plan,
+                "steps": report.steps,
+                "result": summary,
+                "output": output.display().to_string(),
+            }))?
+        );
+    } else {
+        println!("migrated {}", summary.cartridge_id);
+        println!(
+            "state schema: {} -> {}",
+            report.plan.source_schema, report.plan.target_schema
+        );
+        if report.steps.is_empty() {
+            println!("migrations: none");
+        } else {
+            println!("migrations:");
+            for step in report.steps {
+                println!(
+                    "  {}: {} -> {} ({} fuel, {} event(s))",
+                    step.name, step.from, step.to, step.fuel_consumed, step.event_count
+                );
+            }
+        }
+        println!(
+            "result: {} key(s), {} bytes",
+            summary.entries, summary.bytes
+        );
+        println!("snapshot: {}", output.display());
     }
     Ok(())
 }

@@ -1,0 +1,31 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.migration-fixture"
+name = "Migration Fixture"
+version = "0.1.0"
+description = "exercises isolated multi-step state migrations"
+
+[permissions]
+storage = true
+
+[runtime]
+fuel = 10000000
+memory_bytes = 67108864
+storage_bytes = 4096
+storage_keys = 16
+storage_value_bytes = 256
+timeout_ms = 1000
+
+[state]
+schema = 2
+
+[[state.migrations]]
+name = "add-profile"
+from = 0
+to = 1
+
+[[state.migrations]]
+name = "normalize-profile"
+from = 1
+to = 2

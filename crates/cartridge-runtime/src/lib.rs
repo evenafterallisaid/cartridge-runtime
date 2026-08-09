@@ -2,8 +2,8 @@ mod host;
 
 use std::{path::Path, sync::Arc, thread, time::Duration};
 
-use anyhow::{Context, Result, anyhow};
-use cartridge_core::CartridgeArchive;
+use anyhow::{Context, Result, anyhow, bail};
+use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
 pub use cartridge_storage::{
     DirectoryStorage, MemoryStorage, RecoveryReport, RestorePlan, SnapshotComparison,
     SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend, StorageLimits,
@@ -21,6 +21,10 @@ use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
 use wasmtime_wasi::p2::bindings::sync::io::poll;
 
 const EPOCH_TICK_MS: u64 = 10;
+const MAX_GUEST_ERROR_BYTES: usize = 16 * 1024;
+
+pub const MAX_MIGRATION_STEPS_PER_RUN: usize = 64;
+pub const MAX_MIGRATION_TOTAL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -111,15 +115,7 @@ impl Runtime {
         }
         let component = Component::new(&self.engine, &archive.component)
             .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
-        let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
-        linker.allow_shadowing(true);
-        monotonic_clock::add_to_linker::<_, RuntimeMonotonic>(&mut linker, |state| {
-            RuntimeMonotonicView { state }
-        })?;
-        poll::add_to_linker::<_, RuntimePoll>(&mut linker, |state| RuntimePollView { state })?;
-        linker.allow_shadowing(false);
-        Cartridge::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
+        let linker = self.linker()?;
 
         let manifest = archive.manifest;
         let expected_result = replay.as_ref().map(|trace| trace.result.clone());
@@ -128,7 +124,7 @@ impl Runtime {
             &self.engine,
             HostState::new(
                 &manifest,
-                archive.assets,
+                Arc::new(archive.assets),
                 self.storage.clone(),
                 expected_events,
             ),
@@ -146,7 +142,17 @@ impl Runtime {
 
         let result =
             call_result.map_err(|error| anyhow!("the component trapped while running: {error}"))?;
-        let output = result.map_err(|message| anyhow!("cartridge returned an error: {message}"))?;
+        let output = match result {
+            Ok(output) => output,
+            Err(message) if message.len() <= MAX_GUEST_ERROR_BYTES => {
+                return Err(anyhow!("cartridge returned an error: {message}"));
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "cartridge returned an error larger than the {MAX_GUEST_ERROR_BYTES} byte limit"
+                ));
+            }
+        };
         if output.len() > MAX_TRACE_OUTPUT_BYTES {
             return Err(anyhow!(
                 "cartridge output exceeds the {MAX_TRACE_OUTPUT_BYTES} byte limit"
@@ -175,6 +181,156 @@ impl Runtime {
             trace,
         })
     }
+
+    pub fn migrate(
+        &self,
+        archive: CartridgeArchive,
+        source: StorageSnapshot,
+    ) -> Result<MigrationReport> {
+        let plan = archive.manifest.migration_plan(source.state_schema())?;
+        validate_migration_budget(&archive.manifest, &plan)?;
+        let limits = storage_limits(&archive.manifest);
+        let cartridge_id = archive.manifest.cartridge.id.clone();
+        let initial = SnapshotStorage::from_snapshot(&source, &cartridge_id, limits)?;
+        initial.prepare(&cartridge_id, source.state_schema(), limits)?;
+        drop(initial);
+
+        if plan.steps.is_empty() {
+            return Ok(MigrationReport {
+                plan,
+                steps: Vec::new(),
+                snapshot: source,
+            });
+        }
+        if !archive.manifest.permissions.storage {
+            bail!("state migrations require the storage permission");
+        }
+
+        let component = Component::new(&self.engine, &archive.component)
+            .map_err(|error| anyhow!("the migration component could not be compiled: {error}"))?;
+        let assets = Arc::new(archive.assets);
+        let manifest = archive.manifest;
+        let mut current = source;
+        let mut reports = Vec::with_capacity(plan.steps.len());
+
+        for step in &plan.steps {
+            let branch = Arc::new(SnapshotStorage::from_snapshot(
+                &current,
+                &cartridge_id,
+                limits,
+            )?);
+            branch.prepare(&cartridge_id, step.from, limits)?;
+            let report = self.execute_migration_step(
+                &component,
+                &manifest,
+                assets.clone(),
+                branch.clone(),
+                step,
+            )?;
+            let next = branch.export_migrated_snapshot(step.from, step.to, limits)?;
+            next.summary()?;
+            current = next;
+            reports.push(report);
+        }
+
+        if current.state_schema() != plan.target_schema {
+            bail!(
+                "migration ended at schema {}; expected {}",
+                current.state_schema(),
+                plan.target_schema
+            );
+        }
+        Ok(MigrationReport {
+            plan,
+            steps: reports,
+            snapshot: current,
+        })
+    }
+
+    fn execute_migration_step(
+        &self,
+        component: &Component,
+        manifest: &PackageManifest,
+        assets: Arc<std::collections::BTreeMap<String, Vec<u8>>>,
+        storage: Arc<SnapshotStorage>,
+        step: &StateMigration,
+    ) -> Result<MigrationStepReport> {
+        let linker = self.linker()?;
+        let mut store = Store::new(
+            &self.engine,
+            HostState::new(manifest, assets, storage, None),
+        );
+        store.limiter(|state| &mut state.limits);
+        store.set_fuel(manifest.runtime.fuel)?;
+        store.set_epoch_deadline(timeout_ticks(manifest.runtime.timeout_ms));
+
+        let instance = linker.instantiate(&mut store, component).map_err(|error| {
+            anyhow!("migration {} could not be instantiated: {error}", step.name)
+        })?;
+        let migrate = instance
+            .get_typed_func::<(&str, u32, u32), (std::result::Result<(), String>,)>(
+                &mut store, "migrate",
+            )
+            .map_err(|error| {
+                anyhow!("component does not export the required migration function: {error}")
+            })?;
+        let call = migrate.call(&mut store, (&step.name, step.from, step.to));
+        let fuel_remaining = store.get_fuel()?;
+        let mut state = store.into_data();
+        state.finish_replay()?;
+        let (result,) = call
+            .map_err(|error| anyhow!("migration {} trapped while running: {error}", step.name))?;
+        if let Err(message) = result {
+            if message.len() > MAX_GUEST_ERROR_BYTES {
+                bail!(
+                    "migration {} returned an error larger than the {MAX_GUEST_ERROR_BYTES} byte limit",
+                    step.name
+                );
+            }
+            bail!("migration {} returned an error: {message}", step.name);
+        }
+        Ok(MigrationStepReport {
+            name: step.name.clone(),
+            from: step.from,
+            to: step.to,
+            fuel_consumed: manifest.runtime.fuel.saturating_sub(fuel_remaining),
+            event_count: state.events.len(),
+        })
+    }
+
+    fn linker(&self) -> Result<Linker<HostState>> {
+        let mut linker = Linker::new(&self.engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+        linker.allow_shadowing(true);
+        monotonic_clock::add_to_linker::<_, RuntimeMonotonic>(&mut linker, |state| {
+            RuntimeMonotonicView { state }
+        })?;
+        poll::add_to_linker::<_, RuntimePoll>(&mut linker, |state| RuntimePollView { state })?;
+        linker.allow_shadowing(false);
+        Cartridge::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
+        Ok(linker)
+    }
+}
+
+fn validate_migration_budget(manifest: &PackageManifest, plan: &MigrationPlan) -> Result<()> {
+    if plan.steps.len() > MAX_MIGRATION_STEPS_PER_RUN {
+        bail!(
+            "migration plan contains {} steps; maximum is {MAX_MIGRATION_STEPS_PER_RUN}",
+            plan.steps.len()
+        );
+    }
+    let step_count = u64::try_from(plan.steps.len()).unwrap_or(u64::MAX);
+    let total_timeout = manifest
+        .runtime
+        .timeout_ms
+        .checked_mul(step_count)
+        .ok_or_else(|| anyhow!("migration timeout budget overflowed"))?;
+    if total_timeout > MAX_MIGRATION_TOTAL_TIMEOUT_MS {
+        bail!(
+            "migration timeout budget is {total_timeout} ms; maximum is {MAX_MIGRATION_TOTAL_TIMEOUT_MS} ms"
+        );
+    }
+    Ok(())
 }
 
 fn start_epoch_ticker(engine: &Engine) -> Result<()> {
@@ -227,9 +383,67 @@ pub struct RunReport {
     pub trace: ExecutionTrace,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MigrationStepReport {
+    pub name: String,
+    pub from: u32,
+    pub to: u32,
+    pub fuel_consumed: u64,
+    pub event_count: usize,
+}
+
+#[derive(Debug)]
+pub struct MigrationReport {
+    pub plan: MigrationPlan,
+    pub steps: Vec<MigrationStepReport>,
+    pub snapshot: StorageSnapshot,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn migration_manifest(timeout_ms: u64) -> PackageManifest {
+        PackageManifest {
+            format_version: 1,
+            cartridge: cartridge_core::CartridgeMetadata {
+                id: "dev.example.migration".into(),
+                name: "Migration".into(),
+                version: "1.0.0".into(),
+                description: String::new(),
+            },
+            permissions: cartridge_core::Permissions {
+                storage: true,
+                ..Default::default()
+            },
+            runtime: cartridge_core::RuntimeLimits {
+                timeout_ms,
+                ..Default::default()
+            },
+            state: cartridge_core::StateConfig::default(),
+            dependencies: Vec::new(),
+            services: cartridge_core::Services::default(),
+            integrity: cartridge_core::Integrity::default(),
+        }
+    }
+
+    fn migration_plan(steps: usize) -> MigrationPlan {
+        MigrationPlan {
+            format_version: 1,
+            cartridge_id: "dev.example.migration".into(),
+            cartridge_version: "1.0.0".into(),
+            component_sha256: "a".repeat(64),
+            source_schema: 0,
+            target_schema: u32::try_from(steps).unwrap(),
+            steps: (0..steps)
+                .map(|index| StateMigration {
+                    name: format!("step-{index}"),
+                    from: u32::try_from(index).unwrap(),
+                    to: u32::try_from(index + 1).unwrap(),
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn timeout_is_rounded_up_to_the_next_epoch() {
@@ -255,5 +469,20 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(message.contains("interrupt"), "{message}");
+    }
+
+    #[test]
+    fn migration_budget_bounds_steps_and_aggregate_wall_time() {
+        assert!(
+            validate_migration_budget(
+                &migration_manifest(1),
+                &migration_plan(MAX_MIGRATION_STEPS_PER_RUN + 1)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_migration_budget(&migration_manifest(300_000), &migration_plan(3)).is_err()
+        );
+        validate_migration_budget(&migration_manifest(300_000), &migration_plan(2)).unwrap();
     }
 }

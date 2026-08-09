@@ -48,6 +48,8 @@ The packer supplies the integrity block. Cartridge IDs use reverse-domain notati
 
 The optional state section declares the schema expected by the current component and the monotonic upgrade paths it supports. Packages without the section use schema `0`. See [state migrations](migrations.md) for validation and planning rules.
 
+A component that implements migrations targets the `migratable-cartridge` WIT world. It exports the normal `run` function plus `migrate(name, source, target)`. Ordinary cartridges continue to target the smaller `cartridge` world, so adding migration support does not silently expand every component's ABI.
+
 ## Relationships
 
 Cartridges can request narrow, versioned services from other cartridges:

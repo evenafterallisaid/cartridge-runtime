@@ -8,7 +8,7 @@ The intended boundary is documented in `docs/architecture.md`. Missing permissio
 
 ## Current hardening
 
-The runtime enforces decompressed archive budgets, bounded Wasm memories, tables, and host resources, finite fuel and wall-clock budgets, bounded WASI waits, finite storage-lock waits, bounded traces and diagnostic inputs, and control-safe terminal output. Public CLI execution compiles and runs cartridges in a supervised helper process with a cleared, minimal environment and a hard parent-side deadline. Durable state, snapshots, and traces use private Unix permissions when created. Security regression fixtures run on Windows, macOS, and Linux in CI.
+The runtime enforces decompressed archive budgets, bounded Wasm memories, tables, and host resources, finite fuel and wall-clock budgets, bounded WASI waits, finite storage-lock waits, bounded traces and diagnostic inputs, and control-safe terminal output. Public CLI execution compiles and runs cartridges in a supervised helper process with a cleared, minimal environment and a hard parent-side deadline. Migration steps run on disposable snapshot branches with bounded aggregate execution time and publish no output after a failed step. Durable state, snapshots, and traces use private Unix permissions when created. Security regression fixtures run on Windows, macOS, and Linux in CI.
 
 These controls reduce denial-of-service and local data-exposure risks, but this remains a pre-alpha boundary. In particular:
 

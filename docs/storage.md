@@ -52,6 +52,8 @@ cartridge storage recover app.cartridge --state-dir ./state
 cartridge storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
 cartridge storage inspect backup.cartridge-state.json
 cartridge storage migration-plan app.cartridge --from-schema 0
+cartridge storage migrate app.cartridge old.cartridge-state.json \
+  --output migrated.cartridge-state.json
 cartridge run app.cartridge --from-snapshot backup.cartridge-state.json \
   --snapshot-output branch.cartridge-state.json -- experiment
 cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
@@ -61,4 +63,4 @@ State commits are immutable generations. The backend flushes a new temporary sna
 
 The internal generation files are a recovery mechanism, not the portable snapshot format. Export produces a separately versioned envelope containing only cartridge identity and sorted key/value data. Snapshot comparison reports changed keys, lengths, and digests without printing values. Restore rejects another cartridge's snapshot and any state that exceeds the package limits, then replaces the namespace in one generation.
 
-Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. Snapshot branches complete the other half of the migration foundation: a future migration runner can transform isolated state, compare the result, validate quotas, and commit through the existing restore path.
+Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. Migration rehearsal executes every declared step against a fresh snapshot branch, validates the intermediate schema and quotas, and writes a new portable snapshot only after the complete plan succeeds. It never opens the durable backend. Committing that result with an automatic rollback point is a separate, explicit operation planned for the next storage slice.

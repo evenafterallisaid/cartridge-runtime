@@ -1,0 +1,10 @@
+{
+  "payload": {
+    "format_version": 2,
+    "cartridge_id": "dev.cartridge.migration-fixture",
+    "entries": {
+      "profile/name": "416461"
+    }
+  },
+  "payload_sha256": "267723a4f1109de49a7a2dc62808fe8f89a79b92de091f58e76daa1ede1a75a0"
+}

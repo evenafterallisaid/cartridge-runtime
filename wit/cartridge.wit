@@ -21,3 +21,9 @@ world cartridge {
     import host;
     export run: func(args: list<string>) -> result<string, string>;
 }
+
+world migratable-cartridge {
+    import host;
+    export run: func(args: list<string>) -> result<string, string>;
+    export migrate: func(name: string, source: u32, target: u32) -> result<_, string>;
+}

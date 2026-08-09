@@ -55,15 +55,44 @@ impl SnapshotStorage {
     }
 
     pub fn export_snapshot(&self) -> Result<StorageSnapshot> {
-        let mut entries = BTreeMap::new();
-        for key in self.storage.list(&self.cartridge_id, "")? {
-            let value = self
-                .storage
-                .get(&self.cartridge_id, &key)?
-                .ok_or_else(|| Error::Corrupt(format!("snapshot branch lost key {key:?}")))?;
-            entries.insert(key, value);
+        self.export_snapshot_with_schema(
+            self.state_schema,
+            StorageLimits {
+                max_bytes: MAX_STORAGE_BYTES,
+                max_keys: MAX_STORAGE_KEYS,
+                max_value_bytes: MAX_STORAGE_VALUE_BYTES,
+            },
+        )
+    }
+
+    pub fn export_migrated_snapshot(
+        &self,
+        expected_schema: u32,
+        next_schema: u32,
+        limits: StorageLimits,
+    ) -> Result<StorageSnapshot> {
+        if self.state_schema != expected_schema {
+            return Err(Error::SchemaMismatch {
+                expected: expected_schema,
+                actual: self.state_schema,
+            });
         }
-        StorageSnapshot::from_entries(&self.cartridge_id, self.state_schema, &entries)
+        if next_schema <= expected_schema {
+            return Err(Error::InvalidSchemaTransition {
+                from: expected_schema,
+                to: next_schema,
+            });
+        }
+        self.export_snapshot_with_schema(next_schema, limits)
+    }
+
+    fn export_snapshot_with_schema(
+        &self,
+        state_schema: u32,
+        limits: StorageLimits,
+    ) -> Result<StorageSnapshot> {
+        let entries = self.storage.snapshot_entries(&self.cartridge_id, limits)?;
+        StorageSnapshot::from_entries(&self.cartridge_id, state_schema, &entries)
     }
 
     fn check_namespace(&self, namespace: &str) -> Result<()> {
@@ -543,6 +572,58 @@ mod tests {
                 expected: 3,
                 actual: 2
             })
+        ));
+    }
+
+    #[test]
+    fn migrated_snapshot_advances_schema_without_mutating_its_source_branch() {
+        let source =
+            StorageSnapshot::from_entries("dev.example.test", 1, &BTreeMap::new()).unwrap();
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+        branch
+            .put("dev.example.test", "version", b"two", LIMITS)
+            .unwrap();
+
+        let migrated = branch.export_migrated_snapshot(1, 2, LIMITS).unwrap();
+
+        assert_eq!(source.state_schema(), 1);
+        assert_eq!(branch.export_snapshot().unwrap().state_schema(), 1);
+        assert_eq!(migrated.state_schema(), 2);
+    }
+
+    #[test]
+    fn migrated_snapshot_rejects_non_monotonic_or_mismatched_schemas() {
+        let source =
+            StorageSnapshot::from_entries("dev.example.test", 1, &BTreeMap::new()).unwrap();
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+
+        assert!(matches!(
+            branch.export_migrated_snapshot(0, 2, LIMITS),
+            Err(Error::SchemaMismatch { .. })
+        ));
+        assert!(matches!(
+            branch.export_migrated_snapshot(1, 1, LIMITS),
+            Err(Error::InvalidSchemaTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn migrated_snapshot_revalidates_the_complete_branch_under_one_quota() {
+        let source =
+            StorageSnapshot::from_entries("dev.example.test", 1, &BTreeMap::new()).unwrap();
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+        branch
+            .put("dev.example.test", "value", &[0; 16], LIMITS)
+            .unwrap();
+        let lower = StorageLimits {
+            max_bytes: 8,
+            max_keys: LIMITS.max_keys,
+            max_value_bytes: 8,
+        };
+
+        assert!(matches!(
+            branch.export_migrated_snapshot(1, 2, lower),
+            Err(Error::ValueTooLarge { .. } | Error::QuotaExceeded { .. })
         ));
     }
 }
