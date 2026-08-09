@@ -128,11 +128,26 @@ Delivery slices:
 
 1. In-memory key/value contract, namespace isolation, quotas, guest bindings, and replay semantics.
 2. Durable directory backend with locking, immutable generation commits, corruption detection, and recovery tests on every CI platform.
-3. Canonical snapshot format with content digests, CLI export/import, and transactional restore.
+3. Canonical snapshot format with content digests, CLI export/inspect/diff, dry runs, and transactional restore.
 4. Migration plans that run against a temporary snapshot before committing changes.
 5. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first two slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. The next slice defines portable snapshots without exposing the internal journal format as a compatibility promise.
+The first three slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. The next slice builds migrations as pure snapshot transformations before allowing them to commit.
+
+Migration design constraints:
+
+- the manifest declares a monotonically increasing state schema version
+- every migration names one source and destination schema version
+- the runtime captures an automatic rollback snapshot before migration
+- migration code runs against an isolated overlay, never the live namespace
+- dry runs report key and byte changes without exposing stored values
+- the transformed snapshot must pass integrity and quota validation
+- committing a migration writes exactly one durable generation
+- failed or trapped migrations leave the previous generation active
+- downgrade support is explicit rather than inferred
+- migration compatibility is tested on snapshots from every released schema
+
+Later snapshot work includes selective exports, encrypted envelopes, signed backups, blob references, streaming import for large state, and redaction policies for support bundles. None of those should change the guest key/value ABI.
 
 Exit criteria:
 
@@ -719,11 +734,12 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Define the portable storage snapshot format and CLI export/import commands.
-2. Add migration dry runs and transactional restore.
-3. Add package-wide Merkle-style asset integrity.
-4. Create a minimal 2D window and input prototype behind new WIT packages.
-5. Build a small trace viewer after there is enough real trace data to design around.
+1. Add manifest state schema versions and a migration-plan format.
+2. Run migrations against isolated snapshot overlays with automatic rollback points.
+3. Add content-addressed blobs and snapshot references for larger state.
+4. Add package-wide Merkle-style asset integrity.
+5. Create a minimal 2D window and input prototype behind new WIT packages.
+6. Build a small trace viewer after there is enough real trace data to design around.
 
 Completed foundations:
 
@@ -732,5 +748,6 @@ Completed foundations:
 - epoch deadlines alongside deterministic fuel limits
 - isolated in-memory storage with quotas and side-effect-free replay
 - checksummed durable generations, process locking, status, and recovery
+- portable snapshot export, inspection, diffing, dry runs, and transactional restore
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

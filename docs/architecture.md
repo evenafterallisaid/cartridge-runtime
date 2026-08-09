@@ -26,6 +26,8 @@ The `.cartridge` archive is also untrusted. Duplicate entries, malformed manifes
 
 Storage backends receive the validated cartridge id as an opaque namespace. Guests never choose a namespace or receive a host path. Per-value, key-count, and total-byte limits are checked before a write changes state. The in-memory backend is deterministic and useful for tests. The directory backend hashes namespace names, serializes writers with an operating-system file lock, and commits immutable checksummed generations while retaining one rollback point.
 
+Portable snapshots sit above the backend contract. They contain sorted key/value state and cartridge identity, but no host path, lock, journal generation, timestamp, or platform metadata. Restore validates identity, integrity, and quotas before replacing a namespace in one locked generation. Dry runs use the same plan without committing it.
+
 Fuel provides a deterministic instruction budget. A separate runtime epoch ticker enforces the manifest wall-time deadline, so a component blocked in compute cannot avoid interruption simply because its fuel budget is large. Epoch timing is deliberately coarse and is not part of deterministic replay.
 
 The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, while the host controls which imports are linked. A security review, signed packages, cache isolation, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.

@@ -45,8 +45,13 @@ Traces may contain private storage values and should be treated as sensitive fil
 cartridge run app.cartridge --state-dir ./state -- first-run
 cartridge storage status app.cartridge --state-dir ./state
 cartridge storage recover app.cartridge --state-dir ./state
+cartridge storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
+cartridge storage inspect backup.cartridge-state.json
+cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
 ```
 
 State commits are immutable generations. The backend flushes a new temporary snapshot, renames it to a previously unused generation, and retains the prior valid generation. Incomplete temporary files are ignored and removed by the next write. Every generation contains a digest over its canonical payload; corrupt committed generations block normal access until explicit recovery quarantines them.
 
-The internal generation files are a recovery mechanism, not the future portable snapshot format. Snapshot and migration commands will use a separately versioned interchange format rather than making journal layout part of the guest ABI.
+The internal generation files are a recovery mechanism, not the portable snapshot format. Export produces a separately versioned envelope containing only cartridge identity and sorted key/value data. Snapshot comparison reports changed keys, lengths, and digests without printing values. Restore rejects another cartridge's snapshot and any state that exceeds the package limits, then replaces the namespace in one generation.
+
+Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. This is also the foundation for migrations: a future migration runner can transform a snapshot, compare the result, validate quotas, and commit through the existing restore path.

@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
-use cartridge_runtime::{DirectoryStorage, Runtime, StorageBackend};
+use cartridge_runtime::{
+    DirectoryStorage, Runtime, SnapshotDifference, StorageBackend, StorageLimits, StorageSnapshot,
+};
 use cartridge_trace::{ExecutionTrace, TraceDifference};
 use clap::{Parser, Subcommand};
 
@@ -118,6 +120,38 @@ enum StorageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// export a portable snapshot without journal metadata
+    Export {
+        package: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// validate and summarize a portable snapshot
+    Inspect {
+        snapshot: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// find the first difference between two snapshots
+    Diff {
+        left: PathBuf,
+        right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// plan or commit a transactional snapshot restore
+    Restore {
+        package: PathBuf,
+        snapshot: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -162,6 +196,20 @@ fn main() -> Result<()> {
                 state_dir,
                 json,
             } => storage_recover_command(&package, &state_dir, json),
+            StorageCommand::Export {
+                package,
+                state_dir,
+                output,
+            } => storage_export_command(&package, &state_dir, &output),
+            StorageCommand::Inspect { snapshot, json } => storage_inspect_command(&snapshot, json),
+            StorageCommand::Diff { left, right, json } => storage_diff_command(&left, &right, json),
+            StorageCommand::Restore {
+                package,
+                snapshot,
+                state_dir,
+                dry_run,
+                json,
+            } => storage_restore_command(&package, &snapshot, &state_dir, dry_run, json),
         },
     }
 }
@@ -308,6 +356,117 @@ fn storage_recover_command(package: &Path, state_dir: &Path, json: bool) -> Resu
         println!("discarded pending: {}", report.discarded_pending);
     }
     Ok(())
+}
+
+fn storage_export_command(package: &Path, state_dir: &Path, output: &Path) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let storage = DirectoryStorage::open(state_dir)?;
+    let snapshot = storage.export_snapshot(&archive.manifest.cartridge.id)?;
+    let summary = snapshot.summary()?;
+    snapshot.write_new(output)?;
+    println!(
+        "exported {} key(s), {} bytes -> {}",
+        summary.entries,
+        summary.bytes,
+        output.display()
+    );
+    Ok(())
+}
+
+fn storage_inspect_command(path: &Path, json: bool) -> Result<()> {
+    let snapshot = StorageSnapshot::read(path)
+        .with_context(|| format!("could not inspect snapshot {}", path.display()))?;
+    let summary = snapshot.summary()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("{}", summary.cartridge_id);
+        println!("snapshot format: {}", summary.format_version);
+        println!("entries: {}", summary.entries);
+        println!("bytes: {}", summary.bytes);
+        println!("payload sha256: {}", summary.payload_sha256);
+    }
+    Ok(())
+}
+
+fn storage_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
+    let left = StorageSnapshot::read(left)
+        .with_context(|| format!("could not inspect snapshot {}", left.display()))?;
+    let right = StorageSnapshot::read(right)
+        .with_context(|| format!("could not inspect snapshot {}", right.display()))?;
+    let comparison = left.compare(&right)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+    } else if comparison.identical {
+        println!("snapshots are identical");
+    } else if let Some(difference) = comparison.difference {
+        match difference {
+            SnapshotDifference::Identity { left, right } => {
+                println!("cartridge identity differs");
+                println!("  left:  {left}");
+                println!("  right: {right}");
+            }
+            SnapshotDifference::Entry { key, left, right } => {
+                println!("first entry difference at {key}");
+                println!("  left:  {}", serde_json::to_string(&left)?);
+                println!("  right: {}", serde_json::to_string(&right)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn storage_restore_command(
+    package: &Path,
+    snapshot: &Path,
+    state_dir: &Path,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let snapshot = StorageSnapshot::read(snapshot)?;
+    let storage = DirectoryStorage::open(state_dir)?;
+    let limits = storage_limits(&archive.manifest);
+    let plan = if dry_run {
+        storage.plan_restore(&archive.manifest.cartridge.id, &snapshot, limits)?
+    } else {
+        storage.restore(&archive.manifest.cartridge.id, &snapshot, limits)?
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": dry_run,
+                "changed": plan.changed(),
+                "plan": plan,
+            }))?
+        );
+    } else {
+        println!(
+            "{} restore for {}",
+            if dry_run { "planned" } else { "completed" },
+            archive.manifest.cartridge.id
+        );
+        println!("added: {}", plan.added);
+        println!("replaced: {}", plan.replaced);
+        println!("removed: {}", plan.removed);
+        println!("unchanged: {}", plan.unchanged);
+        println!(
+            "usage: {} key(s), {} bytes -> {} key(s), {} bytes",
+            plan.current.keys, plan.current.bytes, plan.snapshot.keys, plan.snapshot.bytes
+        );
+    }
+    Ok(())
+}
+
+fn storage_limits(manifest: &cartridge_core::PackageManifest) -> StorageLimits {
+    StorageLimits {
+        max_bytes: manifest.runtime.storage_bytes,
+        max_keys: manifest.runtime.storage_keys,
+        max_value_bytes: manifest.runtime.storage_value_bytes,
+    }
 }
 
 fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {

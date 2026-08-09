@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 
 use crate::{
-    Error, Result, StorageBackend, StorageLimits, StorageUsage, validate_key, validate_limits,
-    validate_namespace, validate_prefix,
+    Error, Result, StorageBackend, StorageLimits, StorageSnapshot, StorageUsage, validate_key,
+    validate_limits, validate_namespace, validate_prefix,
 };
 
 const DISK_FORMAT_VERSION: u32 = 1;
@@ -81,6 +81,54 @@ impl DirectoryStorage {
                 quarantined,
                 discarded_pending,
             })
+        })
+    }
+
+    pub fn export_snapshot(&self, namespace: &str) -> Result<StorageSnapshot> {
+        self.with_namespace(namespace, |directory| {
+            let state = load_state(directory, namespace)?;
+            StorageSnapshot::from_entries(namespace, &state.entries)
+        })
+    }
+
+    pub fn plan_restore(
+        &self,
+        namespace: &str,
+        snapshot: &StorageSnapshot,
+        limits: StorageLimits,
+    ) -> Result<RestorePlan> {
+        let entries = snapshot.entries_for(namespace)?;
+        validate_restore_limits(&entries, limits)?;
+        self.with_namespace(namespace, |directory| {
+            let current = load_state(directory, namespace)?;
+            build_restore_plan(&current.entries, &entries)
+        })
+    }
+
+    pub fn restore(
+        &self,
+        namespace: &str,
+        snapshot: &StorageSnapshot,
+        limits: StorageLimits,
+    ) -> Result<RestorePlan> {
+        let entries = snapshot.entries_for(namespace)?;
+        validate_restore_limits(&entries, limits)?;
+        self.with_namespace(namespace, |directory| {
+            cleanup_pending(directory)?;
+            let current = load_state(directory, namespace)?;
+            let plan = build_restore_plan(&current.entries, &entries)?;
+            if plan.changed() {
+                commit_state(
+                    directory,
+                    namespace,
+                    State {
+                        generation: current.generation,
+                        usage: plan.snapshot,
+                        entries,
+                    },
+                )?;
+            }
+            Ok(plan)
         })
     }
 
@@ -225,6 +273,23 @@ pub struct RecoveryReport {
     pub discarded_pending: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RestorePlan {
+    pub current: StorageUsage,
+    pub snapshot: StorageUsage,
+    pub added: usize,
+    pub replaced: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
+impl RestorePlan {
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.added != 0 || self.replaced != 0 || self.removed != 0
+    }
+}
+
 fn load_state(directory: &Path, namespace: &str) -> Result<State> {
     let files = state_files(directory)?;
     let mut latest = State::default();
@@ -235,6 +300,78 @@ fn load_state(directory: &Path, namespace: &str) -> Result<State> {
         }
     }
     Ok(latest)
+}
+
+fn validate_restore_limits(
+    entries: &BTreeMap<String, Vec<u8>>,
+    limits: StorageLimits,
+) -> Result<()> {
+    validate_limits(limits)?;
+    let mut bytes = 0usize;
+    for value in entries.values() {
+        if value.len() > limits.max_value_bytes {
+            return Err(Error::ValueTooLarge {
+                size: value.len(),
+                limit: limits.max_value_bytes,
+            });
+        }
+        bytes = bytes.checked_add(value.len()).ok_or(Error::QuotaExceeded {
+            size: usize::MAX,
+            limit: limits.max_bytes,
+        })?;
+    }
+    if bytes > limits.max_bytes {
+        return Err(Error::QuotaExceeded {
+            size: bytes,
+            limit: limits.max_bytes,
+        });
+    }
+    if entries.len() > limits.max_keys {
+        return Err(Error::KeyLimitExceeded {
+            limit: limits.max_keys,
+        });
+    }
+    Ok(())
+}
+
+fn build_restore_plan(
+    current: &BTreeMap<String, Vec<u8>>,
+    snapshot: &BTreeMap<String, Vec<u8>>,
+) -> Result<RestorePlan> {
+    let mut added = 0;
+    let mut replaced = 0;
+    let mut unchanged = 0;
+    for (key, value) in snapshot {
+        match current.get(key) {
+            None => added += 1,
+            Some(current) if current == value => unchanged += 1,
+            Some(_) => replaced += 1,
+        }
+    }
+    let removed = current
+        .keys()
+        .filter(|key| !snapshot.contains_key(*key))
+        .count();
+    Ok(RestorePlan {
+        current: state_usage(current)?,
+        snapshot: state_usage(snapshot)?,
+        added,
+        replaced,
+        removed,
+        unchanged,
+    })
+}
+
+fn state_usage(entries: &BTreeMap<String, Vec<u8>>) -> Result<StorageUsage> {
+    let bytes = entries.values().try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.len())
+            .ok_or_else(|| Error::Corrupt("storage usage overflowed".into()))
+    })?;
+    Ok(StorageUsage {
+        bytes,
+        keys: entries.len(),
+    })
 }
 
 fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
@@ -508,6 +645,57 @@ mod tests {
             first.list("dev.example.test", "").unwrap(),
             vec!["first", "second"]
         );
+    }
+
+    #[test]
+    fn restore_plan_does_not_change_state_until_committed() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage
+            .put("dev.example.test", "value", b"first", LIMITS)
+            .unwrap();
+        let snapshot = storage.export_snapshot("dev.example.test").unwrap();
+        storage
+            .put("dev.example.test", "value", b"second", LIMITS)
+            .unwrap();
+        storage
+            .put("dev.example.test", "extra", b"remove", LIMITS)
+            .unwrap();
+
+        let plan = storage
+            .plan_restore("dev.example.test", &snapshot, LIMITS)
+            .unwrap();
+
+        assert_eq!(plan.replaced, 1);
+        assert_eq!(plan.removed, 1);
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"second".to_vec())
+        );
+
+        storage
+            .restore("dev.example.test", &snapshot, LIMITS)
+            .unwrap();
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(storage.get("dev.example.test", "extra").unwrap(), None);
+    }
+
+    #[test]
+    fn restore_rejects_another_cartridges_snapshot() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage
+            .put("dev.example.first", "value", b"first", LIMITS)
+            .unwrap();
+        let snapshot = storage.export_snapshot("dev.example.first").unwrap();
+
+        assert!(matches!(
+            storage.plan_restore("dev.example.second", &snapshot, LIMITS),
+            Err(Error::SnapshotIdentity { .. })
+        ));
     }
 
     struct TestDirectory {

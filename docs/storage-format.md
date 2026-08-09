@@ -54,4 +54,4 @@ Normal access rejects malformed JSON, changed payload digests, mismatched namesp
 
 `cartridge storage recover` validates every retained generation. If at least one is valid, corrupt generations are renamed with a `corrupt-` prefix and the newest valid generation becomes active. Recovery refuses to manufacture empty state when every committed generation is corrupt.
 
-This format is internal and may change before 1.0. Portable export and import will use a separate snapshot format with its own version and compatibility rules.
+This format is internal and may change before 1.0. Portable export and restore use the separate [storage snapshot format](snapshot-format.md), which has its own version and compatibility rules.

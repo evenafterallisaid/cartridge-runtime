@@ -1,4 +1,5 @@
 mod directory;
+mod snapshot;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -9,7 +10,10 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 
-pub use directory::{DirectoryStorage, RecoveryReport};
+pub use directory::{DirectoryStorage, RecoveryReport, RestorePlan};
+pub use snapshot::{
+    SnapshotComparison, SnapshotDifference, SnapshotEntry, StorageSnapshot, StorageSnapshotSummary,
+};
 
 pub const MAX_KEY_BYTES: usize = 256;
 
@@ -177,6 +181,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("storage serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("snapshot belongs to {actual}; expected {expected}")]
+    SnapshotIdentity { expected: String, actual: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,0 +1,330 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{Error, Result, StorageUsage, validate_key, validate_namespace};
+
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+
+static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshot {
+    payload: SnapshotPayload,
+    payload_sha256: String,
+}
+
+impl StorageSnapshot {
+    pub(crate) fn from_entries(
+        cartridge_id: &str,
+        entries: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self> {
+        validate_namespace(cartridge_id)?;
+        let payload = SnapshotPayload {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            cartridge_id: cartridge_id.to_owned(),
+            entries: entries
+                .iter()
+                .map(|(key, value)| (key.clone(), hex::encode(value)))
+                .collect(),
+        };
+        let payload_sha256 = payload_digest(&payload)?;
+        Ok(Self {
+            payload,
+            payload_sha256,
+        })
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let snapshot: Self = serde_json::from_slice(bytes)
+            .map_err(|error| Error::Corrupt(format!("snapshot is not valid JSON: {error}")))?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn read(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path)?;
+        if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+            return Err(Error::Corrupt(format!(
+                "{} exceeds the snapshot size limit",
+                path.display()
+            )));
+        }
+        Self::from_slice(&fs::read(path)?)
+    }
+
+    pub fn write_new(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.validate()?;
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent)?;
+        }
+        let directory = parent.unwrap_or_else(|| Path::new("."));
+        let temporary = temporary_path(directory);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        drop(file);
+        if let Err(error) = fs::hard_link(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::Io(error));
+        }
+        fs::remove_file(temporary)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.payload.format_version != SNAPSHOT_FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported snapshot format {}; expected {SNAPSHOT_FORMAT_VERSION}",
+                self.payload.format_version
+            )));
+        }
+        validate_namespace(&self.payload.cartridge_id)
+            .map_err(|_| Error::Corrupt("snapshot has an invalid cartridge id".into()))?;
+        if self.payload_sha256 != payload_digest(&self.payload)? {
+            return Err(Error::Corrupt(
+                "snapshot payload digest does not match its contents".into(),
+            ));
+        }
+        self.decode_entries().map(|_| ())
+    }
+
+    #[must_use]
+    pub fn cartridge_id(&self) -> &str {
+        &self.payload.cartridge_id
+    }
+
+    pub fn summary(&self) -> Result<StorageSnapshotSummary> {
+        self.validate()?;
+        let entries = self.decode_entries()?;
+        let usage = usage(&entries)?;
+        Ok(StorageSnapshotSummary {
+            format_version: self.payload.format_version,
+            cartridge_id: self.payload.cartridge_id.clone(),
+            entries: usage.keys,
+            bytes: usage.bytes,
+            payload_sha256: self.payload_sha256.clone(),
+        })
+    }
+
+    pub fn compare(&self, other: &Self) -> Result<SnapshotComparison> {
+        self.validate()?;
+        other.validate()?;
+        let difference = if self.cartridge_id() == other.cartridge_id() {
+            first_entry_difference(&self.decode_entries()?, &other.decode_entries()?)
+        } else {
+            Some(SnapshotDifference::Identity {
+                left: self.cartridge_id().to_owned(),
+                right: other.cartridge_id().to_owned(),
+            })
+        };
+        Ok(SnapshotComparison {
+            identical: difference.is_none(),
+            difference,
+        })
+    }
+
+    pub(crate) fn entries_for(
+        &self,
+        expected_cartridge_id: &str,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
+        self.validate()?;
+        if self.cartridge_id() != expected_cartridge_id {
+            return Err(Error::SnapshotIdentity {
+                expected: expected_cartridge_id.to_owned(),
+                actual: self.cartridge_id().to_owned(),
+            });
+        }
+        self.decode_entries()
+    }
+
+    fn decode_entries(&self) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut decoded = BTreeMap::new();
+        for (key, encoded) in &self.payload.entries {
+            validate_key(key)
+                .map_err(|_| Error::Corrupt(format!("snapshot contains invalid key {key:?}")))?;
+            let value = hex::decode(encoded).map_err(|error| {
+                Error::Corrupt(format!("snapshot value for {key:?} is invalid: {error}"))
+            })?;
+            decoded.insert(key.clone(), value);
+        }
+        Ok(decoded)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotPayload {
+    format_version: u32,
+    cartridge_id: String,
+    entries: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StorageSnapshotSummary {
+    pub format_version: u32,
+    pub cartridge_id: String,
+    pub entries: usize,
+    pub bytes: usize,
+    pub payload_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SnapshotComparison {
+    pub identical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difference: Option<SnapshotDifference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SnapshotDifference {
+    Identity {
+        left: String,
+        right: String,
+    },
+    Entry {
+        key: String,
+        left: Option<SnapshotEntry>,
+        right: Option<SnapshotEntry>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SnapshotEntry {
+    pub bytes: usize,
+    pub sha256: String,
+}
+
+fn payload_digest(payload: &SnapshotPayload) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(payload)?)))
+}
+
+fn usage(entries: &BTreeMap<String, Vec<u8>>) -> Result<StorageUsage> {
+    let bytes = entries.values().try_fold(0usize, |total, value| {
+        total
+            .checked_add(value.len())
+            .ok_or_else(|| Error::Corrupt("snapshot usage overflowed".into()))
+    })?;
+    Ok(StorageUsage {
+        bytes,
+        keys: entries.len(),
+    })
+}
+
+fn first_entry_difference(
+    left: &BTreeMap<String, Vec<u8>>,
+    right: &BTreeMap<String, Vec<u8>>,
+) -> Option<SnapshotDifference> {
+    let keys: BTreeSet<_> = left.keys().chain(right.keys()).collect();
+    keys.into_iter().find_map(|key| {
+        let left_value = left.get(key);
+        let right_value = right.get(key);
+        (left_value != right_value).then(|| SnapshotDifference::Entry {
+            key: key.clone(),
+            left: left_value.map(|value| snapshot_entry(value)),
+            right: right_value.map(|value| snapshot_entry(value)),
+        })
+    })
+}
+
+fn snapshot_entry(value: &[u8]) -> SnapshotEntry {
+    SnapshotEntry {
+        bytes: value.len(),
+        sha256: hex::encode(Sha256::digest(value)),
+    }
+}
+
+fn temporary_path(directory: &Path) -> PathBuf {
+    let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    directory.join(format!(
+        ".cartridge-snapshot-{}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(value: &[u8]) -> StorageSnapshot {
+        StorageSnapshot::from_entries(
+            "dev.example.test",
+            &BTreeMap::from([("settings/theme".into(), value.to_vec())]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_round_trips_canonical_data() {
+        let snapshot = snapshot(b"dark");
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let decoded = StorageSnapshot::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.summary().unwrap(), snapshot.summary().unwrap());
+        assert_eq!(
+            decoded.entries_for("dev.example.test").unwrap(),
+            BTreeMap::from([("settings/theme".into(), b"dark".to_vec())])
+        );
+    }
+
+    #[test]
+    fn changed_snapshot_payloads_are_rejected() {
+        let snapshot = snapshot(b"dark");
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value["payload"]["entries"]["settings/theme"] = "6c69676874".into();
+
+        assert!(matches!(
+            StorageSnapshot::from_slice(&serde_json::to_vec(&value).unwrap()),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn comparison_reports_changed_values_without_exposing_them() {
+        let comparison = snapshot(b"dark").compare(&snapshot(b"light")).unwrap();
+
+        assert!(!comparison.identical);
+        assert!(matches!(
+            comparison.difference,
+            Some(SnapshotDifference::Entry { .. })
+        ));
+    }
+
+    #[test]
+    fn portable_v1_fixture_remains_compatible() {
+        let snapshot =
+            StorageSnapshot::from_slice(include_bytes!("../tests/fixtures/snapshot-v1.json"))
+                .unwrap();
+
+        assert_eq!(
+            snapshot.summary().unwrap(),
+            StorageSnapshotSummary {
+                format_version: 1,
+                cartridge_id: "dev.example.test".into(),
+                entries: 1,
+                bytes: 4,
+                payload_sha256: "3e2cf42a40fed75311308f325de48929568683b15387be177818ed2dd9fa41c7"
+                    .into(),
+            }
+        );
+    }
+}

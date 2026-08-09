@@ -15,6 +15,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Standalone trace validation, summaries, and trace-to-trace diffing
 - Namespaced key/value storage with atomic quota checks and deterministic replay
 - Checksummed durable storage with process locking and generation recovery
+- Portable storage snapshots with inspection, diffing, dry runs, and transactional restore
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -48,6 +49,9 @@ cargo run -p cartridge-cli -- resolve dist/hello.cartridge
 cargo run -p cartridge-cli -- run dist/hello.cartridge --trace dist/hello.trace.json -- Clyde
 cargo run -p cartridge-cli -- run dist/hello.cartridge --state-dir dist/state -- Ada
 cargo run -p cartridge-cli -- storage status dist/hello.cartridge --state-dir dist/state
+cargo run -p cartridge-cli -- storage export dist/hello.cartridge --state-dir dist/state --output backup.cartridge-state.json
+cargo run -p cartridge-cli -- storage inspect backup.cartridge-state.json
+cargo run -p cartridge-cli -- storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
 cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
 cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
@@ -74,7 +78,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 
