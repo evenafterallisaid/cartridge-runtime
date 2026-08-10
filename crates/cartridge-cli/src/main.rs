@@ -1,3 +1,5 @@
+mod migration_receipt;
+
 use std::{
     ffi::OsString,
     fs,
@@ -18,6 +20,7 @@ use cartridge_runtime::{
 };
 use cartridge_trace::{ExecutionTrace, MAX_TRACE_DOCUMENT_BYTES, TraceDifference};
 use clap::{Parser, Subcommand};
+use migration_receipt::{MigrationReceipt, MigrationReceiptPayload};
 
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WORKER_STARTUP_BUDGET: Duration = Duration::from_secs(10);
@@ -126,6 +129,8 @@ enum Command {
         #[arg(long)]
         rollback_output: PathBuf,
         #[arg(long)]
+        receipt_output: PathBuf,
+        #[arg(long)]
         json: bool,
     },
     /// inspect and compare execution traces
@@ -232,6 +237,25 @@ enum StorageCommand {
         #[arg(long)]
         rollback_output: PathBuf,
         #[arg(long)]
+        receipt_output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// validate and summarize a durable migration receipt
+    #[command(name = "migration-receipt")]
+    MigrationReceipt {
+        receipt: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// determine whether a receipt's migration commit landed
+    #[command(name = "migration-recover")]
+    MigrationRecover {
+        package: PathBuf,
+        receipt: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
         json: bool,
     },
 }
@@ -321,10 +345,17 @@ fn run_cli() -> Result<()> {
             package,
             state_dir,
             rollback_output,
+            receipt_output,
             json,
         } => {
             require_worker_context()?;
-            storage_migrate_commit_command(&package, &state_dir, &rollback_output, json)
+            storage_migrate_commit_command(
+                &package,
+                &state_dir,
+                &rollback_output,
+                &receipt_output,
+                json,
+            )
         }
         Command::Trace { command } => match command {
             TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
@@ -375,8 +406,24 @@ fn run_storage_command(command: StorageCommand) -> Result<()> {
             package,
             state_dir,
             rollback_output,
+            receipt_output,
             json,
-        } => supervised_migrate_commit_command(&package, &state_dir, &rollback_output, json),
+        } => supervised_migrate_commit_command(
+            &package,
+            &state_dir,
+            &rollback_output,
+            &receipt_output,
+            json,
+        ),
+        StorageCommand::MigrationReceipt { receipt, json } => {
+            storage_migration_receipt_command(&receipt, json)
+        }
+        StorageCommand::MigrationRecover {
+            package,
+            receipt,
+            state_dir,
+            json,
+        } => storage_migration_recover_command(&package, &receipt, &state_dir, json),
     }
 }
 
@@ -444,12 +491,30 @@ fn supervised_migrate_commit_command(
     package: &Path,
     state_dir: &Path,
     rollback_output: &Path,
+    receipt_output: &Path,
     json: bool,
 ) -> Result<()> {
+    if rollback_output == receipt_output {
+        bail!("rollback and receipt outputs must use different paths");
+    }
+    for (name, path) in [("rollback", rollback_output), ("receipt", receipt_output)] {
+        if path
+            .try_exists()
+            .with_context(|| format!("could not inspect {name} output {}", path.display()))?
+        {
+            bail!("{name} output {} already exists", path.display());
+        }
+    }
     let archive = CartridgeArchive::open(package)
         .with_context(|| format!("could not validate {} before migration", package.display()))?;
     let storage = DirectoryStorage::open(state_dir)?;
     let source = storage.export_snapshot(&archive.manifest.cartridge.id)?;
+    if source.state_schema() == archive.manifest.state.schema {
+        bail!(
+            "durable state already uses schema {}; no migration commit is needed",
+            source.state_schema()
+        );
+    }
     let budget_ms = migration_budget_ms(&archive, &source)?;
     drop(source);
     drop(storage);
@@ -462,6 +527,8 @@ fn supervised_migrate_commit_command(
         state_dir.as_os_str().to_owned(),
         OsString::from("--rollback-output"),
         rollback_output.as_os_str().to_owned(),
+        OsString::from("--receipt-output"),
+        receipt_output.as_os_str().to_owned(),
     ];
     if json {
         worker_args.push(OsString::from("--json"));
@@ -947,8 +1014,12 @@ fn storage_migrate_commit_command(
     package: &Path,
     state_dir: &Path,
     rollback_output: &Path,
+    receipt_output: &Path,
     json: bool,
 ) -> Result<()> {
+    if rollback_output == receipt_output {
+        bail!("rollback and receipt outputs must use different paths");
+    }
     let archive = CartridgeArchive::open(package)
         .with_context(|| format!("could not inspect {}", package.display()))?;
     let cartridge_id = archive.manifest.cartridge.id.clone();
@@ -966,7 +1037,36 @@ fn storage_migrate_commit_command(
         })?;
 
     let report = Runtime::new()?.migrate(archive, source.snapshot().clone())?;
+    if report.plan.steps.is_empty() {
+        bail!(
+            "durable state already uses schema {}; no migration commit is needed",
+            report.plan.target_schema
+        );
+    }
     let summary = report.snapshot.summary()?;
+    let source_summary = source.snapshot().summary()?;
+    let target_generation = source
+        .generation()
+        .checked_add(1)
+        .context("durable generation overflowed")?;
+    let receipt = MigrationReceipt::new(MigrationReceiptPayload {
+        format_version: 0,
+        cartridge_id: cartridge_id.clone(),
+        package_version: report.plan.cartridge_version.clone(),
+        component_sha256: report.plan.component_sha256.to_ascii_lowercase(),
+        source_generation: source.generation(),
+        target_generation,
+        source_schema: report.plan.source_schema,
+        target_schema: report.plan.target_schema,
+        source_snapshot_sha256: source_summary.payload_sha256,
+        target_snapshot_sha256: summary.payload_sha256.clone(),
+    })?;
+    receipt.write_new(receipt_output).with_context(|| {
+        format!(
+            "could not create migration receipt {}",
+            receipt_output.display()
+        )
+    })?;
     let commit = storage.restore_if_unchanged(&cartridge_id, &source, &report.snapshot, limits)?;
 
     if json {
@@ -978,6 +1078,7 @@ fn storage_migrate_commit_command(
                 "result": summary,
                 "commit": commit,
                 "rollback": rollback_output.display().to_string(),
+                "receipt": receipt_output.display().to_string(),
             }))?
         );
     } else {
@@ -1002,8 +1103,140 @@ fn storage_migrate_commit_command(
             summary.entries, summary.bytes
         );
         println!("rollback: {}", rollback_output.display());
+        println!("receipt: {}", receipt_output.display());
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationRecoveryStatus {
+    NotCommitted,
+    Committed,
+    CommittedThenChanged,
+    Indeterminate,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MigrationRecoveryReport {
+    cartridge_id: String,
+    receipt_sha256: String,
+    status: MigrationRecoveryStatus,
+    source_generation: u64,
+    target_generation: u64,
+    observed_generation: u64,
+    observed_schema: u32,
+    observed_snapshot_sha256: String,
+    target_generation_retained: bool,
+}
+
+fn storage_migration_receipt_command(path: &Path, json: bool) -> Result<()> {
+    let receipt = MigrationReceipt::read(path)?;
+    let payload = receipt.payload();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!("{} {}", payload.cartridge_id, payload.package_version);
+        println!("receipt format: {}", payload.format_version);
+        println!(
+            "state schema: {} -> {}",
+            payload.source_schema, payload.target_schema
+        );
+        println!(
+            "durable generation: {} -> {}",
+            payload.source_generation, payload.target_generation
+        );
+        println!("component sha256: {}", payload.component_sha256);
+        println!("source snapshot sha256: {}", payload.source_snapshot_sha256);
+        println!("target snapshot sha256: {}", payload.target_snapshot_sha256);
+        println!("receipt sha256: {}", receipt.payload_sha256());
+    }
+    Ok(())
+}
+
+fn storage_migration_recover_command(
+    package: &Path,
+    receipt_path: &Path,
+    state_dir: &Path,
+    json: bool,
+) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let receipt = MigrationReceipt::read(receipt_path)?;
+    let payload = receipt.payload();
+    if payload.cartridge_id != archive.manifest.cartridge.id
+        || payload.package_version != archive.manifest.cartridge.version
+        || !payload
+            .component_sha256
+            .eq_ignore_ascii_case(&archive.manifest.integrity.component_sha256)
+        || payload.target_schema != archive.manifest.state.schema
+    {
+        bail!("migration receipt does not belong to this exact package");
+    }
+
+    let storage = DirectoryStorage::open(state_dir)?;
+    let evidence = storage.evidence(&payload.cartridge_id, payload.target_generation)?;
+    let current = evidence.current();
+    let current_summary = current.snapshot().summary()?;
+    let target_matches = evidence.requested().is_some_and(|captured| {
+        captured.generation() == payload.target_generation
+            && captured.snapshot().state_schema() == payload.target_schema
+            && captured
+                .snapshot()
+                .summary()
+                .is_ok_and(|summary| summary.payload_sha256 == payload.target_snapshot_sha256)
+    });
+    let source_matches = current.generation() == payload.source_generation
+        && current_summary.state_schema == payload.source_schema
+        && current_summary.payload_sha256 == payload.source_snapshot_sha256;
+    let status = if target_matches && current.generation() == payload.target_generation {
+        MigrationRecoveryStatus::Committed
+    } else if target_matches {
+        MigrationRecoveryStatus::CommittedThenChanged
+    } else if evidence.requested().is_some() || source_matches {
+        MigrationRecoveryStatus::NotCommitted
+    } else {
+        MigrationRecoveryStatus::Indeterminate
+    };
+    let report = MigrationRecoveryReport {
+        cartridge_id: payload.cartridge_id.clone(),
+        receipt_sha256: receipt.payload_sha256().to_owned(),
+        status,
+        source_generation: payload.source_generation,
+        target_generation: payload.target_generation,
+        observed_generation: current.generation(),
+        observed_schema: current_summary.state_schema,
+        observed_snapshot_sha256: current_summary.payload_sha256,
+        target_generation_retained: evidence.requested().is_some(),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.cartridge_id);
+        println!("recovery status: {}", recovery_status_name(report.status));
+        println!(
+            "receipt generation: {} -> {}",
+            report.source_generation, report.target_generation
+        );
+        println!("observed generation: {}", report.observed_generation);
+        println!("observed schema: {}", report.observed_schema);
+        println!(
+            "target generation retained: {}",
+            report.target_generation_retained
+        );
+        println!("receipt sha256: {}", report.receipt_sha256);
+    }
+    Ok(())
+}
+
+const fn recovery_status_name(status: MigrationRecoveryStatus) -> &'static str {
+    match status {
+        MigrationRecoveryStatus::NotCommitted => "not committed",
+        MigrationRecoveryStatus::Committed => "committed",
+        MigrationRecoveryStatus::CommittedThenChanged => "committed, then changed",
+        MigrationRecoveryStatus::Indeterminate => "indeterminate",
+    }
 }
 
 fn storage_limits(manifest: &cartridge_core::PackageManifest) -> StorageLimits {

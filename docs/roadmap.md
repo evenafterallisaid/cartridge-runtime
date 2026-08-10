@@ -133,9 +133,10 @@ Delivery slices:
 5. Manifest state schemas and deterministic migration-plan validation.
 6. Migration execution against a snapshot branch before committing changes.
 7. Automatic rollback capture, race-safe durable migration commit, and failure-preserving CLI supervision.
-8. Content-addressed blobs, garbage collection, and references from key/value records.
+8. Pre-commit migration receipts and evidence-based recovery after supervisor or host interruption.
+9. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first seven slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost.
+The first eight slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
 
 Migration design constraints:
 
@@ -147,6 +148,7 @@ Migration design constraints:
 - the transformed snapshot must pass integrity and quota validation
 - committing a migration writes exactly one durable generation
 - failed or trapped migrations leave the previous generation active
+- interrupted commits are classified from immutable generation evidence rather than guessed
 - downgrade support is explicit rather than inferred
 - migration compatibility is tested on snapshots from every released schema
 
@@ -160,6 +162,9 @@ These directions fit the existing architecture, but their order follows the matu
 - **Reactive state watch streams.** Allow a cartridge to subscribe to changes it has authority to observe, with coalescing, bounded queues, and trace events. This belongs after async host calls and composition supervision so a slow consumer cannot stall storage commits.
 - **Streaming content-addressed blobs.** Store large values as deduplicated chunks addressed by digest, keep small references in key/value state, and trace digests rather than payloads. The guest API should use component-model streams instead of buffering complete objects into linear memory.
 - **State-and-trace capsules.** Bind a source snapshot, execution trace, package digest, and result snapshot into one inspectable crash or test artifact. Snapshot branches make the first version possible without memory checkpointing.
+- **Determinism certificates.** Run the same capsule repeatedly across runtime versions or operating systems and emit a compact attestation over matching output, trace, fuel class, and result-state digest. This turns portability claims into reproducible evidence without pretending the certificate is a developer signature.
+- **Crash-consistent activation journals.** Generalize migration receipts into prepare/commit evidence for package upgrades and composition-graph changes. New providers and state should become visible together, while restart recovery proves which graph was activated.
+- **Capability leases.** Let a supervisor grant a bounded capability token with an expiry, call budget, and trace identity instead of permanently expanding a cartridge's authority. This is useful for one-shot file imports, user-mediated secrets, and temporary network access.
 - **Parallel scenario matrices.** Fan out many runs from one immutable snapshot, then compare outputs, traces, fuel, and state diffs. This can become `cartridge test --matrix` once branch execution and a test manifest exist.
 - **Portable interpreter fallback.** Investigate a Pulley backend for architectures where native code generation is unavailable or undesirable. It should complement, not replace, Wasmtime's compiled path and needs independent performance and sandbox measurements.
 - **Async component services.** Adopt Component Model Preview 3 futures, streams, cancellation, and backpressure when the toolchain stabilizes. This unlocks long-lived cartridge services, blob streaming, watches, networking, and composition without inventing a private async ABI.
@@ -172,6 +177,7 @@ Exit criteria:
 - interrupted writes preserve the previous valid state
 - a state snapshot can move between Windows and macOS
 - migrations are testable before data is modified
+- an interrupted migration can be classified without retrying guest code
 
 ### 0.4 — windows, drawing, and input
 
@@ -751,13 +757,17 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Add durable migration receipts and a recovery command that can prove whether an interrupted commit landed.
-2. Bind branch runs to trace and state digests for reproducible test capsules.
-3. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches.
-4. Add content-addressed blobs, streaming access, and snapshot references for larger state.
-5. Add package-wide Merkle-style asset integrity.
-6. Create a minimal 2D window and input prototype behind new WIT packages.
-7. Build a small trace viewer after there is enough real trace data to design around.
+1. Build reproducible state-and-trace capsules:
+   - bind package/component identity, arguments, source snapshot, trace, result snapshot, and runtime version in one canonical manifest
+   - add create, inspect, verify, and first-divergence commands without embedding private state values by default
+   - replay a capsule on another supported platform and compare output, ordered events, and result-state digest
+   - minimize failing capsules while preserving the first divergence
+2. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
+3. Add content-addressed blobs, streaming access, reachability-based garbage collection, and snapshot references for larger state.
+4. Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
+5. Create a minimal 2D window and input prototype behind new WIT packages.
+6. Build a small trace and capsule viewer after there is enough real trace data to design around.
+7. Prototype crash-consistent composition activation only after package signing establishes trustworthy principals.
 
 Completed foundations:
 
@@ -771,6 +781,7 @@ Completed foundations:
 - state schemas persisted across memory, durable generations, and portable snapshots
 - validated manifest migration graphs and identity-bound ordered plans
 - isolated multi-step migration rehearsals with intermediate schema and quota validation
+- checksummed pre-commit migration receipts with committed, not-committed, changed, and indeterminate recovery states
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals
@@ -782,6 +793,6 @@ Security work immediately ahead:
 1. Bind package identity to developer signatures before treating cartridge ids as storage principals.
 2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
 3. Add trace redaction profiles and encrypted support bundles.
-4. Add archive, manifest, snapshot, and trace fuzz targets seeded with the security regression corpus.
+4. Add archive, manifest, snapshot, receipt, and trace fuzz targets seeded with the security regression corpus.
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

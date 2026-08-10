@@ -80,8 +80,12 @@ jobs:
           cargo run -p cartridge-cli -- storage inspect migrated.cartridge-state.json
           cargo run -p cartridge-cli -- run migration.cartridge --from-snapshot migrated.cartridge-state.json
           cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir migration-state
-          cargo run -p cartridge-cli -- storage migrate-commit migration.cartridge --state-dir migration-state --rollback-output rollback.cartridge-state.json
+          cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir uncommitted-migration-state
+          cargo run -p cartridge-cli -- storage migrate-commit migration.cartridge --state-dir migration-state --rollback-output rollback.cartridge-state.json --receipt-output migration-receipt.json
           cargo run -p cartridge-cli -- storage inspect rollback.cartridge-state.json
+          cargo run -p cartridge-cli -- storage migration-receipt migration-receipt.json
+          cargo run -p cartridge-cli -- storage migration-recover migration.cartridge migration-receipt.json --state-dir migration-state --json | grep '"status": "committed"'
+          cargo run -p cartridge-cli -- storage migration-recover migration.cartridge migration-receipt.json --state-dir uncommitted-migration-state --json | grep '"status": "not_committed"'
           cargo run -p cartridge-cli -- run migration.cartridge --state-dir migration-state
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/missing-export.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output missing-migration-export.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
@@ -105,11 +109,11 @@ jobs:
           fi
           cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/failing.cartridge-state.json --state-dir failed-migration-state
           set +e
-          "$binary" storage migrate-commit migration.cartridge --state-dir failed-migration-state --rollback-output failed-rollback.cartridge-state.json
+          "$binary" storage migrate-commit migration.cartridge --state-dir failed-migration-state --rollback-output failed-rollback.cartridge-state.json --receipt-output failed-migration-receipt.json
           migration_commit_status=$?
           set -e
-          if [ "$migration_commit_status" -eq 0 ] || [ ! -e failed-rollback.cartridge-state.json ]; then
-            echo "failed durable migration did not preserve its rollback snapshot"
+          if [ "$migration_commit_status" -eq 0 ] || [ ! -e failed-rollback.cartridge-state.json ] || [ -e failed-migration-receipt.json ]; then
+            echo "failed durable migration produced incorrect recovery artifacts"
             exit 1
           fi
           "$binary" storage status legacy-migration.cartridge --state-dir failed-migration-state --json | grep '"state_schema": 0'

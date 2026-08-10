@@ -212,6 +212,7 @@ impl StorageSnapshot {
             return Err(Error::Io(error));
         }
         fs::remove_file(temporary)?;
+        sync_directory(directory)?;
         Ok(())
     }
 
@@ -439,6 +440,18 @@ fn open_private_new(path: &Path) -> std::io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(directory: &Path) -> Result<()> {
+    let _ = fs::metadata(directory)?;
+    Ok(())
 }
 
 #[cfg(test)]

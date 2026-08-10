@@ -97,10 +97,31 @@ impl DirectoryStorage {
     pub fn capture(&self, namespace: &str) -> Result<CapturedState> {
         self.with_namespace(namespace, |directory| {
             let state = load_state(directory, namespace)?;
-            Ok(CapturedState {
-                generation: state.generation,
-                snapshot: StorageSnapshot::from_entries(namespace, state.schema, &state.entries)?,
-            })
+            capture_state(namespace, &state)
+        })
+    }
+
+    pub fn evidence(
+        &self,
+        namespace: &str,
+        requested_generation: u64,
+    ) -> Result<GenerationEvidence> {
+        self.with_namespace(namespace, |directory| {
+            let current_state = load_state(directory, namespace)?;
+            let current = capture_state(namespace, &current_state)?;
+            let requested = if requested_generation == current_state.generation {
+                Some(current.clone())
+            } else {
+                state_files(directory)?
+                    .into_iter()
+                    .find(|(generation, _)| *generation == requested_generation)
+                    .map(|(generation, path)| {
+                        let state = read_state(&path, namespace, generation)?;
+                        capture_state(namespace, &state)
+                    })
+                    .transpose()?
+            };
+            Ok(GenerationEvidence { current, requested })
         })
     }
 
@@ -248,6 +269,31 @@ impl CapturedState {
     pub fn snapshot(&self) -> &StorageSnapshot {
         &self.snapshot
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct GenerationEvidence {
+    current: CapturedState,
+    requested: Option<CapturedState>,
+}
+
+impl GenerationEvidence {
+    #[must_use]
+    pub fn current(&self) -> &CapturedState {
+        &self.current
+    }
+
+    #[must_use]
+    pub fn requested(&self) -> Option<&CapturedState> {
+        self.requested.as_ref()
+    }
+}
+
+fn capture_state(namespace: &str, state: &State) -> Result<CapturedState> {
+    Ok(CapturedState {
+        generation: state.generation,
+        snapshot: StorageSnapshot::from_entries(namespace, state.schema, &state.entries)?,
+    })
 }
 
 fn reject_symlink(path: &Path) -> Result<()> {
@@ -1054,6 +1100,54 @@ mod tests {
         );
         let namespace = storage.namespace_directory("dev.example.test");
         assert_eq!(state_files(&namespace).unwrap().last().unwrap().0, 2);
+    }
+
+    #[test]
+    fn generation_evidence_reads_retained_commits_under_one_lock() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage
+            .put("dev.example.test", "value", b"source", LIMITS)
+            .unwrap();
+        let expected = storage.capture("dev.example.test").unwrap();
+        let branch =
+            SnapshotStorage::from_snapshot(expected.snapshot(), "dev.example.test", LIMITS)
+                .unwrap();
+        branch
+            .put("dev.example.test", "value", b"migrated", LIMITS)
+            .unwrap();
+        let replacement = branch.export_migrated_snapshot(0, 1, LIMITS).unwrap();
+        storage
+            .restore_if_unchanged("dev.example.test", &expected, &replacement, LIMITS)
+            .unwrap();
+        storage
+            .put("dev.example.test", "later", b"change", LIMITS)
+            .unwrap();
+
+        let evidence = storage.evidence("dev.example.test", 2).unwrap();
+
+        assert_eq!(evidence.current().generation(), 3);
+        assert_eq!(evidence.requested().unwrap().generation(), 2);
+        assert!(
+            evidence
+                .requested()
+                .unwrap()
+                .snapshot()
+                .compare(&replacement)
+                .unwrap()
+                .identical
+        );
+
+        storage
+            .put("dev.example.test", "newest", b"change", LIMITS)
+            .unwrap();
+        assert!(
+            storage
+                .evidence("dev.example.test", 2)
+                .unwrap()
+                .requested()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

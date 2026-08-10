@@ -61,10 +61,21 @@ This command deliberately does not touch durable state. To migrate a live namesp
 
 ```sh
 cartridge storage migrate-commit app.cartridge --state-dir ./state \
-  --rollback-output before-migration.cartridge-state.json
+  --rollback-output before-migration.cartridge-state.json \
+  --receipt-output migration-receipt.json
 ```
 
-The worker captures the rollback snapshot before it invokes guest code. It migrates private branches exactly like a rehearsal, then takes the namespace lock and commits only if durable schema and entries still match the captured source. A concurrent write makes the command fail without overwriting either version. A successful transformation is written as exactly one new durable generation. The rollback output uses create-new semantics and is never silently replaced.
+The worker captures the rollback snapshot before it invokes guest code. It migrates private branches exactly like a rehearsal, writes and flushes an immutable migration receipt, then takes the namespace lock and commits only if the durable generation, schema, and entries still match the captured source. A concurrent write makes the command fail without overwriting either version. A successful transformation is written as exactly one new durable generation. Rollback and receipt outputs use create-new semantics and are never silently replaced.
+
+Inspect the receipt or compare it with durable state after an interrupted command:
+
+```sh
+cartridge storage migration-receipt migration-receipt.json
+cartridge storage migration-recover app.cartridge migration-receipt.json \
+  --state-dir ./state
+```
+
+Recovery reports `committed`, `not_committed`, `committed_then_changed`, or `indeterminate`. The receipt names the only generation and snapshot digest that the conditional commit could create. If that generation is current or still retained in the journal, recovery can prove the commit landed even if the worker never printed success. If the source is still current or the target generation contains different state, it can prove the commit did not land. Once later commits have pruned both pieces of evidence, it reports `indeterminate` instead of guessing.
 
 If recovery is needed, use the package version whose manifest expects the rollback snapshot's schema:
 
@@ -75,4 +86,4 @@ cartridge storage restore old-app.cartridge before-migration.cartridge-state.jso
   --state-dir ./state
 ```
 
-The rollback file remains useful even when migration traps or times out because durable state is untouched in those cases. A crash after the atomic commit but before the worker reports success is intentionally treated as an indeterminate result: inspect durable schema and the rollback file before retrying. A future commit receipt will make that recovery decision mechanical.
+The rollback file remains useful even when migration traps or times out because durable state is untouched in those cases. Guest failures happen before receipt creation. A receipt is written only after the complete isolated transformation succeeds and before the atomic commit begins, so its presence covers the otherwise ambiguous crash window. Receipt digests detect accidental modification, but they are not signatures and do not establish who created the artifact.

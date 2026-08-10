@@ -55,7 +55,10 @@ cartridge storage migration-plan app.cartridge --from-schema 0
 cartridge storage migrate app.cartridge old.cartridge-state.json \
   --output migrated.cartridge-state.json
 cartridge storage migrate-commit app.cartridge --state-dir ./state \
-  --rollback-output rollback.cartridge-state.json
+  --rollback-output rollback.cartridge-state.json \
+  --receipt-output migration-receipt.json
+cartridge storage migration-recover app.cartridge migration-receipt.json \
+  --state-dir ./state
 cartridge run app.cartridge --from-snapshot backup.cartridge-state.json \
   --snapshot-output branch.cartridge-state.json -- experiment
 cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
@@ -67,4 +70,6 @@ The internal generation files are a recovery mechanism, not the portable snapsho
 
 Dry-run restore performs the same validation and reports added, replaced, removed, and unchanged key counts without changing state. Migration rehearsal executes every declared step against a fresh snapshot branch, validates the intermediate schema and quotas, and writes a new portable snapshot only after the complete plan succeeds. It never opens the durable backend.
 
-`storage migrate-commit` exports the live generation to a new rollback file before guest migration code runs, executes every step in an isolated worker, then conditionally replaces durable state in one generation. The final lock-protected commit compares the durable generation token, schema, and entries with the captured source. If another process commits while migration is running, the migration fails even if that process later restores byte-identical state; this closes the usual compare-and-swap ABA race. Traps, quota failures, worker deadlines, and stale-source failures all leave durable state unmodified; once created, the rollback snapshot is retained for inspection or recovery.
+`storage migrate-commit` exports the live generation to a new rollback file before guest migration code runs, executes every step in an isolated worker, writes a checksummed intent receipt, then conditionally replaces durable state in one generation. The final lock-protected commit compares the durable generation token, schema, and entries with the captured source. If another process commits while migration is running, the migration fails even if that process later restores byte-identical state; this closes the usual compare-and-swap ABA race. Traps, quota failures, worker deadlines, and stale-source failures all leave durable state unmodified; once created, recovery artifacts are retained for inspection.
+
+The receipt binds the exact package component, source and target schemas, adjacent durable generations, and both snapshot digests. `storage migration-recover` checks current state and the retained target generation under one namespace lock. It can prove a commit landed after the worker was interrupted, prove that another commit won the generation race, or decline to guess once journal pruning removed the needed evidence. See the [receipt format](migration-receipt-format.md).

@@ -10,7 +10,9 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 
-pub use directory::{CapturedState, DirectoryStorage, RecoveryReport, RestorePlan};
+pub use directory::{
+    CapturedState, DirectoryStorage, GenerationEvidence, RecoveryReport, RestorePlan,
+};
 pub use snapshot::{
     SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageSnapshot,
     StorageSnapshotSummary,
