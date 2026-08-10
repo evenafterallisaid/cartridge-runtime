@@ -118,6 +118,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(name = "__worker-migrate-commit", hide = true)]
+    WorkerMigrateCommit {
+        package: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        rollback_output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// inspect and compare execution traces
     Trace {
         #[command(subcommand)]
@@ -214,6 +224,16 @@ enum StorageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// migrate durable state with an automatic rollback snapshot
+    MigrateCommit {
+        package: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        rollback_output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -297,6 +317,15 @@ fn run_cli() -> Result<()> {
             require_worker_context()?;
             storage_migrate_command(&package, &snapshot, &output, json)
         }
+        Command::WorkerMigrateCommit {
+            package,
+            state_dir,
+            rollback_output,
+            json,
+        } => {
+            require_worker_context()?;
+            storage_migrate_commit_command(&package, &state_dir, &rollback_output, json)
+        }
         Command::Trace { command } => match command {
             TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
             TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
@@ -342,6 +371,12 @@ fn run_storage_command(command: StorageCommand) -> Result<()> {
             output,
             json,
         } => supervised_migrate_command(&package, &snapshot, &output, json),
+        StorageCommand::MigrateCommit {
+            package,
+            state_dir,
+            rollback_output,
+            json,
+        } => supervised_migrate_commit_command(&package, &state_dir, &rollback_output, json),
     }
 }
 
@@ -385,6 +420,60 @@ fn supervised_migrate_command(
         .with_context(|| format!("could not validate {} before migration", package.display()))?;
     let source = StorageSnapshot::read(snapshot)
         .with_context(|| format!("could not validate {} before migration", snapshot.display()))?;
+    let budget_ms = migration_budget_ms(&archive, &source)?;
+    drop(source);
+    drop(archive);
+    let mut worker_args = vec![
+        OsString::from("__worker-migrate"),
+        package.as_os_str().to_owned(),
+        snapshot.as_os_str().to_owned(),
+        OsString::from("--output"),
+        output.as_os_str().to_owned(),
+    ];
+    if json {
+        worker_args.push(OsString::from("--json"));
+    }
+    supervise_worker(
+        package,
+        &worker_args,
+        Some(Duration::from_millis(budget_ms)),
+    )
+}
+
+fn supervised_migrate_commit_command(
+    package: &Path,
+    state_dir: &Path,
+    rollback_output: &Path,
+    json: bool,
+) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not validate {} before migration", package.display()))?;
+    let storage = DirectoryStorage::open(state_dir)?;
+    let source = storage.export_snapshot(&archive.manifest.cartridge.id)?;
+    let budget_ms = migration_budget_ms(&archive, &source)?;
+    drop(source);
+    drop(storage);
+    drop(archive);
+
+    let mut worker_args = vec![
+        OsString::from("__worker-migrate-commit"),
+        package.as_os_str().to_owned(),
+        OsString::from("--state-dir"),
+        state_dir.as_os_str().to_owned(),
+        OsString::from("--rollback-output"),
+        rollback_output.as_os_str().to_owned(),
+    ];
+    if json {
+        worker_args.push(OsString::from("--json"));
+    }
+    supervise_worker(
+        package,
+        &worker_args,
+        Some(Duration::from_millis(budget_ms)),
+    )
+}
+
+fn migration_budget_ms(archive: &CartridgeArchive, source: &StorageSnapshot) -> Result<u64> {
     if source.cartridge_id() != archive.manifest.cartridge.id {
         bail!(
             "snapshot belongs to {}; package belongs to {}",
@@ -411,24 +500,7 @@ fn supervised_migrate_command(
             "migration timeout budget is {budget_ms} ms; maximum is {MAX_MIGRATION_TOTAL_TIMEOUT_MS} ms"
         );
     }
-    drop(plan);
-    drop(source);
-    drop(archive);
-    let mut worker_args = vec![
-        OsString::from("__worker-migrate"),
-        package.as_os_str().to_owned(),
-        snapshot.as_os_str().to_owned(),
-        OsString::from("--output"),
-        output.as_os_str().to_owned(),
-    ];
-    if json {
-        worker_args.push(OsString::from("--json"));
-    }
-    supervise_worker(
-        package,
-        &worker_args,
-        Some(Duration::from_millis(budget_ms)),
-    )
+    Ok(budget_ms)
 }
 
 fn push_path_option(arguments: &mut Vec<OsString>, name: &str, value: Option<&Path>) {
@@ -867,6 +939,69 @@ fn storage_migrate_command(package: &Path, source: &Path, output: &Path, json: b
             summary.entries, summary.bytes
         );
         println!("snapshot: {}", output.display());
+    }
+    Ok(())
+}
+
+fn storage_migrate_commit_command(
+    package: &Path,
+    state_dir: &Path,
+    rollback_output: &Path,
+    json: bool,
+) -> Result<()> {
+    let archive = CartridgeArchive::open(package)
+        .with_context(|| format!("could not inspect {}", package.display()))?;
+    let cartridge_id = archive.manifest.cartridge.id.clone();
+    let limits = storage_limits(&archive.manifest);
+    let storage = DirectoryStorage::open(state_dir)?;
+    let source = storage.capture(&cartridge_id)?;
+    source
+        .snapshot()
+        .write_new(rollback_output)
+        .with_context(|| {
+            format!(
+                "could not create rollback snapshot {}",
+                rollback_output.display()
+            )
+        })?;
+
+    let report = Runtime::new()?.migrate(archive, source.snapshot().clone())?;
+    let summary = report.snapshot.summary()?;
+    let commit = storage.restore_if_unchanged(&cartridge_id, &source, &report.snapshot, limits)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": report.plan,
+                "steps": report.steps,
+                "result": summary,
+                "commit": commit,
+                "rollback": rollback_output.display().to_string(),
+            }))?
+        );
+    } else {
+        println!("migrated and committed {cartridge_id}");
+        println!(
+            "state schema: {} -> {}",
+            report.plan.source_schema, report.plan.target_schema
+        );
+        if report.steps.is_empty() {
+            println!("migrations: none");
+        } else {
+            println!("migrations:");
+            for step in report.steps {
+                println!(
+                    "  {}: {} -> {} ({} fuel, {} event(s))",
+                    step.name, step.from, step.to, step.fuel_consumed, step.event_count
+                );
+            }
+        }
+        println!(
+            "committed: {} key(s), {} bytes",
+            summary.entries, summary.bytes
+        );
+        println!("rollback: {}", rollback_output.display());
     }
     Ok(())
 }

@@ -1,0 +1,21 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.migration-fixture"
+name = "Migration Fixture Legacy"
+version = "0.0.1"
+description = "schema zero fixture used to seed durable migration tests"
+
+[permissions]
+storage = true
+
+[runtime]
+fuel = 10000000
+memory_bytes = 67108864
+storage_bytes = 4096
+storage_keys = 16
+storage_value_bytes = 256
+timeout_ms = 1000
+
+[state]
+schema = 0

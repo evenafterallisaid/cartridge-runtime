@@ -5,9 +5,9 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
 pub use cartridge_storage::{
-    DirectoryStorage, MemoryStorage, RecoveryReport, RestorePlan, SnapshotComparison,
-    SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend, StorageLimits,
-    StorageSnapshot, StorageSnapshotSummary, StorageUsage,
+    CapturedState, DirectoryStorage, MemoryStorage, RecoveryReport, RestorePlan,
+    SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend,
+    StorageLimits, StorageSnapshot, StorageSnapshotSummary, StorageUsage,
 };
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, MAX_TRACE_BYTES, MAX_TRACE_DOCUMENT_BYTES,

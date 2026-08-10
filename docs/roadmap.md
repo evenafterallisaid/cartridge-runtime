@@ -132,9 +132,10 @@ Delivery slices:
 4. Isolated snapshot branches for speculative execution and migration rehearsals.
 5. Manifest state schemas and deterministic migration-plan validation.
 6. Migration execution against a snapshot branch before committing changes.
-7. Content-addressed blobs, garbage collection, and references from key/value records.
+7. Automatic rollback capture, race-safe durable migration commit, and failure-preserving CLI supervision.
+8. Content-addressed blobs, garbage collection, and references from key/value records.
 
-The first six slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI executes those plans step by step against fresh isolated branches without touching durable state. The next slice adds automatic rollback capture and an explicit one-generation commit.
+The first seven slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost.
 
 Migration design constraints:
 
@@ -750,9 +751,9 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Add automatic rollback snapshots and explicit migration commit/recovery commands.
+1. Add durable migration receipts and a recovery command that can prove whether an interrupted commit landed.
 2. Bind branch runs to trace and state digests for reproducible test capsules.
-3. Add compare-and-swap and bounded atomic batch operations.
+3. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches.
 4. Add content-addressed blobs, streaming access, and snapshot references for larger state.
 5. Add package-wide Merkle-style asset integrity.
 6. Create a minimal 2D window and input prototype behind new WIT packages.

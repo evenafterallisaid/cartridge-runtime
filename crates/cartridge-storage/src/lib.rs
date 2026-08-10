@@ -10,7 +10,7 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 
-pub use directory::{DirectoryStorage, RecoveryReport, RestorePlan};
+pub use directory::{CapturedState, DirectoryStorage, RecoveryReport, RestorePlan};
 pub use snapshot::{
     SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageSnapshot,
     StorageSnapshotSummary,
@@ -231,6 +231,8 @@ pub enum Error {
     SnapshotIdentity { expected: String, actual: String },
     #[error("state uses schema {actual}; expected schema {expected}")]
     SchemaMismatch { expected: u32, actual: u32 },
+    #[error("durable state changed after the source snapshot was captured")]
+    StateChanged,
     #[error("storage lock was not available within {milliseconds} ms")]
     LockTimeout { milliseconds: u64 },
     #[error("storage path is not a private directory or regular file: {0}")]

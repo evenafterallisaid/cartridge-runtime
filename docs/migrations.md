@@ -57,4 +57,22 @@ Every step starts with a fresh in-memory branch made from the preceding validate
 
 Migration execution uses the package's normal capability policy and storage quota. Each step receives its own fuel and wall-time budget. A plan is limited to 64 executed steps and ten minutes of declared aggregate wall time, and the CLI runs the entire rehearsal in a killable helper process with a separate parent deadline.
 
-This command deliberately does not touch durable state. Automatic rollback capture and a one-generation migration commit are the next storage slice; until then, operators inspect the resulting snapshot and use the existing explicit restore command.
+This command deliberately does not touch durable state. To migrate a live namespace and commit the result explicitly:
+
+```sh
+cartridge storage migrate-commit app.cartridge --state-dir ./state \
+  --rollback-output before-migration.cartridge-state.json
+```
+
+The worker captures the rollback snapshot before it invokes guest code. It migrates private branches exactly like a rehearsal, then takes the namespace lock and commits only if durable schema and entries still match the captured source. A concurrent write makes the command fail without overwriting either version. A successful transformation is written as exactly one new durable generation. The rollback output uses create-new semantics and is never silently replaced.
+
+If recovery is needed, use the package version whose manifest expects the rollback snapshot's schema:
+
+```sh
+cartridge storage restore old-app.cartridge before-migration.cartridge-state.json \
+  --state-dir ./state --dry-run
+cartridge storage restore old-app.cartridge before-migration.cartridge-state.json \
+  --state-dir ./state
+```
+
+The rollback file remains useful even when migration traps or times out because durable state is untouched in those cases. A crash after the atomic commit but before the worker reports success is intentionally treated as an indeterminate result: inspect durable schema and the rollback file before retrying. A future commit receipt will make that recovery decision mechanical.

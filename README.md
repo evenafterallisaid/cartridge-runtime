@@ -19,6 +19,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Portable storage snapshots with inspection, diffing, dry runs, and transactional restore
 - Isolated snapshot branches for speculative runs, migration testing, and debugging
 - Manifest-declared state schemas with deterministic planning and isolated migration rehearsals
+- Durable migration commits with automatic rollback capture and concurrent-write detection
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -56,6 +57,7 @@ cargo run -p cartridge-cli -- storage export dist/hello.cartridge --state-dir di
 cargo run -p cartridge-cli -- storage inspect backup.cartridge-state.json
 cargo run -p cartridge-cli -- storage migration-plan dist/hello.cartridge --from-schema 0
 cargo run -p cartridge-cli -- storage migrate app.cartridge old.cartridge-state.json --output migrated.cartridge-state.json
+cargo run -p cartridge-cli -- storage migrate-commit app.cartridge --state-dir dist/state --rollback-output rollback.cartridge-state.json
 cargo run -p cartridge-cli -- run dist/hello.cartridge --from-snapshot backup.cartridge-state.json --snapshot-output branch.cartridge-state.json -- Test
 cargo run -p cartridge-cli -- storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
 cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json

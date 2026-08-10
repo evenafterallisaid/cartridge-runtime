@@ -91,9 +91,16 @@ impl DirectoryStorage {
     }
 
     pub fn export_snapshot(&self, namespace: &str) -> Result<StorageSnapshot> {
+        Ok(self.capture(namespace)?.snapshot)
+    }
+
+    pub fn capture(&self, namespace: &str) -> Result<CapturedState> {
         self.with_namespace(namespace, |directory| {
             let state = load_state(directory, namespace)?;
-            StorageSnapshot::from_entries(namespace, state.schema, &state.entries)
+            Ok(CapturedState {
+                generation: state.generation,
+                snapshot: StorageSnapshot::from_entries(namespace, state.schema, &state.entries)?,
+            })
         })
     }
 
@@ -149,6 +156,47 @@ impl DirectoryStorage {
         })
     }
 
+    pub fn restore_if_unchanged(
+        &self,
+        namespace: &str,
+        expected: &CapturedState,
+        replacement: &StorageSnapshot,
+        limits: StorageLimits,
+    ) -> Result<RestorePlan> {
+        let expected_entries = expected.snapshot.entries_for(namespace)?;
+        let replacement_entries = replacement.entries_for(namespace)?;
+        validate_restore_limits(&replacement_entries, limits)?;
+        self.with_namespace(namespace, |directory| {
+            cleanup_pending(directory)?;
+            let current = load_state(directory, namespace)?;
+            if current.generation != expected.generation
+                || current.schema != expected.snapshot.state_schema()
+                || current.entries != expected_entries
+            {
+                return Err(Error::StateChanged);
+            }
+            let plan = build_restore_plan(
+                current.schema,
+                &current.entries,
+                replacement.state_schema(),
+                &replacement_entries,
+            )?;
+            if plan.changed() {
+                commit_state(
+                    directory,
+                    namespace,
+                    State {
+                        generation: current.generation,
+                        schema: replacement.state_schema(),
+                        usage: plan.snapshot,
+                        entries: replacement_entries,
+                    },
+                )?;
+            }
+            Ok(plan)
+        })
+    }
+
     fn with_namespace<T>(
         &self,
         namespace: &str,
@@ -181,6 +229,24 @@ impl DirectoryStorage {
     fn namespace_directory(&self, namespace: &str) -> PathBuf {
         self.root
             .join(hex::encode(Sha256::digest(namespace.as_bytes())))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturedState {
+    generation: u64,
+    snapshot: StorageSnapshot,
+}
+
+impl CapturedState {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &StorageSnapshot {
+        &self.snapshot
     }
 }
 
@@ -672,6 +738,8 @@ fn sync_directory(directory: &Path) -> Result<()> {
 mod tests {
     use std::{sync::Arc, thread};
 
+    use crate::SnapshotStorage;
+
     use super::*;
 
     const LIMITS: StorageLimits = StorageLimits {
@@ -907,6 +975,85 @@ mod tests {
             storage.plan_restore("dev.example.second", &snapshot, LIMITS),
             Err(Error::SnapshotIdentity { .. })
         ));
+    }
+
+    #[test]
+    fn conditional_restore_rejects_an_intervening_commit_after_an_aba_change() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage
+            .put("dev.example.test", "value", b"source", LIMITS)
+            .unwrap();
+        let expected = storage.capture("dev.example.test").unwrap();
+        let branch =
+            SnapshotStorage::from_snapshot(expected.snapshot(), "dev.example.test", LIMITS)
+                .unwrap();
+        branch
+            .put("dev.example.test", "value", b"migrated", LIMITS)
+            .unwrap();
+        let replacement = branch.export_migrated_snapshot(0, 1, LIMITS).unwrap();
+        storage
+            .put("dev.example.test", "concurrent", b"kept", LIMITS)
+            .unwrap();
+        storage
+            .restore("dev.example.test", expected.snapshot(), LIMITS)
+            .unwrap();
+        assert!(
+            storage
+                .export_snapshot("dev.example.test")
+                .unwrap()
+                .compare(expected.snapshot())
+                .unwrap()
+                .identical
+        );
+
+        assert!(matches!(
+            storage.restore_if_unchanged("dev.example.test", &expected, &replacement, LIMITS),
+            Err(Error::StateChanged)
+        ));
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"source".to_vec())
+        );
+        assert_eq!(storage.get("dev.example.test", "concurrent").unwrap(), None);
+        assert_eq!(
+            storage
+                .export_snapshot("dev.example.test")
+                .unwrap()
+                .state_schema(),
+            0
+        );
+    }
+
+    #[test]
+    fn conditional_restore_commits_the_replacement_once() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage
+            .put("dev.example.test", "value", b"source", LIMITS)
+            .unwrap();
+        let expected = storage.capture("dev.example.test").unwrap();
+        let branch =
+            SnapshotStorage::from_snapshot(expected.snapshot(), "dev.example.test", LIMITS)
+                .unwrap();
+        branch
+            .put("dev.example.test", "value", b"migrated", LIMITS)
+            .unwrap();
+        let replacement = branch.export_migrated_snapshot(0, 1, LIMITS).unwrap();
+
+        let plan = storage
+            .restore_if_unchanged("dev.example.test", &expected, &replacement, LIMITS)
+            .unwrap();
+
+        assert!(plan.changed());
+        assert_eq!(plan.current_schema, 0);
+        assert_eq!(plan.snapshot_schema, 1);
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"migrated".to_vec())
+        );
+        let namespace = storage.namespace_directory("dev.example.test");
+        assert_eq!(state_files(&namespace).unwrap().last().unwrap().0, 2);
     }
 
     #[cfg(unix)]

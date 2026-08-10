@@ -50,6 +50,8 @@ cartridge storage restore app.cartridge backup.cartridge-state.json \
 
 The runtime rejects cross-cartridge restores, snapshots whose schema differs from the package, oversized values, excessive key counts, and quota overflow before acquiring a commit. A dry run compares current and proposed state without mutation. A committed restore takes the namespace lock and writes the complete snapshot as one new durable generation, leaving the previous generation as its rollback point.
 
+Migration commits use a stricter conditional restore. The runtime captures the durable generation token and complete source snapshot, migrates an isolated branch, then compares the locked live namespace with that source immediately before writing. A generation, schema, key, or value change aborts the commit, which prevents a long migration from erasing concurrent durable writes and detects ABA changes that return to the same bytes.
+
 Export refuses to overwrite an existing output file. Snapshots may contain private application data and are not encrypted in v2; they should be protected like any other backup.
 
 ## Isolated branch execution
