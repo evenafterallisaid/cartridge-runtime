@@ -758,8 +758,9 @@ A capability is not complete when its host function works once. It is complete w
 The next concrete sequence is:
 
 1. Build reproducible state-and-trace capsules:
-   - bind package/component identity, arguments, source snapshot, trace, result snapshot, and runtime version in one canonical manifest
-   - add create, inspect, verify, and first-divergence commands without embedding private state values by default
+   - [implemented] bind package/component identity, arguments, source snapshot, trace, result snapshot, and runtime version in one canonical manifest
+   - [implemented] add bounded create, inspect, and verify commands without embedding private state values by default
+   - add capsule-to-capsule first-divergence reporting across identity, invocation, source, trace, and result state
    - replay a capsule on another supported platform and compare output, ordered events, and result-state digest
    - minimize failing capsules while preserving the first divergence
 2. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
@@ -782,6 +783,7 @@ Completed foundations:
 - validated manifest migration graphs and identity-bound ordered plans
 - isolated multi-step migration rehearsals with intermediate schema and quota validation
 - checksummed pre-commit migration receipts with committed, not-committed, changed, and indeterminate recovery states
+- portable execution capsule manifests with path confinement, raw artifact digests, and semantic cross-file verification
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals

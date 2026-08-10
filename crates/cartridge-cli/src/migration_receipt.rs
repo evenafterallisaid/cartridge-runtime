@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -49,17 +49,19 @@ impl MigrationReceipt {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("could not inspect receipt {}", path.display()))?;
-        if metadata.len() > MAX_RECEIPT_BYTES {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .with_context(|| format!("could not open receipt {}", path.display()))?
+            .take(MAX_RECEIPT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("could not read receipt {}", path.display()))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
             bail!(
                 "migration receipt {} exceeds the {} byte limit",
                 path.display(),
                 MAX_RECEIPT_BYTES
             );
         }
-        let bytes =
-            fs::read(path).with_context(|| format!("could not read receipt {}", path.display()))?;
         Self::from_slice(&bytes)
     }
 

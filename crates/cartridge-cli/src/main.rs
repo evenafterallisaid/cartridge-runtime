@@ -1,9 +1,10 @@
+mod capsule;
 mod migration_receipt;
 
 use std::{
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
     sync::Arc,
@@ -138,6 +139,11 @@ enum Command {
         #[command(subcommand)]
         command: TraceCommand,
     },
+    /// create and verify reproducible execution capsules
+    Capsule {
+        #[command(subcommand)]
+        command: CapsuleCommand,
+    },
     /// inspect and recover durable cartridge state
     Storage {
         #[command(subcommand)]
@@ -157,6 +163,36 @@ enum TraceCommand {
     Diff {
         left: PathBuf,
         right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CapsuleCommand {
+    /// bind a package, source state, trace, and result state
+    Create {
+        package: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long)]
+        result: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// validate and summarize a capsule manifest
+    Inspect {
+        capsule: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify every referenced artifact and semantic binding
+    Verify {
+        capsule: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -361,8 +397,83 @@ fn run_cli() -> Result<()> {
             TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
             TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
         },
+        Command::Capsule { command } => run_capsule_command(command),
         Command::Storage { command } => run_storage_command(command),
     }
+}
+
+fn run_capsule_command(command: CapsuleCommand) -> Result<()> {
+    match command {
+        CapsuleCommand::Create {
+            package,
+            source,
+            trace,
+            result,
+            output,
+            json,
+        } => {
+            let summary = capsule::create(&package, &source, &trace, &result, &output)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("created capsule -> {}", output.display());
+                print_capsule_summary(&summary);
+            }
+            Ok(())
+        }
+        CapsuleCommand::Inspect { capsule, json } => {
+            let summary = capsule::inspect(&capsule)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print_capsule_summary(&summary);
+            }
+            Ok(())
+        }
+        CapsuleCommand::Verify { capsule, json } => {
+            let report = capsule::verify(&capsule)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("verified capsule and all referenced artifacts");
+                print_capsule_summary(&report.capsule);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_capsule_summary(summary: &capsule::CapsuleSummary) {
+    println!("{} {}", summary.cartridge_id, summary.cartridge_version);
+    println!("capsule format: {}", summary.format_version);
+    println!("runtime: {}", summary.runtime_version);
+    println!("component sha256: {}", summary.component_sha256);
+    println!(
+        "arguments: {} value(s), {} bytes ({})",
+        summary.argument_count, summary.argument_bytes, summary.arguments_sha256
+    );
+    println!(
+        "source state: schema {}, {} key(s), {} bytes ({})",
+        summary.source_schema,
+        summary.source_entries,
+        summary.source_bytes,
+        summary.source_snapshot_sha256
+    );
+    println!(
+        "trace: {} event(s), {} output bytes, {} fuel ({})",
+        summary.trace_events,
+        summary.trace_output_bytes,
+        summary.fuel_consumed,
+        summary.trace_output_sha256
+    );
+    println!(
+        "result state: schema {}, {} key(s), {} bytes ({})",
+        summary.result_schema,
+        summary.result_entries,
+        summary.result_bytes,
+        summary.result_snapshot_sha256
+    );
+    println!("capsule sha256: {}", summary.capsule_sha256);
 }
 
 fn run_storage_command(command: StorageCommand) -> Result<()> {
@@ -1304,15 +1415,19 @@ fn trace_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
 }
 
 fn read_trace(path: &Path) -> Result<ExecutionTrace> {
-    if fs::metadata(path)?.len() > MAX_TRACE_DOCUMENT_BYTES {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("could not open trace {}", path.display()))?
+        .take(MAX_TRACE_DOCUMENT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read trace {}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TRACE_DOCUMENT_BYTES {
         bail!(
             "trace {} exceeds the {} byte input limit",
             path.display(),
             MAX_TRACE_DOCUMENT_BYTES
         );
     }
-    let bytes =
-        fs::read(path).with_context(|| format!("could not read trace {}", path.display()))?;
     let trace: ExecutionTrace = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid trace {}", path.display()))?;
     trace

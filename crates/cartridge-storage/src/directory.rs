@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -567,14 +567,16 @@ fn state_usage(entries: &BTreeMap<String, Vec<u8>>) -> Result<StorageUsage> {
 }
 
 fn read_state(path: &Path, namespace: &str, generation: u64) -> Result<State> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_STATE_FILE_BYTES {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_STATE_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATE_FILE_BYTES {
         return Err(Error::Corrupt(format!(
             "{} exceeds the state file size limit",
             path.display()
         )));
     }
-    let bytes = fs::read(path)?;
     let envelope: DiskEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
         Error::Corrupt(format!("{} is not valid JSON: {error}", path.display()))
     })?;

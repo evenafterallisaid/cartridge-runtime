@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -182,14 +182,17 @@ impl StorageSnapshot {
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MAX_SNAPSHOT_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_FILE_BYTES {
             return Err(Error::Corrupt(format!(
                 "{} exceeds the snapshot size limit",
                 path.display()
             )));
         }
-        Self::from_slice(&fs::read(path)?)
+        Self::from_slice(&bytes)
     }
 
     pub fn write_new(&self, path: impl AsRef<Path>) -> Result<()> {

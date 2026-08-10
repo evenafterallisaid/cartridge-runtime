@@ -67,6 +67,10 @@ jobs:
           cargo run -p cartridge-cli -- storage diff first.cartridge-state.json second.cartridge-state.json
           cargo run -p cartridge-cli -- run hello.cartridge --from-snapshot first.cartridge-state.json --snapshot-output branch.cartridge-state.json -- Branch
           cargo run -p cartridge-cli -- storage diff first.cartridge-state.json branch.cartridge-state.json
+          cargo run -p cartridge-cli -- run hello.cartridge --trace capsule.trace.json --from-snapshot first.cartridge-state.json --snapshot-output capsule-result.cartridge-state.json -- Capsule
+          cargo run -p cartridge-cli -- capsule create hello.cartridge --source first.cartridge-state.json --trace capsule.trace.json --result capsule-result.cartridge-state.json --output run.cartridge-capsule.json
+          cargo run -p cartridge-cli -- capsule inspect run.cartridge-capsule.json
+          cargo run -p cartridge-cli -- capsule verify run.cartridge-capsule.json
           cargo run -p cartridge-cli -- storage restore hello.cartridge first.cartridge-state.json --state-dir state --dry-run
           cargo run -p cartridge-cli -- storage restore hello.cartridge first.cartridge-state.json --state-dir state
           cargo run -p cartridge-cli -- storage export hello.cartridge --state-dir state --output restored.cartridge-state.json
@@ -91,6 +95,15 @@ jobs:
           cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
           binary=target/debug/cartridge
           if [ -x target/debug/cartridge.exe ]; then binary=target/debug/cartridge.exe; fi
+          printf ' ' >> capsule-result.cartridge-state.json
+          set +e
+          "$binary" capsule verify run.cartridge-capsule.json
+          tampered_capsule_status=$?
+          set -e
+          if [ "$tampered_capsule_status" -eq 0 ]; then
+            echo "capsule verification accepted a changed result artifact"
+            exit 1
+          fi
           set +e
           "$binary" __worker-run hello.cartridge
           direct_worker_status=$?
