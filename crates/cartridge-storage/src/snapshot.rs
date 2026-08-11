@@ -11,10 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES, MemoryStorage, Result,
-    StorageBackend, StorageLimits, StorageUsage, validate_key, validate_limits, validate_namespace,
+    StorageBackend, StorageLimits, StorageMutation, StorageTransactionResult, StorageUsage,
+    validate_key, validate_limits, validate_namespace,
 };
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 144 * 1024 * 1024;
 
@@ -43,10 +44,13 @@ impl SnapshotStorage {
         validate_limits(limits)?;
         let entries = snapshot.entries_for(cartridge_id)?;
         let storage = MemoryStorage::new();
-        storage.prepare(cartridge_id, snapshot.state_schema(), limits)?;
-        for (key, value) in entries {
-            storage.put(cartridge_id, &key, &value, limits)?;
-        }
+        storage.load_namespace(
+            cartridge_id,
+            snapshot.state_schema(),
+            snapshot.state_revision(),
+            entries,
+            limits,
+        )?;
         Ok(Self {
             cartridge_id: cartridge_id.to_owned(),
             state_schema: snapshot.state_schema(),
@@ -91,8 +95,13 @@ impl SnapshotStorage {
         state_schema: u32,
         limits: StorageLimits,
     ) -> Result<StorageSnapshot> {
-        let entries = self.storage.snapshot_entries(&self.cartridge_id, limits)?;
-        StorageSnapshot::from_entries(&self.cartridge_id, state_schema, &entries)
+        let (revision, entries) = self.storage.snapshot_state(&self.cartridge_id, limits)?;
+        StorageSnapshot::from_entries_with_revision(
+            &self.cartridge_id,
+            state_schema,
+            revision,
+            &entries,
+        )
     }
 
     fn check_namespace(&self, namespace: &str) -> Result<()> {
@@ -143,12 +152,59 @@ impl StorageBackend for SnapshotStorage {
         self.check_namespace(namespace)?;
         self.storage.usage(namespace)
     }
+
+    fn revision(&self, namespace: &str) -> Result<u64> {
+        self.check_namespace(namespace)?;
+        self.storage.revision(namespace)
+    }
+
+    fn compare_exchange(
+        &self,
+        namespace: &str,
+        expected_revision: u64,
+        key: &str,
+        expected: Option<&[u8]>,
+        replacement: Option<&[u8]>,
+        limits: StorageLimits,
+    ) -> Result<StorageTransactionResult> {
+        self.check_namespace(namespace)?;
+        self.storage.compare_exchange(
+            namespace,
+            expected_revision,
+            key,
+            expected,
+            replacement,
+            limits,
+        )
+    }
+
+    fn apply_batch(
+        &self,
+        namespace: &str,
+        expected_revision: u64,
+        mutations: &[StorageMutation],
+        limits: StorageLimits,
+    ) -> Result<StorageTransactionResult> {
+        self.check_namespace(namespace)?;
+        self.storage
+            .apply_batch(namespace, expected_revision, mutations, limits)
+    }
 }
 
 impl StorageSnapshot {
-    pub(crate) fn from_entries(
+    #[cfg(test)]
+    fn from_entries(
         cartridge_id: &str,
         state_schema: u32,
+        entries: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self> {
+        Self::from_entries_with_revision(cartridge_id, state_schema, 0, entries)
+    }
+
+    pub(crate) fn from_entries_with_revision(
+        cartridge_id: &str,
+        state_schema: u32,
+        state_revision: u64,
         entries: &BTreeMap<String, Vec<u8>>,
     ) -> Result<Self> {
         validate_namespace(cartridge_id)?;
@@ -156,6 +212,7 @@ impl StorageSnapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             cartridge_id: cartridge_id.to_owned(),
             state_schema,
+            state_revision,
             entries: entries
                 .iter()
                 .map(|(key, value)| (key.clone(), hex::encode(value)))
@@ -220,15 +277,21 @@ impl StorageSnapshot {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.payload.format_version, 1 | SNAPSHOT_FORMAT_VERSION) {
+        if !matches!(self.payload.format_version, 1 | 2 | SNAPSHOT_FORMAT_VERSION) {
             return Err(Error::Corrupt(format!(
-                "unsupported snapshot format {}; expected 1 or {SNAPSHOT_FORMAT_VERSION}",
+                "unsupported snapshot format {}; expected 1, 2, or {SNAPSHOT_FORMAT_VERSION}",
                 self.payload.format_version
             )));
         }
         if self.payload.format_version == 1 && self.payload.state_schema != 0 {
             return Err(Error::Corrupt(
                 "snapshot format 1 cannot declare a state schema".into(),
+            ));
+        }
+        if self.payload.format_version < SNAPSHOT_FORMAT_VERSION && self.payload.state_revision != 0
+        {
+            return Err(Error::Corrupt(
+                "snapshot formats 1 and 2 cannot declare a state revision".into(),
             ));
         }
         validate_namespace(&self.payload.cartridge_id)
@@ -251,6 +314,47 @@ impl StorageSnapshot {
         self.payload.state_schema
     }
 
+    #[must_use]
+    pub fn state_revision(&self) -> u64 {
+        self.payload.state_revision
+    }
+
+    pub fn with_state_revision(&self, state_revision: u64) -> Result<Self> {
+        self.validate()?;
+        Self::from_entries_with_revision(
+            self.cartridge_id(),
+            self.state_schema(),
+            state_revision,
+            &self.decode_entries()?,
+        )
+    }
+
+    pub fn payload_sha256_for_format(&self, format_version: u32) -> Result<String> {
+        self.validate()?;
+        if !matches!(format_version, 1 | 2 | SNAPSHOT_FORMAT_VERSION) {
+            return Err(Error::Corrupt(format!(
+                "unsupported snapshot compatibility format {format_version}"
+            )));
+        }
+        if format_version == 1 && self.state_schema() != 0 {
+            return Err(Error::Corrupt(
+                "snapshot format 1 cannot represent a nonzero schema".into(),
+            ));
+        }
+        let payload = SnapshotPayload {
+            format_version,
+            cartridge_id: self.cartridge_id().to_owned(),
+            state_schema: self.state_schema(),
+            state_revision: if format_version >= SNAPSHOT_FORMAT_VERSION {
+                self.state_revision()
+            } else {
+                0
+            },
+            entries: self.payload.entries.clone(),
+        };
+        payload_digest(&payload)
+    }
+
     pub fn summary(&self) -> Result<StorageSnapshotSummary> {
         self.validate()?;
         let entries = self.decode_entries()?;
@@ -259,6 +363,7 @@ impl StorageSnapshot {
             format_version: self.payload.format_version,
             cartridge_id: self.payload.cartridge_id.clone(),
             state_schema: self.payload.state_schema,
+            state_revision: self.payload.state_revision,
             entries: usage.keys,
             bytes: usage.bytes,
             payload_sha256: self.payload_sha256.clone(),
@@ -277,6 +382,11 @@ impl StorageSnapshot {
             Some(SnapshotDifference::Schema {
                 left: self.state_schema(),
                 right: other.state_schema(),
+            })
+        } else if self.state_revision() != other.state_revision() {
+            Some(SnapshotDifference::Revision {
+                left: self.state_revision(),
+                right: other.state_revision(),
             })
         } else {
             first_entry_difference(&self.decode_entries()?, &other.decode_entries()?)
@@ -339,6 +449,8 @@ struct SnapshotPayload {
     cartridge_id: String,
     #[serde(default, skip_serializing_if = "is_default")]
     state_schema: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    state_revision: u64,
     entries: BTreeMap<String, String>,
 }
 
@@ -347,6 +459,7 @@ pub struct StorageSnapshotSummary {
     pub format_version: u32,
     pub cartridge_id: String,
     pub state_schema: u32,
+    pub state_revision: u64,
     pub entries: usize,
     pub bytes: usize,
     pub payload_sha256: String,
@@ -369,6 +482,10 @@ pub enum SnapshotDifference {
     Schema {
         left: u32,
         right: u32,
+    },
+    Revision {
+        left: u64,
+        right: u64,
     },
     Entry {
         key: String,
@@ -535,11 +652,27 @@ mod tests {
                 format_version: 1,
                 cartridge_id: "dev.example.test".into(),
                 state_schema: 0,
+                state_revision: 0,
                 entries: 1,
                 bytes: 4,
                 payload_sha256: "3e2cf42a40fed75311308f325de48929568683b15387be177818ed2dd9fa41c7"
                     .into(),
             }
+        );
+    }
+
+    #[test]
+    fn portable_v2_fixture_remains_compatible_with_revision_zero() {
+        let snapshot =
+            StorageSnapshot::from_slice(include_bytes!("../tests/fixtures/snapshot-v2.json"))
+                .unwrap();
+
+        assert_eq!(snapshot.state_schema(), 1);
+        assert_eq!(snapshot.state_revision(), 0);
+        assert_eq!(snapshot.summary().unwrap().entries, 1);
+        assert_eq!(
+            snapshot.payload_sha256_for_format(2).unwrap(),
+            "2fe93e0109ac40b913c9e48f113fdac2f3e6e517fc8566865381c40867649955"
         );
     }
 
@@ -562,6 +695,27 @@ mod tests {
             BTreeMap::from([("settings/theme".into(), b"dark".to_vec())])
         );
         assert_eq!(result.summary().unwrap().entries, 2);
+        assert_eq!(source.state_revision(), 0);
+        assert_eq!(result.state_revision(), 2);
+    }
+
+    #[test]
+    fn snapshot_revisions_survive_branch_round_trips_and_affect_comparison() {
+        let entries = BTreeMap::from([("settings/theme".into(), b"dark".to_vec())]);
+        let source =
+            StorageSnapshot::from_entries_with_revision("dev.example.test", 0, 7, &entries)
+                .unwrap();
+        let branch = SnapshotStorage::from_snapshot(&source, "dev.example.test", LIMITS).unwrap();
+        let exported = branch.export_snapshot().unwrap();
+        let older = StorageSnapshot::from_entries_with_revision("dev.example.test", 0, 6, &entries)
+            .unwrap();
+
+        assert_eq!(branch.revision("dev.example.test").unwrap(), 7);
+        assert_eq!(exported.state_revision(), 7);
+        assert_eq!(
+            exported.compare(&older).unwrap().difference,
+            Some(SnapshotDifference::Revision { left: 7, right: 6 })
+        );
     }
 
     #[test]

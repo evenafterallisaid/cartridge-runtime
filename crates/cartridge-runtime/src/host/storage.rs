@@ -1,6 +1,11 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use cartridge_storage::{
+    MAX_TRANSACTION_INPUT_BYTES, MAX_TRANSACTION_OPERATIONS, StorageMutation,
+    StorageTransactionResult,
+};
+
 use super::HostState;
 
 impl HostState {
@@ -226,6 +231,237 @@ impl HostState {
         }
     }
 
+    pub(super) fn storage_revision(&mut self) -> Result<u64, String> {
+        if !self.permissions.storage {
+            let error = "storage capability was not granted".to_owned();
+            self.record("storage", "revision", json!({ "denied": error }));
+            return Err(error);
+        }
+        if let Some(outcome) = self.replay_outcome("storage", "revision") {
+            let outcome = outcome?;
+            let result = decode_recorded_revision(&outcome).inspect_err(|error| {
+                self.set_divergence(error.clone());
+            });
+            if self.apply_replay_storage {
+                let actual = self
+                    .storage
+                    .revision(&self.storage_namespace)
+                    .map_err(|error| error.to_string())?;
+                if result.as_ref().is_ok_and(|expected| *expected != actual) {
+                    let error = "source state does not match recorded storage revision".to_owned();
+                    self.set_divergence(error.clone());
+                    return Err(error);
+                }
+            }
+            self.record("storage", "revision", outcome);
+            return result;
+        }
+        match self.storage.revision(&self.storage_namespace) {
+            Ok(revision) => {
+                self.record("storage", "revision", json!({ "revision": revision }));
+                Ok(revision)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record("storage", "revision", json!({ "error": error }));
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn compare_exchange_storage(
+        &mut self,
+        revision: u64,
+        key: &str,
+        expected: Option<&[u8]>,
+        replacement: Option<&[u8]>,
+    ) -> Result<StorageTransactionResult, String> {
+        if !self.permissions.storage {
+            let error = "storage capability was not granted".to_owned();
+            self.record(
+                "storage",
+                "compare-exchange",
+                json!({ "key": key, "denied": error }),
+            );
+            return Err(error);
+        }
+        let (expected_value, replacement_value) = value_identities(expected, replacement);
+        if let Some(outcome) = self.replay_outcome("storage", "compare-exchange") {
+            let outcome = outcome?;
+            self.check_replay_field(&outcome, "revision", &Value::from(revision))?;
+            self.check_replay_field(&outcome, "key", &Value::from(key))?;
+            self.check_replay_field(&outcome, "expected", &expected_value)?;
+            self.check_replay_field(&outcome, "replacement", &replacement_value)?;
+            let result = decode_recorded_transaction(&outcome).inspect_err(|error| {
+                self.set_divergence(error.clone());
+            });
+            if self.apply_replay_storage {
+                if let Ok(recorded) = result {
+                    let actual = match self.storage.compare_exchange(
+                        &self.storage_namespace,
+                        revision,
+                        key,
+                        expected,
+                        replacement,
+                        self.storage_limits,
+                    ) {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            let error =
+                                format!("replayed storage compare-exchange failed: {error}");
+                            self.set_divergence(error.clone());
+                            return Err(error);
+                        }
+                    };
+                    if actual != recorded {
+                        let error = "source state does not match recorded compare-exchange result"
+                            .to_owned();
+                        self.set_divergence(error.clone());
+                        return Err(error);
+                    }
+                    self.record("storage", "compare-exchange", outcome);
+                    return Ok(recorded);
+                }
+            }
+            self.record("storage", "compare-exchange", outcome);
+            return result;
+        }
+        let result = self.storage.compare_exchange(
+            &self.storage_namespace,
+            revision,
+            key,
+            expected,
+            replacement,
+            self.storage_limits,
+        );
+        self.record_transaction(
+            "compare-exchange",
+            json!({
+                "revision": revision,
+                "key": key,
+                "expected": expected_value,
+                "replacement": replacement_value,
+            }),
+            result,
+        )
+    }
+
+    pub(super) fn apply_storage_batch(
+        &mut self,
+        revision: u64,
+        mutations: &[StorageMutation],
+    ) -> Result<StorageTransactionResult, String> {
+        let request = mutation_identity(mutations);
+        self.apply_storage_batch_request(revision, Some(mutations), &request)
+    }
+
+    pub(super) fn reject_oversized_storage_batch(
+        &mut self,
+        revision: u64,
+        operations: usize,
+    ) -> Result<StorageTransactionResult, String> {
+        let request = json!({ "operations": operations, "oversized": true });
+        self.apply_storage_batch_request(revision, None, &request)
+    }
+
+    fn apply_storage_batch_request(
+        &mut self,
+        revision: u64,
+        mutations: Option<&[StorageMutation]>,
+        request: &Value,
+    ) -> Result<StorageTransactionResult, String> {
+        if !self.permissions.storage {
+            let error = "storage capability was not granted".to_owned();
+            self.record("storage", "apply", json!({ "denied": error }));
+            return Err(error);
+        }
+        if let Some(outcome) = self.replay_outcome("storage", "apply") {
+            let outcome = outcome?;
+            self.check_replay_field(&outcome, "revision", &Value::from(revision))?;
+            self.check_replay_field(&outcome, "request", request)?;
+            let result = decode_recorded_transaction(&outcome).inspect_err(|error| {
+                self.set_divergence(error.clone());
+            });
+            if self.apply_replay_storage {
+                if let Ok(recorded) = result {
+                    let Some(mutations) = mutations else {
+                        let error =
+                            "recorded oversized storage batch unexpectedly succeeded".to_owned();
+                        self.set_divergence(error.clone());
+                        return Err(error);
+                    };
+                    let actual = match self.storage.apply_batch(
+                        &self.storage_namespace,
+                        revision,
+                        mutations,
+                        self.storage_limits,
+                    ) {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            let error = format!("replayed storage batch failed: {error}");
+                            self.set_divergence(error.clone());
+                            return Err(error);
+                        }
+                    };
+                    if actual != recorded {
+                        let error =
+                            "source state does not match recorded storage batch result".to_owned();
+                        self.set_divergence(error.clone());
+                        return Err(error);
+                    }
+                    self.record("storage", "apply", outcome);
+                    return Ok(recorded);
+                }
+            }
+            self.record("storage", "apply", outcome);
+            return result;
+        }
+        let result = mutations.map_or_else(
+            || Err(cartridge_storage::Error::InvalidTransaction),
+            |mutations| {
+                self.storage.apply_batch(
+                    &self.storage_namespace,
+                    revision,
+                    mutations,
+                    self.storage_limits,
+                )
+            },
+        );
+        self.record_transaction(
+            "apply",
+            json!({
+                "revision": revision,
+                "request": request,
+            }),
+            result,
+        )
+    }
+
+    fn record_transaction(
+        &mut self,
+        operation: &str,
+        mut identity: Value,
+        result: cartridge_storage::Result<StorageTransactionResult>,
+    ) -> Result<StorageTransactionResult, String> {
+        let object = identity
+            .as_object_mut()
+            .ok_or_else(|| "storage trace identity is not an object".to_owned())?;
+        match result {
+            Ok(result) => {
+                object.insert("applied".into(), Value::from(result.applied));
+                object.insert("result_revision".into(), Value::from(result.revision));
+                self.record("storage", operation, identity);
+                Ok(result)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                object.insert("error".into(), Value::from(error.clone()));
+                self.record("storage", operation, identity);
+                Err(error)
+            }
+        }
+    }
+
     fn check_replay_field(
         &mut self,
         outcome: &Value,
@@ -310,4 +546,139 @@ fn decode_recorded_list(outcome: &Value) -> Result<Vec<String>, String> {
         .ok_or_else(|| "recorded storage list outcome is missing keys".to_owned())?;
     serde_json::from_value(keys)
         .map_err(|error| format!("recorded storage keys are invalid: {error}"))
+}
+
+fn decode_recorded_revision(outcome: &Value) -> Result<u64, String> {
+    if let Some(error) = recorded_error(outcome) {
+        return Err(error);
+    }
+    outcome
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "recorded storage revision is missing".to_owned())
+}
+
+fn decode_recorded_transaction(outcome: &Value) -> Result<StorageTransactionResult, String> {
+    if let Some(error) = recorded_error(outcome) {
+        return Err(error);
+    }
+    let applied = outcome
+        .get("applied")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "recorded storage transaction is missing applied".to_owned())?;
+    let revision = outcome
+        .get("result_revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "recorded storage transaction is missing its revision".to_owned())?;
+    Ok(StorageTransactionResult { applied, revision })
+}
+
+fn value_identity(value: Option<&[u8]>, hash: bool) -> Value {
+    value.map_or(Value::Null, |value| {
+        if hash {
+            json!({
+                "length": value.len(),
+                "sha256": hex::encode(Sha256::digest(value)),
+            })
+        } else {
+            json!({ "length": value.len(), "oversized": true })
+        }
+    })
+}
+
+fn value_identities(expected: Option<&[u8]>, replacement: Option<&[u8]>) -> (Value, Value) {
+    let total = expected
+        .map_or(0, <[u8]>::len)
+        .checked_add(replacement.map_or(0, <[u8]>::len));
+    let hash = total.is_some_and(|total| total <= MAX_TRANSACTION_INPUT_BYTES);
+    (
+        value_identity(expected, hash),
+        value_identity(replacement, hash),
+    )
+}
+
+fn mutation_identity(mutations: &[StorageMutation]) -> Value {
+    if mutations.len() > MAX_TRANSACTION_OPERATIONS {
+        return json!({ "operations": mutations.len(), "oversized": true });
+    }
+    let input_bytes = mutations.iter().try_fold(0usize, |total, mutation| {
+        total.checked_add(mutation.key.len()).and_then(|bytes| {
+            mutation
+                .value
+                .as_ref()
+                .map_or(Some(bytes), |value| bytes.checked_add(value.len()))
+        })
+    });
+    let Some(input_bytes) = input_bytes else {
+        return json!({
+            "operations": mutations.len(),
+            "input_bytes": u64::MAX,
+            "oversized": true,
+        });
+    };
+    if input_bytes > MAX_TRANSACTION_INPUT_BYTES {
+        return json!({
+            "operations": mutations.len(),
+            "input_bytes": input_bytes,
+            "oversized": true,
+        });
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"cartridge-storage-batch-v1\0");
+    hasher.update(
+        u64::try_from(mutations.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for mutation in mutations {
+        hasher.update(
+            u64::try_from(mutation.key.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(mutation.key.as_bytes());
+        if let Some(value) = &mutation.value {
+            hasher.update([1]);
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+    json!({
+        "operations": mutations.len(),
+        "input_bytes": input_bytes,
+        "sha256": hex::encode(hasher.finalize()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_batch_identities_do_not_hash_guest_values() {
+        let too_many = vec![
+            StorageMutation {
+                key: String::new(),
+                value: None,
+            };
+            MAX_TRANSACTION_OPERATIONS + 1
+        ];
+        assert_eq!(
+            mutation_identity(&too_many),
+            json!({
+                "operations": MAX_TRANSACTION_OPERATIONS + 1,
+                "oversized": true,
+            })
+        );
+
+        let too_large = [StorageMutation {
+            key: "key".into(),
+            value: Some(vec![0; MAX_TRANSACTION_INPUT_BYTES + 1]),
+        }];
+        let identity = mutation_identity(&too_large);
+        assert_eq!(identity.get("oversized"), Some(&Value::Bool(true)));
+        assert!(identity.get("sha256").is_none());
+    }
 }

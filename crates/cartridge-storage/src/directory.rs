@@ -14,8 +14,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES, Result, StorageBackend,
-    StorageLimits, StorageSnapshot, StorageUsage, validate_entry_limits, validate_key,
-    validate_limits, validate_namespace, validate_prefix,
+    StorageLimits, StorageMutation, StorageSnapshot, StorageTransactionResult, StorageUsage,
+    apply_mutations, mutations_change, next_revision, validate_compare_exchange,
+    validate_entry_limits, validate_key, validate_limits, validate_mutations, validate_namespace,
+    validate_prefix,
 };
 
 const DISK_FORMAT_VERSION: u32 = 2;
@@ -137,8 +139,10 @@ impl DirectoryStorage {
             let current = load_state(directory, namespace)?;
             build_restore_plan(
                 current.schema,
+                current.generation,
                 &current.entries,
                 snapshot.state_schema(),
+                snapshot.state_revision(),
                 &entries,
             )
         })
@@ -157,8 +161,10 @@ impl DirectoryStorage {
             let current = load_state(directory, namespace)?;
             let plan = build_restore_plan(
                 current.schema,
+                current.generation,
                 &current.entries,
                 snapshot.state_schema(),
+                snapshot.state_revision(),
                 &entries,
             )?;
             if plan.changed() {
@@ -166,7 +172,7 @@ impl DirectoryStorage {
                     directory,
                     namespace,
                     State {
-                        generation: current.generation,
+                        generation: current.generation.max(snapshot.state_revision()),
                         schema: snapshot.state_schema(),
                         usage: plan.snapshot,
                         entries,
@@ -198,8 +204,10 @@ impl DirectoryStorage {
             }
             let plan = build_restore_plan(
                 current.schema,
+                current.generation,
                 &current.entries,
                 replacement.state_schema(),
+                replacement.state_revision(),
                 &replacement_entries,
             )?;
             if plan.changed() {
@@ -207,7 +215,7 @@ impl DirectoryStorage {
                     directory,
                     namespace,
                     State {
-                        generation: current.generation,
+                        generation: current.generation.max(replacement.state_revision()),
                         schema: replacement.state_schema(),
                         usage: plan.snapshot,
                         entries: replacement_entries,
@@ -292,7 +300,12 @@ impl GenerationEvidence {
 fn capture_state(namespace: &str, state: &State) -> Result<CapturedState> {
     Ok(CapturedState {
         generation: state.generation,
-        snapshot: StorageSnapshot::from_entries(namespace, state.schema, &state.entries)?,
+        snapshot: StorageSnapshot::from_entries_with_revision(
+            namespace,
+            state.schema,
+            state.generation,
+            &state.entries,
+        )?,
     })
 }
 
@@ -359,6 +372,13 @@ impl StorageBackend for DirectoryStorage {
         self.with_namespace(namespace, |directory| {
             cleanup_pending(directory)?;
             let mut state = load_state(directory, namespace)?;
+            if state
+                .entries
+                .get(key)
+                .is_some_and(|current| current == value)
+            {
+                return Ok(());
+            }
             let old_size = state.entries.get(key).map_or(0, Vec::len);
             let next_bytes = state
                 .usage
@@ -421,6 +441,95 @@ impl StorageBackend for DirectoryStorage {
             Ok(load_state(directory, namespace)?.usage)
         })
     }
+
+    fn revision(&self, namespace: &str) -> Result<u64> {
+        self.with_namespace(namespace, |directory| {
+            Ok(load_state(directory, namespace)?.generation)
+        })
+    }
+
+    fn compare_exchange(
+        &self,
+        namespace: &str,
+        expected_revision: u64,
+        key: &str,
+        expected: Option<&[u8]>,
+        replacement: Option<&[u8]>,
+        limits: StorageLimits,
+    ) -> Result<StorageTransactionResult> {
+        validate_compare_exchange(key, expected, replacement, limits)?;
+        self.with_namespace(namespace, |directory| {
+            cleanup_pending(directory)?;
+            let mut state = load_state(directory, namespace)?;
+            if state.generation != expected_revision
+                || state.entries.get(key).map(Vec::as_slice) != expected
+            {
+                return Ok(StorageTransactionResult {
+                    applied: false,
+                    revision: state.generation,
+                });
+            }
+            let mutations = [StorageMutation {
+                key: key.to_owned(),
+                value: replacement.map(<[u8]>::to_vec),
+            }];
+            let revision = if mutations_change(&state.entries, &mutations) {
+                next_revision(state.generation)?
+            } else {
+                state.generation
+            };
+            let changed =
+                apply_mutations(&mut state.entries, &mut state.usage, &mutations, limits)?;
+            if changed {
+                commit_state(directory, namespace, state)?;
+                return Ok(StorageTransactionResult {
+                    applied: true,
+                    revision,
+                });
+            }
+            Ok(StorageTransactionResult {
+                applied: true,
+                revision: state.generation,
+            })
+        })
+    }
+
+    fn apply_batch(
+        &self,
+        namespace: &str,
+        expected_revision: u64,
+        mutations: &[StorageMutation],
+        limits: StorageLimits,
+    ) -> Result<StorageTransactionResult> {
+        validate_mutations(mutations, limits)?;
+        self.with_namespace(namespace, |directory| {
+            cleanup_pending(directory)?;
+            let mut state = load_state(directory, namespace)?;
+            if state.generation != expected_revision {
+                return Ok(StorageTransactionResult {
+                    applied: false,
+                    revision: state.generation,
+                });
+            }
+            let revision = if mutations_change(&state.entries, mutations) {
+                next_revision(state.generation)?
+            } else {
+                state.generation
+            };
+            let changed = apply_mutations(&mut state.entries, &mut state.usage, mutations, limits)?;
+            if changed {
+                commit_state(directory, namespace, state)?;
+                return Ok(StorageTransactionResult {
+                    applied: true,
+                    revision,
+                });
+            }
+            Ok(StorageTransactionResult {
+                applied: true,
+                revision: state.generation,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -460,6 +569,9 @@ pub struct RecoveryReport {
 pub struct RestorePlan {
     pub current_schema: u32,
     pub snapshot_schema: u32,
+    pub current_revision: u64,
+    pub snapshot_revision: u64,
+    pub result_revision: u64,
     pub current: StorageUsage,
     pub snapshot: StorageUsage,
     pub added: usize,
@@ -471,7 +583,8 @@ pub struct RestorePlan {
 impl RestorePlan {
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.current_schema != self.snapshot_schema
+        self.current_revision != self.result_revision
+            || self.current_schema != self.snapshot_schema
             || self.added != 0
             || self.replaced != 0
             || self.removed != 0
@@ -524,8 +637,10 @@ fn validate_restore_limits(
 
 fn build_restore_plan(
     current_schema: u32,
+    current_revision: u64,
     current: &BTreeMap<String, Vec<u8>>,
     snapshot_schema: u32,
+    snapshot_revision: u64,
     snapshot: &BTreeMap<String, Vec<u8>>,
 ) -> Result<RestorePlan> {
     let mut added = 0;
@@ -542,9 +657,20 @@ fn build_restore_plan(
         .keys()
         .filter(|key| !snapshot.contains_key(*key))
         .count();
+    let content_changed =
+        current_schema != snapshot_schema || added != 0 || replaced != 0 || removed != 0;
+    let imports_newer_revision = snapshot_revision > current_revision;
+    let result_revision = if content_changed || imports_newer_revision {
+        next_revision(current_revision.max(snapshot_revision))?
+    } else {
+        current_revision
+    };
     Ok(RestorePlan {
         current_schema,
         snapshot_schema,
+        current_revision,
+        snapshot_revision,
+        result_revision,
         current: state_usage(current)?,
         snapshot: state_usage(snapshot)?,
         added,
@@ -786,7 +912,7 @@ fn sync_directory(directory: &Path) -> Result<()> {
 mod tests {
     use std::{sync::Arc, thread};
 
-    use crate::SnapshotStorage;
+    use crate::{SnapshotDifference, SnapshotStorage};
 
     use super::*;
 
@@ -952,6 +1078,94 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_batches_allow_exactly_one_revision_winner() {
+        let directory = TestDirectory::new();
+        let first = Arc::new(DirectoryStorage::open(directory.path()).unwrap());
+        let second = Arc::new(DirectoryStorage::open(directory.path()).unwrap());
+        first.prepare("dev.example.test", 0, LIMITS).unwrap();
+        let revision = first.revision("dev.example.test").unwrap();
+        let first_thread = {
+            let storage = first.clone();
+            thread::spawn(move || {
+                storage
+                    .apply_batch(
+                        "dev.example.test",
+                        revision,
+                        &[StorageMutation {
+                            key: "first".into(),
+                            value: Some(b"one".to_vec()),
+                        }],
+                        LIMITS,
+                    )
+                    .unwrap()
+            })
+        };
+        let second_thread = thread::spawn(move || {
+            second
+                .apply_batch(
+                    "dev.example.test",
+                    revision,
+                    &[StorageMutation {
+                        key: "second".into(),
+                        value: Some(b"two".to_vec()),
+                    }],
+                    LIMITS,
+                )
+                .unwrap()
+        });
+
+        let first_result = first_thread.join().unwrap();
+        let second_result = second_thread.join().unwrap();
+
+        assert_ne!(first_result.applied, second_result.applied);
+        assert_eq!(first.list("dev.example.test", "").unwrap().len(), 1);
+        assert_eq!(first.revision("dev.example.test").unwrap(), revision + 1);
+    }
+
+    #[test]
+    fn rejected_durable_batches_publish_no_generation_or_partial_state() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage.prepare("dev.example.test", 0, LIMITS).unwrap();
+        let revision = storage.revision("dev.example.test").unwrap();
+        let namespace = storage.namespace_directory("dev.example.test");
+
+        assert!(matches!(
+            storage.apply_batch(
+                "dev.example.test",
+                revision,
+                &[
+                    StorageMutation {
+                        key: "first".into(),
+                        value: Some(vec![0; 250]),
+                    },
+                    StorageMutation {
+                        key: "second".into(),
+                        value: Some(vec![0; 250]),
+                    },
+                    StorageMutation {
+                        key: "third".into(),
+                        value: Some(vec![0; 250]),
+                    },
+                    StorageMutation {
+                        key: "fourth".into(),
+                        value: Some(vec![0; 250]),
+                    },
+                    StorageMutation {
+                        key: "fifth".into(),
+                        value: Some(vec![0; 250]),
+                    },
+                ],
+                LIMITS,
+            ),
+            Err(Error::QuotaExceeded { .. })
+        ));
+        assert_eq!(storage.revision("dev.example.test").unwrap(), revision);
+        assert!(storage.list("dev.example.test", "").unwrap().is_empty());
+        assert_eq!(state_files(&namespace).unwrap().len(), 1);
+    }
+
+    #[test]
     fn contended_locks_fail_within_a_fixed_budget() {
         let directory = TestDirectory::new();
         let storage = DirectoryStorage::open(directory.path()).unwrap();
@@ -1026,6 +1240,46 @@ mod tests {
     }
 
     #[test]
+    fn restore_advances_past_imported_revisions_without_overflowing() {
+        let directory = TestDirectory::new();
+        let storage = DirectoryStorage::open(directory.path()).unwrap();
+        storage.prepare("dev.example.test", 0, LIMITS).unwrap();
+        let imported = StorageSnapshot::from_entries_with_revision(
+            "dev.example.test",
+            0,
+            100,
+            &BTreeMap::from([("value".into(), b"imported".to_vec())]),
+        )
+        .unwrap();
+
+        let plan = storage
+            .restore("dev.example.test", &imported, LIMITS)
+            .unwrap();
+
+        assert_eq!(plan.current_revision, 1);
+        assert_eq!(plan.snapshot_revision, 100);
+        assert_eq!(plan.result_revision, 101);
+        assert_eq!(storage.revision("dev.example.test").unwrap(), 101);
+
+        let exhausted = StorageSnapshot::from_entries_with_revision(
+            "dev.example.test",
+            0,
+            u64::MAX,
+            &BTreeMap::from([("value".into(), b"blocked".to_vec())]),
+        )
+        .unwrap();
+        assert!(matches!(
+            storage.restore("dev.example.test", &exhausted, LIMITS),
+            Err(Error::RevisionOverflow)
+        ));
+        assert_eq!(
+            storage.get("dev.example.test", "value").unwrap(),
+            Some(b"imported".to_vec())
+        );
+        assert_eq!(storage.revision("dev.example.test").unwrap(), 101);
+    }
+
+    #[test]
     fn conditional_restore_rejects_an_intervening_commit_after_an_aba_change() {
         let directory = TestDirectory::new();
         let storage = DirectoryStorage::open(directory.path()).unwrap();
@@ -1046,14 +1300,15 @@ mod tests {
         storage
             .restore("dev.example.test", expected.snapshot(), LIMITS)
             .unwrap();
-        assert!(
+        assert!(matches!(
             storage
                 .export_snapshot("dev.example.test")
                 .unwrap()
                 .compare(expected.snapshot())
                 .unwrap()
-                .identical
-        );
+                .difference,
+            Some(SnapshotDifference::Revision { .. })
+        ));
 
         assert!(matches!(
             storage.restore_if_unchanged("dev.example.test", &expected, &replacement, LIMITS),
@@ -1096,12 +1351,13 @@ mod tests {
         assert!(plan.changed());
         assert_eq!(plan.current_schema, 0);
         assert_eq!(plan.snapshot_schema, 1);
+        assert_eq!(plan.result_revision, 3);
         assert_eq!(
             storage.get("dev.example.test", "value").unwrap(),
             Some(b"migrated".to_vec())
         );
         let namespace = storage.namespace_directory("dev.example.test");
-        assert_eq!(state_files(&namespace).unwrap().last().unwrap().0, 2);
+        assert_eq!(state_files(&namespace).unwrap().last().unwrap().0, 3);
     }
 
     #[test]
@@ -1126,26 +1382,27 @@ mod tests {
             .put("dev.example.test", "later", b"change", LIMITS)
             .unwrap();
 
-        let evidence = storage.evidence("dev.example.test", 2).unwrap();
+        let evidence = storage.evidence("dev.example.test", 3).unwrap();
 
-        assert_eq!(evidence.current().generation(), 3);
-        assert_eq!(evidence.requested().unwrap().generation(), 2);
-        assert!(
+        assert_eq!(evidence.current().generation(), 4);
+        assert_eq!(evidence.requested().unwrap().generation(), 3);
+        assert!(matches!(
             evidence
                 .requested()
                 .unwrap()
                 .snapshot()
                 .compare(&replacement)
                 .unwrap()
-                .identical
-        );
+                .difference,
+            Some(SnapshotDifference::Revision { left: 3, right: 2 })
+        ));
 
         storage
             .put("dev.example.test", "newest", b"change", LIMITS)
             .unwrap();
         assert!(
             storage
-                .evidence("dev.example.test", 2)
+                .evidence("dev.example.test", 3)
                 .unwrap()
                 .requested()
                 .is_none()

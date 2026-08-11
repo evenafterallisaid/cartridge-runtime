@@ -44,5 +44,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

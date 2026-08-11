@@ -1215,6 +1215,7 @@ fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Resul
                 "cartridge_id": archive.manifest.cartridge.id,
                 "state_dir": storage.root(),
                 "state_schema": summary.state_schema,
+                "state_revision": summary.state_revision,
                 "usage": {
                     "bytes": summary.bytes,
                     "keys": summary.entries,
@@ -1225,6 +1226,7 @@ fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Resul
         println!("{}", archive.manifest.cartridge.id);
         println!("state directory: {}", storage.root().display());
         println!("state schema: {}", summary.state_schema);
+        println!("state revision: {}", summary.state_revision);
         println!("keys: {}", summary.entries);
         println!("bytes: {}", summary.bytes);
     }
@@ -1276,6 +1278,7 @@ fn storage_inspect_command(path: &Path, json: bool) -> Result<()> {
         println!("{}", summary.cartridge_id);
         println!("snapshot format: {}", summary.format_version);
         println!("state schema: {}", summary.state_schema);
+        println!("state revision: {}", summary.state_revision);
         println!("entries: {}", summary.entries);
         println!("bytes: {}", summary.bytes);
         println!("payload sha256: {}", summary.payload_sha256);
@@ -1302,6 +1305,11 @@ fn storage_diff_command(left: &Path, right: &Path, json: bool) -> Result<()> {
             }
             SnapshotDifference::Schema { left, right } => {
                 println!("state schema differs");
+                println!("  left:  {left}");
+                println!("  right: {right}");
+            }
+            SnapshotDifference::Revision { left, right } => {
+                println!("state revision differs");
                 println!("  left:  {left}");
                 println!("  right: {right}");
             }
@@ -1476,12 +1484,15 @@ fn storage_migrate_commit_command(
             report.plan.target_schema
         );
     }
-    let summary = report.snapshot.summary()?;
+    let migration_summary = report.snapshot.summary()?;
     let source_summary = source.snapshot().summary()?;
     let target_generation = source
         .generation()
+        .max(migration_summary.state_revision)
         .checked_add(1)
         .context("durable generation overflowed")?;
+    let committed_snapshot = report.snapshot.with_state_revision(target_generation)?;
+    let summary = committed_snapshot.summary()?;
     let receipt = MigrationReceipt::new(MigrationReceiptPayload {
         format_version: 0,
         cartridge_id: cartridge_id.clone(),
@@ -1489,6 +1500,7 @@ fn storage_migrate_commit_command(
         component_sha256: report.plan.component_sha256.to_ascii_lowercase(),
         source_generation: source.generation(),
         target_generation,
+        migration_revision: migration_summary.state_revision,
         source_schema: report.plan.source_schema,
         target_schema: report.plan.target_schema,
         source_snapshot_sha256: source_summary.payload_sha256,
@@ -1611,17 +1623,25 @@ fn storage_migration_recover_command(
     let evidence = storage.evidence(&payload.cartridge_id, payload.target_generation)?;
     let current = evidence.current();
     let current_summary = current.snapshot().summary()?;
+    let snapshot_format = if payload.format_version == 1 {
+        2
+    } else {
+        current_summary.format_version
+    };
     let target_matches = evidence.requested().is_some_and(|captured| {
         captured.generation() == payload.target_generation
             && captured.snapshot().state_schema() == payload.target_schema
             && captured
                 .snapshot()
-                .summary()
-                .is_ok_and(|summary| summary.payload_sha256 == payload.target_snapshot_sha256)
+                .payload_sha256_for_format(snapshot_format)
+                .is_ok_and(|digest| digest == payload.target_snapshot_sha256)
     });
     let source_matches = current.generation() == payload.source_generation
         && current_summary.state_schema == payload.source_schema
-        && current_summary.payload_sha256 == payload.source_snapshot_sha256;
+        && current
+            .snapshot()
+            .payload_sha256_for_format(snapshot_format)?
+            == payload.source_snapshot_sha256;
     let status = if target_matches && current.generation() == payload.target_generation {
         MigrationRecoveryStatus::Committed
     } else if target_matches {

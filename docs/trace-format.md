@@ -22,7 +22,7 @@ A trace is an executable record of one cartridge invocation. It identifies the e
 
 Each event receives a zero-based sequence number. An event contains a capability name, an operation name, and the value observable by the guest. Clock and random values are stored in full because replay must return the same inputs without consulting the live host.
 
-Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so ordinary replay does not consult live state; writes and deletes record their inputs and result without being applied to live storage.
+Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so ordinary replay does not consult live state; writes and deletes record their inputs and result without being applied to live storage. Atomic storage events bind revisions and request identities, and stateful capsule replay applies them only to its disposable snapshot branch before comparing the final revision-bearing snapshot digest.
 
 ## Replay
 

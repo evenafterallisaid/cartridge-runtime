@@ -47,7 +47,7 @@ Writers hold `namespace.lock` across the complete read-modify-write transaction:
 7. Flush directory metadata where the operating system exposes that operation.
 8. Retain the newest two generations.
 
-The active state is the highest valid generation, so no mutable head pointer can disagree with the journal. A crash before the rename leaves only a disposable temporary file. A crash after the rename leaves either the previous generation or the new one as the highest visible commit.
+The active state is the highest valid generation, so no mutable head pointer can disagree with the journal. The same generation number is exposed to the guest only as its namespace revision. Atomic batches write one generation regardless of their operation count. A crash before the rename leaves only a disposable temporary file. A crash after the rename leaves either the previous generation or the new one as the highest visible commit.
 
 ## Corruption and recovery
 

@@ -6,9 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
 pub use cartridge_storage::{
     BlobGcReport, BlobInfo, BlobStore, CapturedState, DirectoryStorage, GenerationEvidence,
-    MAX_BLOB_BYTES, MemoryStorage, RecoveryReport, RestorePlan, SnapshotComparison,
-    SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend, StorageLimits,
-    StorageSnapshot, StorageSnapshotSummary, StorageUsage,
+    MAX_BLOB_BYTES, MAX_TRANSACTION_INPUT_BYTES, MAX_TRANSACTION_OPERATIONS, MemoryStorage,
+    RecoveryReport, RestorePlan, SnapshotComparison, SnapshotDifference, SnapshotEntry,
+    SnapshotStorage, StorageBackend, StorageLimits, StorageMutation, StorageSnapshot,
+    StorageSnapshotSummary, StorageTransactionResult, StorageUsage,
 };
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, MAX_TRACE_BYTES, MAX_TRACE_DOCUMENT_BYTES,

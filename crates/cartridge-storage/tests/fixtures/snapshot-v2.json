@@ -1,0 +1,11 @@
+{
+  "payload": {
+    "format_version": 2,
+    "cartridge_id": "dev.example.test",
+    "state_schema": 1,
+    "entries": {
+      "settings/theme": "6461726b"
+    }
+  },
+  "payload_sha256": "2fe93e0109ac40b913c9e48f113fdac2f3e6e517fc8566865381c40867649955"
+}

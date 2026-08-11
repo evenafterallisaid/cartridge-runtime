@@ -517,6 +517,51 @@ impl cartridge::api::host::Host for HostState {
     fn storage_list(&mut self, prefix: String) -> Result<Vec<String>, String> {
         self.list_storage(&prefix)
     }
+
+    fn storage_revision(&mut self) -> Result<u64, String> {
+        HostState::storage_revision(self)
+    }
+
+    fn storage_compare_exchange(
+        &mut self,
+        revision: u64,
+        key: String,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+    ) -> Result<cartridge::api::host::StorageTransactionResult, String> {
+        self.compare_exchange_storage(revision, &key, expected.as_deref(), replacement.as_deref())
+            .map(|result| cartridge::api::host::StorageTransactionResult {
+                applied: result.applied,
+                revision: result.revision,
+            })
+    }
+
+    fn storage_apply(
+        &mut self,
+        revision: u64,
+        mutations: Vec<cartridge::api::host::StorageMutation>,
+    ) -> Result<cartridge::api::host::StorageTransactionResult, String> {
+        if mutations.len() > cartridge_storage::MAX_TRANSACTION_OPERATIONS {
+            return self
+                .reject_oversized_storage_batch(revision, mutations.len())
+                .map(|result| cartridge::api::host::StorageTransactionResult {
+                    applied: result.applied,
+                    revision: result.revision,
+                });
+        }
+        let mutations: Vec<_> = mutations
+            .into_iter()
+            .map(|mutation| cartridge_storage::StorageMutation {
+                key: mutation.key,
+                value: mutation.value,
+            })
+            .collect();
+        self.apply_storage_batch(revision, &mutations)
+            .map(|result| cartridge::api::host::StorageTransactionResult {
+                applied: result.applied,
+                revision: result.revision,
+            })
+    }
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -853,6 +898,151 @@ mod tests {
         assert_eq!(
             storage.get("dev.example.host", "settings/theme").unwrap(),
             Some(value.to_vec())
+        );
+    }
+
+    #[test]
+    fn atomic_storage_transactions_record_and_replay_state() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let mut recorded = HostState::new(
+            &manifest(permissions.clone()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        let revision = cartridge::api::host::Host::storage_revision(&mut recorded).unwrap();
+        let mutations = vec![
+            cartridge::api::host::StorageMutation {
+                key: "settings/theme".into(),
+                value: Some(b"dark".to_vec()),
+            },
+            cartridge::api::host::StorageMutation {
+                key: "settings/font".into(),
+                value: Some(b"mono".to_vec()),
+            },
+        ];
+        let applied =
+            cartridge::api::host::Host::storage_apply(&mut recorded, revision, mutations.clone())
+                .unwrap();
+        let confirmed = cartridge::api::host::Host::storage_compare_exchange(
+            &mut recorded,
+            applied.revision,
+            "settings/theme".into(),
+            Some(b"dark".to_vec()),
+            Some(b"dark".to_vec()),
+        )
+        .unwrap();
+        assert!(applied.applied);
+        assert!(confirmed.applied);
+
+        let storage = Arc::new(MemoryStorage::new());
+        let mut replayed = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            storage.clone(),
+            Some(recorded.events.clone()),
+        )
+        .apply_replay_storage();
+        assert_eq!(
+            cartridge::api::host::Host::storage_revision(&mut replayed).unwrap(),
+            revision
+        );
+        let replayed_apply =
+            cartridge::api::host::Host::storage_apply(&mut replayed, revision, mutations).unwrap();
+        assert_eq!(replayed_apply.applied, applied.applied);
+        assert_eq!(replayed_apply.revision, applied.revision);
+        let replayed_compare = cartridge::api::host::Host::storage_compare_exchange(
+            &mut replayed,
+            applied.revision,
+            "settings/theme".into(),
+            Some(b"dark".to_vec()),
+            Some(b"dark".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(replayed_compare.applied, confirmed.applied);
+        assert_eq!(replayed_compare.revision, confirmed.revision);
+        replayed.finish_replay().unwrap();
+        assert_eq!(
+            storage.get("dev.example.host", "settings/theme").unwrap(),
+            Some(b"dark".to_vec())
+        );
+        assert_eq!(
+            storage.revision("dev.example.host").unwrap(),
+            applied.revision
+        );
+    }
+
+    #[test]
+    fn malformed_transaction_outcomes_cannot_mutate_replay_state() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let mutations = vec![cartridge::api::host::StorageMutation {
+            key: "settings/theme".into(),
+            value: Some(b"dark".to_vec()),
+        }];
+        let mut recorded = HostState::new(
+            &manifest(permissions.clone()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        cartridge::api::host::Host::storage_apply(&mut recorded, 0, mutations.clone()).unwrap();
+        recorded.events[0]
+            .outcome
+            .as_object_mut()
+            .unwrap()
+            .remove("result_revision");
+
+        let storage = Arc::new(MemoryStorage::new());
+        let mut replayed = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            storage.clone(),
+            Some(recorded.events),
+        )
+        .apply_replay_storage();
+        assert!(cartridge::api::host::Host::storage_apply(&mut replayed, 0, mutations).is_err());
+        assert!(matches!(
+            replayed.finish_replay(),
+            Err(ReplayError::Divergence { .. })
+        ));
+        assert!(storage.list("dev.example.host", "").unwrap().is_empty());
+        assert_eq!(storage.revision("dev.example.host").unwrap(), 0);
+    }
+
+    #[test]
+    fn oversized_wit_batches_are_rejected_before_translation() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        let mutations = vec![
+            cartridge::api::host::StorageMutation {
+                key: "key".into(),
+                value: None,
+            };
+            cartridge_storage::MAX_TRANSACTION_OPERATIONS + 1
+        ];
+
+        assert!(cartridge::api::host::Host::storage_apply(&mut state, 0, mutations).is_err());
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].outcome.get("request"),
+            Some(&json!({
+                "operations": cartridge_storage::MAX_TRANSACTION_OPERATIONS + 1,
+                "oversized": true,
+            }))
         );
     }
 

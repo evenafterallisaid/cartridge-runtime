@@ -140,8 +140,9 @@ Delivery slices:
    - [implemented] safe-by-default explicit-retain garbage collection
    - derive reachability from snapshots and capsules
    - add guest-visible blob references after reachability and quota semantics are fixed
+10. [implemented] ABA-safe namespace revisions, compare-exchange, and bounded atomic guest batches across memory, snapshot, and durable backends.
 
-The first eight slices and the host-side foundation of slice nine are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
+The first eight slices, the host-side foundation of slice nine, and slice ten are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata while preserving the monotonic revision clock. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source and isolated migration revision to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
 
 Migration design constraints:
 
@@ -163,7 +164,7 @@ Later snapshot work includes selective exports, encrypted envelopes, signed back
 
 These directions fit the existing architecture, but their order follows the maturity of the standards they build on:
 
-- **Atomic state transactions.** Add compare-and-swap and bounded batch operations before exposing multi-key migrations to guests. The WASI key/value proposal already separates single-key, atomic, batch, and watch interfaces, which gives Cartridge a useful compatibility target without forcing one backend model.
+- **Atomic state transactions.** [implemented] Namespace-wide revision tokens, compare-exchange, bounded batches, portable revision snapshots, trace replay, and one-generation durable commits now form the synchronous foundation. Future work can map these semantics onto the WASI key/value atomic and batch interfaces without weakening the current ABA guarantees.
 - **Reactive state watch streams.** Allow a cartridge to subscribe to changes it has authority to observe, with coalescing, bounded queues, and trace events. This belongs after async host calls and composition supervision so a slow consumer cannot stall storage commits.
 - **Streaming content-addressed blobs.** Store large values as deduplicated chunks addressed by digest, keep small references in key/value state, and trace digests rather than payloads. The guest API should use component-model streams instead of buffering complete objects into linear memory.
 - **State-and-trace capsules.** Bind a source snapshot, execution trace, package digest, and result snapshot into one inspectable crash or test artifact. Snapshot branches make the first version possible without memory checkpointing.
@@ -773,7 +774,7 @@ The next concrete sequence is:
    - derive live blob reachability from snapshots and capsules
    - make collection consume verified reachability manifests instead of hand-written retain lists
    - define blob-reference quota, lifecycle, and replay rules before adding the guest ABI
-3. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
+3. [implemented] Generalize migration's conditional commit into guest-facing compare-exchange and bounded atomic batches, with trace events and ABA-safe portable revision tokens.
 4. [implemented] Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
 5. Create a minimal 2D window and input prototype behind new WIT packages.
 6. Build a small trace and capsule viewer after there is enough real trace data to design around.
@@ -796,8 +797,9 @@ Completed foundations:
 - state-reproducing capsule replay on disposable snapshot branches
 - privacy-safe non-replayable trace summary and metadata exports
 - content-addressed blob storage with bounded streaming I/O and safe-by-default garbage collection
+- ABA-safe compare-exchange and bounded atomic state batches across all storage backends
 - Merkle-style package asset roots and selective payload verification
-- seeded archive, manifest, snapshot, and trace fuzz targets with scheduled bounded runs
+- seeded archive, manifest, snapshot, trace, and atomic-transaction fuzz targets with scheduled bounded runs
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals

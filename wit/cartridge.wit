@@ -1,4 +1,4 @@
-package cartridge:api@0.1.0;
+package cartridge:api@0.2.0;
 
 interface host {
     enum log-level {
@@ -6,6 +6,16 @@ interface host {
         info,
         warn,
         error,
+    }
+
+    record storage-mutation {
+        key: string,
+        value: option<list<u8>>,
+    }
+
+    record storage-transaction-result {
+        applied: bool,
+        revision: u64,
     }
 
     log: func(level: log-level, message: string);
@@ -16,6 +26,9 @@ interface host {
     storage-put: func(key: string, value: list<u8>) -> result<_, string>;
     storage-delete: func(key: string) -> result<bool, string>;
     storage-list: func(prefix: string) -> result<list<string>, string>;
+    storage-revision: func() -> result<u64, string>;
+    storage-compare-exchange: func(revision: u64, key: string, expected: option<list<u8>>, replacement: option<list<u8>>) -> result<storage-transaction-result, string>;
+    storage-apply: func(revision: u64, mutations: list<storage-mutation>) -> result<storage-transaction-result, string>;
 }
 world cartridge {
     import host;

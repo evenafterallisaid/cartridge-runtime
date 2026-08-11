@@ -1,16 +1,17 @@
-# Migration receipt format v1
+# Migration receipt format v2
 
 A migration receipt is an immutable intent record written after every isolated migration step succeeds and before the durable compare-and-swap commit begins. Its suggested suffix is `.cartridge-migration.json`.
 
 ```json
 {
   "payload": {
-    "format_version": 1,
+    "format_version": 2,
     "cartridge_id": "dev.example.app",
     "package_version": "2.0.0",
     "component_sha256": "...",
     "source_generation": 12,
-    "target_generation": 13,
+    "target_generation": 17,
+    "migration_revision": 16,
     "source_schema": 2,
     "target_schema": 3,
     "source_snapshot_sha256": "...",
@@ -20,7 +21,7 @@ A migration receipt is an immutable intent record written after every isolated m
 }
 ```
 
-The target generation must be exactly one greater than the source, matching the storage backend's one-generation migration commit. Schemas must increase. All digests use 64 lowercase hexadecimal characters. `payload_sha256` covers the compact JSON serialization of `payload`; unknown fields, invalid identities, generation gaps, non-increasing schemas, oversized documents, and digest mismatches are rejected.
+The target generation is one greater than the larger of the source generation and isolated migration revision. This keeps the durable ABA clock ahead of every branch revision while still producing exactly one journal commit. Schemas must increase. All digests use 64 lowercase hexadecimal characters. `payload_sha256` covers the compact JSON serialization of `payload`; unknown fields, invalid identities, impossible revision evidence, non-increasing schemas, oversized documents, and digest mismatches are rejected. Version 1 receipts remain readable and use their original adjacent-generation rule.
 
 ## Write ordering
 

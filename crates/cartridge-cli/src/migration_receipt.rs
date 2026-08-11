@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const RECEIPT_FORMAT_VERSION: u32 = 1;
+const RECEIPT_FORMAT_VERSION: u32 = 2;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 
 static RECEIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +30,8 @@ pub struct MigrationReceiptPayload {
     pub component_sha256: String,
     pub source_generation: u64,
     pub target_generation: u64,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub migration_revision: u64,
     pub source_schema: u32,
     pub target_schema: u32,
     pub source_snapshot_sha256: String,
@@ -103,9 +105,9 @@ impl MigrationReceipt {
 
     pub fn validate(&self) -> Result<()> {
         let payload = &self.payload;
-        if payload.format_version != RECEIPT_FORMAT_VERSION {
+        if !matches!(payload.format_version, 1 | RECEIPT_FORMAT_VERSION) {
             bail!(
-                "unsupported migration receipt format {}; expected {RECEIPT_FORMAT_VERSION}",
+                "unsupported migration receipt format {}; expected 1 or {RECEIPT_FORMAT_VERSION}",
                 payload.format_version
             );
         }
@@ -130,13 +132,18 @@ impl MigrationReceipt {
                 bail!("migration receipt has an invalid {name} digest");
             }
         }
-        if payload.target_generation
-            != payload
-                .source_generation
-                .checked_add(1)
-                .context("migration receipt generation overflowed")?
-        {
-            bail!("migration receipt target generation must follow its source generation");
+        let expected_generation = if payload.format_version == 1 {
+            if payload.migration_revision != 0 {
+                bail!("migration receipt format 1 cannot declare a migration revision");
+            }
+            payload.source_generation
+        } else {
+            payload.source_generation.max(payload.migration_revision)
+        }
+        .checked_add(1)
+        .context("migration receipt generation overflowed")?;
+        if payload.target_generation != expected_generation {
+            bail!("migration receipt target generation does not follow its revision evidence");
         }
         if payload.source_schema >= payload.target_schema {
             bail!("migration receipt must describe an increasing schema transition");
@@ -175,6 +182,10 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 fn temporary_path(directory: &Path) -> PathBuf {
@@ -219,7 +230,8 @@ mod tests {
             package_version: "1.2.0".into(),
             component_sha256: "a".repeat(64),
             source_generation: 7,
-            target_generation: 8,
+            target_generation: 10,
+            migration_revision: 9,
             source_schema: 1,
             target_schema: 3,
             source_snapshot_sha256: "b".repeat(64),
@@ -234,8 +246,35 @@ mod tests {
         let decoded = MigrationReceipt::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
 
         assert_eq!(decoded.payload().source_generation, 7);
-        assert_eq!(decoded.payload().target_generation, 8);
+        assert_eq!(decoded.payload().target_generation, 10);
         assert_eq!(decoded.payload_sha256(), receipt.payload_sha256());
+    }
+
+    #[test]
+    fn format_one_receipts_remain_compatible() {
+        let payload = MigrationReceiptPayload {
+            format_version: 1,
+            cartridge_id: "dev.example.migration".into(),
+            package_version: "1.1.0".into(),
+            component_sha256: "a".repeat(64),
+            source_generation: 7,
+            target_generation: 8,
+            migration_revision: 0,
+            source_schema: 1,
+            target_schema: 2,
+            source_snapshot_sha256: "b".repeat(64),
+            target_snapshot_sha256: "c".repeat(64),
+        };
+        let legacy = MigrationReceipt {
+            payload_sha256: payload_digest(&payload).unwrap(),
+            payload,
+        };
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+
+        let decoded = MigrationReceipt::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.payload().format_version, 1);
+        assert_eq!(decoded.payload().migration_revision, 0);
     }
 
     #[test]
@@ -249,7 +288,7 @@ mod tests {
     #[test]
     fn receipts_reject_generation_gaps() {
         let mut payload = receipt().payload().clone();
-        payload.target_generation = 10;
+        payload.target_generation = 11;
 
         assert!(MigrationReceipt::new(payload).is_err());
     }

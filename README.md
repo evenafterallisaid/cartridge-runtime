@@ -14,7 +14,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
 - Deterministic trace recording, replay, and first-divergence detection
 - Standalone trace validation, summaries, diffing, and privacy-safe redacted exports
-- Namespaced key/value storage with atomic quota checks and deterministic replay
+- Namespaced key/value storage with ABA-safe revisions, atomic batches, compare-exchange, and deterministic replay
 - Checksummed durable storage with process locking and generation recovery
 - Portable storage snapshots with inspection, diffing, dry runs, and transactional restore
 - Isolated snapshot branches for speculative runs, migration testing, and debugging
