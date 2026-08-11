@@ -11,6 +11,8 @@ cartridge capsule create app.cartridge \
 
 cartridge capsule inspect run.cartridge-capsule.json
 cartridge capsule verify run.cartridge-capsule.json
+cartridge capsule diff run.cartridge-capsule.json other.cartridge-capsule.json
+cartridge capsule replay run.cartridge-capsule.json
 ```
 
 The manifest records:
@@ -39,4 +41,12 @@ Verification performs two layers of checks:
 
 Artifacts are digested again after semantic parsing, narrowing concurrent replacement races to changes made after verification returns. Creation runs the same complete verifier before reporting success. Inputs and manifest decoding are bounded before allocation, and capsule output uses create-new private-file semantics plus a flushed directory entry.
 
-The v1 manifest proves artifact integrity and internal consistency, not that the result snapshot was produced by the trace. Cross-platform capsule replay and first-divergence comparison are the next slice. Like snapshots and receipts, unkeyed hashes do not provide author authenticity; package signing remains a separate security milestone.
+The v1 manifest proves artifact integrity and internal consistency, not by itself that the result snapshot was produced by the trace. Like snapshots and receipts, unkeyed hashes do not provide author authenticity; package signing remains a separate security milestone.
+
+## Difference and replay
+
+`capsule diff` reports the first difference in a stable order: package identity, runtime and invocation, raw package, source state, trace, then result state. It compares semantic metadata and content digests rather than artifact filenames, so an unchanged capsule tree can be relocated without becoming different. Values, arguments, output text, and trace events are not printed.
+
+`capsule replay` first verifies every bound artifact in the parent, launches a deadline-supervised helper, verifies the capsule again in that worker, and replays the recorded invocation through the current runtime. The worker executes an already-loaded package and trace rather than reopening them after verification, then re-verifies the complete capsule before reporting success. Replay must consume the complete ordered trace and reproduce its output and fuel result. Storage writes remain side-effect-free during replay, so the command verifies the bound result snapshot as an artifact but labels it `artifact-verified-not-recomputed`. Applying recorded writes to a disposable snapshot branch and independently reproducing the result-state digest is the next replay slice.
+
+Cross-platform replay can already detect runtime, component, invocation, event, output, or fuel divergence. It does not claim result-state reproduction until replay branches can apply validated storage effects without touching live state.

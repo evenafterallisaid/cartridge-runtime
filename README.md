@@ -62,6 +62,8 @@ cargo run -p cartridge-cli -- storage migrate-commit app.cartridge --state-dir d
 cargo run -p cartridge-cli -- storage migration-recover app.cartridge migration-receipt.json --state-dir dist/state
 cargo run -p cartridge-cli -- capsule create dist/hello.cartridge --source before.cartridge-state.json --trace run.trace.json --result after.cartridge-state.json --output run.cartridge-capsule.json
 cargo run -p cartridge-cli -- capsule verify run.cartridge-capsule.json
+cargo run -p cartridge-cli -- capsule diff run.cartridge-capsule.json other.cartridge-capsule.json
+cargo run -p cartridge-cli -- capsule replay run.cartridge-capsule.json
 cargo run -p cartridge-cli -- run dist/hello.cartridge --from-snapshot backup.cartridge-state.json --snapshot-output branch.cartridge-state.json -- Test
 cargo run -p cartridge-cli -- storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
 cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json

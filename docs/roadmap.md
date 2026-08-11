@@ -760,8 +760,9 @@ The next concrete sequence is:
 1. Build reproducible state-and-trace capsules:
    - [implemented] bind package/component identity, arguments, source snapshot, trace, result snapshot, and runtime version in one canonical manifest
    - [implemented] add bounded create, inspect, and verify commands without embedding private state values by default
-   - add capsule-to-capsule first-divergence reporting across identity, invocation, source, trace, and result state
-   - replay a capsule on another supported platform and compare output, ordered events, and result-state digest
+   - [implemented] add capsule-to-capsule first-divergence reporting across identity, invocation, source, trace, and result state
+   - [implemented] replay a fully reverified capsule in a deadline-supervised worker and compare runtime, invocation, ordered events, output, and fuel
+   - apply validated replay writes to a disposable source branch and independently reproduce the result-state digest
    - minimize failing capsules while preserving the first divergence
 2. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
 3. Add content-addressed blobs, streaming access, reachability-based garbage collection, and snapshot references for larger state.

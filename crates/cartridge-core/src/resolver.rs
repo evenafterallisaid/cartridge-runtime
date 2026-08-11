@@ -56,7 +56,7 @@ pub fn resolve_dependencies(
     let mut unavailable_optional = Vec::new();
     for dependency in &root.dependencies {
         let requirement = VersionReq::parse(&dependency.version)
-            .expect("validated dependency version requirement");
+            .map_err(|error| ResolveError::InvalidManifest(error.to_string()))?;
         let mut matching: Vec<_> = candidates
             .iter()
             .filter(|candidate| candidate.cartridge.id == dependency.cartridge)

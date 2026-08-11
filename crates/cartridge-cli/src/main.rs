@@ -113,6 +113,12 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    #[command(name = "__worker-capsule-replay", hide = true)]
+    WorkerCapsuleReplay {
+        capsule: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(name = "__worker-migrate", hide = true)]
     WorkerMigrate {
         package: PathBuf,
@@ -192,6 +198,19 @@ enum CapsuleCommand {
     },
     /// verify every referenced artifact and semantic binding
     Verify {
+        capsule: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// find the first semantic difference between two capsules
+    Diff {
+        left: PathBuf,
+        right: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// replay a capsule's recorded invocation in a supervised worker
+    Replay {
         capsule: PathBuf,
         #[arg(long)]
         json: bool,
@@ -368,6 +387,10 @@ fn run_cli() -> Result<()> {
             require_worker_context()?;
             replay_command(&package, &trace, &args)
         }
+        Command::WorkerCapsuleReplay { capsule, json } => {
+            require_worker_context()?;
+            capsule_replay_command(&capsule, json)
+        }
         Command::WorkerMigrate {
             package,
             snapshot,
@@ -440,7 +463,88 @@ fn run_capsule_command(command: CapsuleCommand) -> Result<()> {
             }
             Ok(())
         }
+        CapsuleCommand::Diff { left, right, json } => {
+            let comparison = capsule::compare(&left, &right)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&comparison)?);
+            } else if comparison.identical {
+                println!("capsules are semantically identical");
+            } else if let Some(capsule::CapsuleDifference::Field { field, left, right }) =
+                comparison.difference
+            {
+                println!("first capsule difference at {field}");
+                println!("  left:  {}", serde_json::to_string(&left)?);
+                println!("  right: {}", serde_json::to_string(&right)?);
+            }
+            Ok(())
+        }
+        CapsuleCommand::Replay { capsule, json } => {
+            supervised_capsule_replay_command(&capsule, json)
+        }
     }
+}
+
+fn supervised_capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
+    let inputs = capsule::replay_inputs(capsule_path)?;
+    let mut worker_args = vec![
+        OsString::from("__worker-capsule-replay"),
+        capsule_path.as_os_str().to_owned(),
+    ];
+    if json {
+        worker_args.push(OsString::from("--json"));
+    }
+    supervise_worker(&inputs.package_path, &worker_args, None)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CapsuleReplayReport {
+    replayed: bool,
+    cartridge_id: String,
+    cartridge_version: String,
+    runtime_version: String,
+    argument_count: usize,
+    event_count: usize,
+    output_sha256: String,
+    fuel_consumed: u64,
+    result_snapshot_sha256: String,
+    result_state_evidence: &'static str,
+}
+
+fn capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
+    let inputs = capsule::replay_inputs(capsule_path)?;
+    let expected_capsule_sha256 = inputs.summary.capsule_sha256.clone();
+    let event_count = inputs.trace.events.len();
+    let report = Runtime::new()?.replay(inputs.package, &inputs.arguments, inputs.trace)?;
+    let final_verification = capsule::verify(capsule_path)?;
+    if final_verification.capsule.capsule_sha256 != expected_capsule_sha256 {
+        bail!("capsule changed during replay");
+    }
+    let replay = CapsuleReplayReport {
+        replayed: true,
+        cartridge_id: inputs.summary.cartridge_id,
+        cartridge_version: inputs.summary.cartridge_version,
+        runtime_version: inputs.summary.runtime_version,
+        argument_count: inputs.arguments.len(),
+        event_count,
+        output_sha256: inputs.summary.trace_output_sha256,
+        fuel_consumed: report.fuel_consumed,
+        result_snapshot_sha256: inputs.summary.result_snapshot_sha256,
+        result_state_evidence: "artifact-verified-not-recomputed",
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&replay)?);
+    } else {
+        println!("replayed capsule {}", capsule_path.display());
+        println!("{} {}", replay.cartridge_id, replay.cartridge_version);
+        println!("runtime: {}", replay.runtime_version);
+        println!("arguments: {}", replay.argument_count);
+        println!("events: {}", replay.event_count);
+        println!("output sha256: {}", replay.output_sha256);
+        println!("fuel consumed: {}", replay.fuel_consumed);
+        println!("result snapshot sha256: {}", replay.result_snapshot_sha256);
+        println!("result state: artifact verified; replay does not apply writes");
+    }
+    Ok(())
 }
 
 fn print_capsule_summary(summary: &capsule::CapsuleSummary) {

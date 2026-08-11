@@ -10,6 +10,7 @@ use cartridge_core::CartridgeArchive;
 use cartridge_runtime::StorageSnapshot;
 use cartridge_trace::{ExecutionTrace, MAX_TRACE_DOCUMENT_BYTES};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const CAPSULE_FORMAT_VERSION: u32 = 1;
@@ -114,6 +115,32 @@ pub struct CapsuleVerification {
     pub result_snapshot_path: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CapsuleComparison {
+    pub identical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difference: Option<CapsuleDifference>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CapsuleDifference {
+    Field {
+        field: String,
+        left: Value,
+        right: Value,
+    },
+}
+
+#[derive(Debug)]
+pub struct CapsuleReplayInputs {
+    pub package_path: PathBuf,
+    pub package: CartridgeArchive,
+    pub trace: ExecutionTrace,
+    pub arguments: Vec<String>,
+    pub summary: CapsuleSummary,
+}
+
 pub fn create(
     package_path: &Path,
     source_path: &Path,
@@ -198,6 +225,12 @@ pub fn inspect(path: &Path) -> Result<CapsuleSummary> {
     Ok(Capsule::read(path)?.summary())
 }
 
+pub fn compare(left: &Path, right: &Path) -> Result<CapsuleComparison> {
+    let left = Capsule::read(left)?;
+    let right = Capsule::read(right)?;
+    Ok(compare_capsules(&left, &right))
+}
+
 pub fn verify(path: &Path) -> Result<CapsuleVerification> {
     let capsule = Capsule::read(path)?;
     let directory = path
@@ -244,6 +277,46 @@ pub fn verify(path: &Path) -> Result<CapsuleVerification> {
         source_snapshot_path: payload.source_snapshot.artifact.path.clone(),
         trace_path: payload.trace.artifact.path.clone(),
         result_snapshot_path: payload.result_snapshot.artifact.path.clone(),
+    })
+}
+
+pub fn replay_inputs(path: &Path) -> Result<CapsuleReplayInputs> {
+    let initial = verify(path)?;
+    let expected_capsule_sha256 = initial.capsule.capsule_sha256.clone();
+    let capsule = Capsule::read(path)?;
+    if capsule.payload_sha256 != expected_capsule_sha256 {
+        bail!("capsule changed while replay inputs were being loaded");
+    }
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = fs::canonicalize(directory)?;
+    let package_path = verify_artifact(&root, &capsule.payload.package, MAX_PACKAGE_FILE_BYTES)?;
+    let package = CartridgeArchive::open(&package_path)?;
+    verify_artifact(&root, &capsule.payload.package, MAX_PACKAGE_FILE_BYTES)?;
+    let trace_path = verify_artifact(
+        &root,
+        &capsule.payload.trace.artifact,
+        MAX_TRACE_DOCUMENT_BYTES,
+    )?;
+    let trace = read_trace(&trace_path)?;
+    verify_artifact(
+        &root,
+        &capsule.payload.trace.artifact,
+        MAX_TRACE_DOCUMENT_BYTES,
+    )?;
+    let final_verification = verify(path)?;
+    if final_verification.capsule.capsule_sha256 != expected_capsule_sha256 {
+        bail!("capsule changed while replay inputs were being loaded");
+    }
+    let arguments = trace.args.clone();
+    Ok(CapsuleReplayInputs {
+        package_path,
+        package,
+        trace,
+        arguments,
+        summary: capsule.summary(),
     })
 }
 
@@ -373,6 +446,203 @@ impl Capsule {
             capsule_sha256: self.payload_sha256.clone(),
         }
     }
+}
+
+fn compare_capsules(left: &Capsule, right: &Capsule) -> CapsuleComparison {
+    let left = &left.payload;
+    let right = &right.payload;
+    let difference = compare_identity(left, right)
+        .or_else(|| compare_package(left, right))
+        .or_else(|| compare_source(left, right))
+        .or_else(|| compare_trace(left, right))
+        .or_else(|| compare_result(left, right));
+    CapsuleComparison {
+        identical: difference.is_none(),
+        difference,
+    }
+}
+
+fn first_difference<const N: usize>(
+    fields: [(&str, Value, Value); N],
+) -> Option<CapsuleDifference> {
+    fields
+        .into_iter()
+        .find(|(_, left, right)| left != right)
+        .map(|(field, left, right)| CapsuleDifference::Field {
+            field: field.into(),
+            left,
+            right,
+        })
+}
+
+fn compare_identity(left: &CapsulePayload, right: &CapsulePayload) -> Option<CapsuleDifference> {
+    first_difference([
+        (
+            "format_version",
+            serde_json::json!(left.format_version),
+            serde_json::json!(right.format_version),
+        ),
+        (
+            "cartridge_id",
+            serde_json::json!(left.cartridge_id),
+            serde_json::json!(right.cartridge_id),
+        ),
+        (
+            "cartridge_version",
+            serde_json::json!(left.cartridge_version),
+            serde_json::json!(right.cartridge_version),
+        ),
+        (
+            "component_sha256",
+            serde_json::json!(left.component_sha256),
+            serde_json::json!(right.component_sha256),
+        ),
+        (
+            "runtime_version",
+            serde_json::json!(left.runtime_version),
+            serde_json::json!(right.runtime_version),
+        ),
+        (
+            "argument_count",
+            serde_json::json!(left.argument_count),
+            serde_json::json!(right.argument_count),
+        ),
+        (
+            "argument_bytes",
+            serde_json::json!(left.argument_bytes),
+            serde_json::json!(right.argument_bytes),
+        ),
+        (
+            "arguments_sha256",
+            serde_json::json!(left.arguments_sha256),
+            serde_json::json!(right.arguments_sha256),
+        ),
+    ])
+}
+
+fn compare_package(left: &CapsulePayload, right: &CapsulePayload) -> Option<CapsuleDifference> {
+    first_difference([
+        (
+            "package.bytes",
+            serde_json::json!(left.package.bytes),
+            serde_json::json!(right.package.bytes),
+        ),
+        (
+            "package.sha256",
+            serde_json::json!(left.package.sha256),
+            serde_json::json!(right.package.sha256),
+        ),
+    ])
+}
+
+fn compare_source(left: &CapsulePayload, right: &CapsulePayload) -> Option<CapsuleDifference> {
+    first_difference([
+        (
+            "source.state_schema",
+            serde_json::json!(left.source_snapshot.state_schema),
+            serde_json::json!(right.source_snapshot.state_schema),
+        ),
+        (
+            "source.entries",
+            serde_json::json!(left.source_snapshot.entries),
+            serde_json::json!(right.source_snapshot.entries),
+        ),
+        (
+            "source.bytes",
+            serde_json::json!(left.source_snapshot.bytes),
+            serde_json::json!(right.source_snapshot.bytes),
+        ),
+        (
+            "source.payload_sha256",
+            serde_json::json!(left.source_snapshot.payload_sha256),
+            serde_json::json!(right.source_snapshot.payload_sha256),
+        ),
+        (
+            "source.file_bytes",
+            serde_json::json!(left.source_snapshot.artifact.bytes),
+            serde_json::json!(right.source_snapshot.artifact.bytes),
+        ),
+        (
+            "source.file_sha256",
+            serde_json::json!(left.source_snapshot.artifact.sha256),
+            serde_json::json!(right.source_snapshot.artifact.sha256),
+        ),
+    ])
+}
+
+fn compare_trace(left: &CapsulePayload, right: &CapsulePayload) -> Option<CapsuleDifference> {
+    first_difference([
+        (
+            "trace.format_version",
+            serde_json::json!(left.trace.format_version),
+            serde_json::json!(right.trace.format_version),
+        ),
+        (
+            "trace.event_count",
+            serde_json::json!(left.trace.event_count),
+            serde_json::json!(right.trace.event_count),
+        ),
+        (
+            "trace.output_bytes",
+            serde_json::json!(left.trace.output_bytes),
+            serde_json::json!(right.trace.output_bytes),
+        ),
+        (
+            "trace.output_sha256",
+            serde_json::json!(left.trace.output_sha256),
+            serde_json::json!(right.trace.output_sha256),
+        ),
+        (
+            "trace.fuel_consumed",
+            serde_json::json!(left.trace.fuel_consumed),
+            serde_json::json!(right.trace.fuel_consumed),
+        ),
+        (
+            "trace.file_bytes",
+            serde_json::json!(left.trace.artifact.bytes),
+            serde_json::json!(right.trace.artifact.bytes),
+        ),
+        (
+            "trace.file_sha256",
+            serde_json::json!(left.trace.artifact.sha256),
+            serde_json::json!(right.trace.artifact.sha256),
+        ),
+    ])
+}
+
+fn compare_result(left: &CapsulePayload, right: &CapsulePayload) -> Option<CapsuleDifference> {
+    first_difference([
+        (
+            "result.state_schema",
+            serde_json::json!(left.result_snapshot.state_schema),
+            serde_json::json!(right.result_snapshot.state_schema),
+        ),
+        (
+            "result.entries",
+            serde_json::json!(left.result_snapshot.entries),
+            serde_json::json!(right.result_snapshot.entries),
+        ),
+        (
+            "result.bytes",
+            serde_json::json!(left.result_snapshot.bytes),
+            serde_json::json!(right.result_snapshot.bytes),
+        ),
+        (
+            "result.payload_sha256",
+            serde_json::json!(left.result_snapshot.payload_sha256),
+            serde_json::json!(right.result_snapshot.payload_sha256),
+        ),
+        (
+            "result.file_bytes",
+            serde_json::json!(left.result_snapshot.artifact.bytes),
+            serde_json::json!(right.result_snapshot.artifact.bytes),
+        ),
+        (
+            "result.file_sha256",
+            serde_json::json!(left.result_snapshot.artifact.sha256),
+            serde_json::json!(right.result_snapshot.artifact.sha256),
+        ),
+    ])
 }
 
 fn validate_identity(
@@ -643,30 +913,13 @@ fn sync_directory(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn portable_paths_reject_escapes_and_windows_prefixes() {
-        for path in [
-            "../state.json",
-            "/state.json",
-            "C:/state.json",
-            "a\\state.json",
-        ] {
-            assert!(path_from_portable(path).is_err());
-        }
-        assert_eq!(
-            path_from_portable("artifacts/state.json").unwrap(),
-            PathBuf::from("artifacts").join("state.json")
-        );
-    }
-
-    #[test]
-    fn changed_capsule_payloads_are_rejected() {
+    fn capsule() -> Capsule {
         let artifact = ArtifactReference {
             path: "artifact.bin".into(),
             bytes: 1,
             sha256: "a".repeat(64),
         };
-        let payload = CapsulePayload {
+        Capsule::new(CapsulePayload {
             format_version: 1,
             cartridge_id: "dev.example.test".into(),
             cartridge_version: "1.0.0".into(),
@@ -698,12 +951,49 @@ mod tests {
                 bytes: 0,
                 payload_sha256: "d".repeat(64),
             },
-        };
-        let capsule = Capsule::new(payload).unwrap();
-        let mut value = serde_json::to_value(capsule).unwrap();
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn portable_paths_reject_escapes_and_windows_prefixes() {
+        for path in [
+            "../state.json",
+            "/state.json",
+            "C:/state.json",
+            "a\\state.json",
+        ] {
+            assert!(path_from_portable(path).is_err());
+        }
+        assert_eq!(
+            path_from_portable("artifacts/state.json").unwrap(),
+            PathBuf::from("artifacts").join("state.json")
+        );
+    }
+
+    #[test]
+    fn changed_capsule_payloads_are_rejected() {
+        let mut value = serde_json::to_value(capsule()).unwrap();
         value["payload"]["argument_count"] = serde_json::json!(1);
 
         assert!(Capsule::from_slice(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn comparison_reports_the_first_result_state_difference() {
+        let left = capsule();
+        let mut payload = left.payload.clone();
+        payload.result_snapshot.payload_sha256 = "e".repeat(64);
+        let right = Capsule::new(payload).unwrap();
+
+        let comparison = compare_capsules(&left, &right);
+
+        assert!(!comparison.identical);
+        assert!(matches!(
+            comparison.difference,
+            Some(CapsuleDifference::Field { field, .. })
+                if field == "result.payload_sha256"
+        ));
     }
 
     #[test]

@@ -110,11 +110,11 @@ impl CartridgeArchive {
             .map(|(name, bytes)| {
                 let path = name
                     .strip_prefix("assets/")
-                    .expect("entry names were checked above")
+                    .ok_or_else(|| Error::Archive(format!("unexpected archive entry: {name}")))?
                     .to_owned();
-                (path, bytes)
+                Ok((path, bytes))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         verify_assets(&manifest, &assets)?;
 
         Ok(Self {
