@@ -5,6 +5,7 @@ use std::{
 
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
@@ -118,6 +119,19 @@ impl PackageManifest {
                 return Err(Error::Manifest(format!(
                     "integrity.assets_sha256 entry for {path:?} must be a 64-character hexadecimal digest"
                 )));
+            }
+        }
+        if !self.integrity.assets_root_sha256.is_empty() {
+            if !is_sha256(&self.integrity.assets_root_sha256) {
+                return Err(Error::Manifest(
+                    "integrity.assets_root_sha256 must be a 64-character hexadecimal digest".into(),
+                ));
+            }
+            let actual = asset_integrity_root(&self.integrity.assets_sha256)?;
+            if !actual.eq_ignore_ascii_case(&self.integrity.assets_root_sha256) {
+                return Err(Error::Integrity(
+                    "asset integrity root does not match the declared asset digests".into(),
+                ));
             }
         }
         validate_relationships(self)?;
@@ -307,13 +321,55 @@ pub struct Integrity {
     pub component_sha256: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub assets_sha256: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub assets_root_sha256: String,
 }
 
 impl Integrity {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.component_sha256.is_empty() && self.assets_sha256.is_empty()
+        self.component_sha256.is_empty()
+            && self.assets_sha256.is_empty()
+            && self.assets_root_sha256.is_empty()
     }
+}
+
+pub(crate) fn asset_integrity_root(assets: &BTreeMap<String, String>) -> Result<String> {
+    let mut nodes = Vec::with_capacity(assets.len());
+    for (path, digest) in assets {
+        let digest = hex::decode(digest)
+            .map_err(|_| Error::Integrity(format!("invalid asset digest for {path:?}")))?;
+        if digest.len() != 32 {
+            return Err(Error::Integrity(format!(
+                "invalid asset digest for {path:?}"
+            )));
+        }
+        let path_length = u64::try_from(path.len())
+            .map_err(|_| Error::Integrity("asset path length overflowed".into()))?;
+        let mut hasher = Sha256::new();
+        hasher.update([0]);
+        hasher.update(path_length.to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(digest);
+        nodes.push(hasher.finalize().to_vec());
+    }
+    if nodes.is_empty() {
+        return Ok(hex::encode(Sha256::digest([2])));
+    }
+    while nodes.len() > 1 {
+        let mut parents = Vec::with_capacity(nodes.len().div_ceil(2));
+        for pair in nodes.chunks(2) {
+            let left = &pair[0];
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut hasher = Sha256::new();
+            hasher.update([1]);
+            hasher.update(left);
+            hasher.update(right);
+            parents.push(hasher.finalize().to_vec());
+        }
+        nodes = parents;
+    }
+    Ok(hex::encode(&nodes[0]))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -573,6 +629,24 @@ mod tests {
     #[test]
     fn accepts_valid_manifest() {
         manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn asset_root_binds_paths_and_digests() {
+        let mut value = manifest();
+        value
+            .integrity
+            .assets_sha256
+            .insert("a.txt".into(), hex::encode(Sha256::digest(b"a")));
+        value.integrity.assets_root_sha256 =
+            asset_integrity_root(&value.integrity.assets_sha256).unwrap();
+        value.validate().unwrap();
+
+        value
+            .integrity
+            .assets_sha256
+            .insert("b.txt".into(), hex::encode(Sha256::digest(b"b")));
+        assert!(value.validate().is_err());
     }
 
     #[test]

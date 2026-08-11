@@ -33,7 +33,7 @@ The manifest also declares the state schema expected by the component. Live exec
 
 Storage is observable state and therefore part of deterministic replay. Live reads record the returned bytes, length, and digest. Live writes record the key, value length, digest, and outcome. Deletes and listings record their result.
 
-During replay, reads return the recorded bytes. Writes and deletes are checked against the trace but are not applied to the backend. This prevents debugging an old execution from modifying current application state. Malformed bytes, mismatched digests, changed keys, and changed write contents are reported as the first divergence.
+During ordinary replay, reads return the recorded bytes. Writes and deletes are checked against the trace but are not applied to the backend. This prevents debugging an old execution from modifying current application state. Capsule replay uses a stricter disposable mode: it starts from the bound source snapshot, checks recorded reads and listings against that branch, applies validated writes and deletes only to the branch, then requires the exported result digest to match the capsule. Malformed bytes, mismatched source state, changed keys, and changed write contents are reported as the first divergence.
 
 Traces may contain private storage values and should be treated as sensitive files.
 

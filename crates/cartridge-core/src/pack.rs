@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::{Error, PackageLimits, PackageManifest, Result, normalize_relative_path};
+use crate::{
+    Error, PackageLimits, PackageManifest, Result, manifest::asset_integrity_root,
+    normalize_relative_path,
+};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +67,8 @@ pub fn pack(options: &PackOptions) -> Result<PackageManifest> {
         .iter()
         .map(|(path, bytes)| (path.clone(), hex::encode(Sha256::digest(bytes))))
         .collect();
+    manifest.integrity.assets_root_sha256 =
+        asset_integrity_root(&manifest.integrity.assets_sha256)?;
 
     if let Some(parent) = options.output.parent() {
         fs::create_dir_all(parent)?;
@@ -284,5 +289,57 @@ version = "0.1.0"
         .unwrap_err();
 
         assert!(error.to_string().contains("input limit"));
+    }
+
+    #[test]
+    fn packed_assets_support_selective_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("Cartridge.toml");
+        let component = directory.path().join("component.wasm");
+        let assets = directory.path().join("assets");
+        let output = directory.path().join("assets.cartridge");
+        fs::create_dir(&assets).unwrap();
+        fs::write(
+            &manifest,
+            br#"format_version = 1
+[cartridge]
+id = "dev.example.assets"
+name = "Assets"
+version = "0.1.0"
+[permissions]
+assets = true
+"#,
+        )
+        .unwrap();
+        fs::write(&component, b"\0asm\x01\0\0\0").unwrap();
+        fs::write(assets.join("message.txt"), b"hello").unwrap();
+
+        let packed = pack(&PackOptions {
+            manifest,
+            component,
+            assets: Some(assets),
+            output: output.clone(),
+        })
+        .unwrap();
+        let report = crate::CartridgeArchive::verify_asset(&output, "message.txt").unwrap();
+
+        assert!(!packed.integrity.assets_root_sha256.is_empty());
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.path, "message.txt");
+        assert_eq!(
+            report.assets_root_sha256,
+            packed.integrity.assets_root_sha256
+        );
+
+        let tampered_output = directory.path().join("tampered.cartridge");
+        let tampered_assets = BTreeMap::from([("message.txt".into(), b"changed".to_vec())]);
+        write_archive(
+            &tampered_output,
+            &packed,
+            b"\0asm\x01\0\0\0",
+            &tampered_assets,
+        )
+        .unwrap();
+        assert!(crate::CartridgeArchive::verify_asset(&tampered_output, "message.txt").is_err());
     }
 }

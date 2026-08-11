@@ -16,11 +16,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
-    DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS, Runtime,
-    SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
+    BlobStore, DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
+    Runtime, SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
 };
-use cartridge_trace::{ExecutionTrace, MAX_TRACE_DOCUMENT_BYTES, TraceDifference};
-use clap::{Parser, Subcommand};
+use cartridge_trace::{
+    ExecutionTrace, MAX_REDACTED_TRACE_DOCUMENT_BYTES, MAX_TRACE_DOCUMENT_BYTES, RedactionProfile,
+    TraceDifference,
+};
+use clap::{Parser, Subcommand, ValueEnum};
 use migration_receipt::{MigrationReceipt, MigrationReceiptPayload};
 
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +73,16 @@ enum Command {
         candidates: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+    /// selectively verify package assets
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommand,
+    },
+    /// manage content-addressed blobs
+    Blob {
+        #[command(subcommand)]
+        command: BlobCommand,
     },
     /// execute a cartridge
     Run {
@@ -158,6 +171,56 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum AssetCommand {
+    /// verify one asset without inflating unrelated asset payloads
+    Verify {
+        package: PathBuf,
+        path: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlobCommand {
+    /// stream a file into the blob store
+    Put {
+        input: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify a stored object against its address
+    Verify {
+        sha256: String,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// stream a verified object to a new file
+    Get {
+        sha256: String,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// find or remove objects not listed by digest
+    Gc {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        keep: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TraceCommand {
     /// validate a trace and show its execution summary
     Inspect {
@@ -172,6 +235,20 @@ enum TraceCommand {
         #[arg(long)]
         json: bool,
     },
+    /// export a non-replayable trace with sensitive values removed
+    Redact {
+        trace: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = TraceRedactionProfile::Summary)]
+        profile: TraceRedactionProfile,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TraceRedactionProfile {
+    Summary,
+    Metadata,
 }
 
 #[derive(Debug, Subcommand)]
@@ -341,6 +418,8 @@ fn run_cli() -> Result<()> {
             candidates,
             json,
         } => resolve_command(&root, &candidates, json),
+        Command::Asset { command } => run_asset_command(command),
+        Command::Blob { command } => run_blob_command(command),
         Command::Run {
             package,
             trace,
@@ -416,13 +495,135 @@ fn run_cli() -> Result<()> {
                 json,
             )
         }
-        Command::Trace { command } => match command {
-            TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
-            TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
-        },
+        Command::Trace { command } => run_trace_command(command),
         Command::Capsule { command } => run_capsule_command(command),
         Command::Storage { command } => run_storage_command(command),
     }
+}
+
+fn run_blob_command(command: BlobCommand) -> Result<()> {
+    match command {
+        BlobCommand::Put { input, store, json } => {
+            let report = BlobStore::open(store)?.put(input)?;
+            print_blob_info(&report, json)
+        }
+        BlobCommand::Verify {
+            sha256,
+            store,
+            json,
+        } => {
+            let report = BlobStore::open(store)?.verify(&sha256)?;
+            print_blob_info(&report, json)
+        }
+        BlobCommand::Get {
+            sha256,
+            store,
+            output,
+        } => {
+            let report = BlobStore::open(store)?.materialize(&sha256, &output)?;
+            println!(
+                "materialized {} byte(s) -> {}",
+                report.bytes,
+                output.display()
+            );
+            Ok(())
+        }
+        BlobCommand::Gc {
+            store,
+            keep,
+            apply,
+            json,
+        } => {
+            let retained = keep.into_iter().collect();
+            let report = BlobStore::open(store)?.gc(&retained, !apply)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("retained: {}", report.retained);
+                println!(
+                    "removable: {} object(s), {} bytes",
+                    report.removable, report.removable_bytes
+                );
+                println!(
+                    "removed: {} object(s), {} bytes",
+                    report.removed, report.removed_bytes
+                );
+                println!("dry run: {}", report.dry_run);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_blob_info(report: &cartridge_runtime::BlobInfo, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("sha256: {}", report.sha256);
+        println!("bytes: {}", report.bytes);
+        println!("already existed: {}", report.existed);
+    }
+    Ok(())
+}
+
+fn run_trace_command(command: TraceCommand) -> Result<()> {
+    match command {
+        TraceCommand::Inspect { trace, json } => trace_inspect_command(&trace, json),
+        TraceCommand::Diff { left, right, json } => trace_diff_command(&left, &right, json),
+        TraceCommand::Redact {
+            trace,
+            output,
+            profile,
+        } => trace_redact_command(&trace, &output, profile),
+    }
+}
+
+fn run_asset_command(command: AssetCommand) -> Result<()> {
+    match command {
+        AssetCommand::Verify {
+            package,
+            path,
+            json,
+        } => asset_verify_command(&package, &path, json),
+    }
+}
+
+fn asset_verify_command(package: &Path, path: &str, json: bool) -> Result<()> {
+    let report = CartridgeArchive::verify_asset(package, path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("verified asset {}", report.path);
+        println!("{} {}", report.cartridge_id, report.cartridge_version);
+        println!("bytes: {}", report.bytes);
+        println!("sha256: {}", report.sha256);
+        println!("asset root: {}", report.assets_root_sha256);
+    }
+    Ok(())
+}
+
+fn trace_redact_command(trace: &Path, output: &Path, profile: TraceRedactionProfile) -> Result<()> {
+    let trace = read_trace(trace)?;
+    let profile = match profile {
+        TraceRedactionProfile::Summary => RedactionProfile::Summary,
+        TraceRedactionProfile::Metadata => RedactionProfile::Metadata,
+    };
+    let redacted = trace.redact(profile)?;
+    let bytes = serde_json::to_vec_pretty(&redacted)?;
+    if bytes.len() > MAX_REDACTED_TRACE_DOCUMENT_BYTES {
+        bail!("redacted trace exceeds the {MAX_REDACTED_TRACE_DOCUMENT_BYTES} byte output limit");
+    }
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    write_private(output, &bytes)?;
+    println!("redacted trace -> {}", output.display());
+    println!("profile: {profile:?}");
+    println!("replayable: false");
+    Ok(())
 }
 
 fn run_capsule_command(command: CapsuleCommand) -> Result<()> {
@@ -486,6 +687,7 @@ fn run_capsule_command(command: CapsuleCommand) -> Result<()> {
 
 fn supervised_capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
     let inputs = capsule::replay_inputs(capsule_path)?;
+    let execution_budget = Duration::from_millis(inputs.package.manifest.runtime.timeout_ms);
     let mut worker_args = vec![
         OsString::from("__worker-capsule-replay"),
         capsule_path.as_os_str().to_owned(),
@@ -493,7 +695,7 @@ fn supervised_capsule_replay_command(capsule_path: &Path, json: bool) -> Result<
     if json {
         worker_args.push(OsString::from("--json"));
     }
-    supervise_worker(&inputs.package_path, &worker_args, None)
+    supervise_worker(&inputs.package_path, &worker_args, Some(execution_budget))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -514,7 +716,20 @@ fn capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
     let inputs = capsule::replay_inputs(capsule_path)?;
     let expected_capsule_sha256 = inputs.summary.capsule_sha256.clone();
     let event_count = inputs.trace.events.len();
-    let report = Runtime::new()?.replay(inputs.package, &inputs.arguments, inputs.trace)?;
+    let report = Runtime::new()?.replay_from_snapshot(
+        inputs.package,
+        &inputs.arguments,
+        inputs.trace,
+        &inputs.source,
+    )?;
+    let reproduced = report.snapshot.summary()?;
+    if reproduced.payload_sha256 != inputs.summary.result_snapshot_sha256 {
+        bail!(
+            "replayed result state digest differs: expected {}, got {}",
+            inputs.summary.result_snapshot_sha256,
+            reproduced.payload_sha256
+        );
+    }
     let final_verification = capsule::verify(capsule_path)?;
     if final_verification.capsule.capsule_sha256 != expected_capsule_sha256 {
         bail!("capsule changed during replay");
@@ -527,9 +742,9 @@ fn capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
         argument_count: inputs.arguments.len(),
         event_count,
         output_sha256: inputs.summary.trace_output_sha256,
-        fuel_consumed: report.fuel_consumed,
+        fuel_consumed: report.run.fuel_consumed,
         result_snapshot_sha256: inputs.summary.result_snapshot_sha256,
-        result_state_evidence: "artifact-verified-not-recomputed",
+        result_state_evidence: "recomputed-from-source",
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&replay)?);
@@ -542,7 +757,7 @@ fn capsule_replay_command(capsule_path: &Path, json: bool) -> Result<()> {
         println!("output sha256: {}", replay.output_sha256);
         println!("fuel consumed: {}", replay.fuel_consumed);
         println!("result snapshot sha256: {}", replay.result_snapshot_sha256);
-        println!("result state: artifact verified; replay does not apply writes");
+        println!("result state: reproduced on a disposable source branch");
     }
     Ok(())
 }
@@ -805,11 +1020,14 @@ fn supervise_worker(
     arguments: &[OsString],
     execution_budget: Option<Duration>,
 ) -> Result<()> {
-    let archive = CartridgeArchive::open(package)
-        .with_context(|| format!("could not validate {} before execution", package.display()))?;
-    let execution_budget = execution_budget
-        .unwrap_or_else(|| Duration::from_millis(archive.manifest.runtime.timeout_ms));
-    drop(archive);
+    let execution_budget = if let Some(budget) = execution_budget {
+        budget
+    } else {
+        let archive = CartridgeArchive::open(package).with_context(|| {
+            format!("could not validate {} before execution", package.display())
+        })?;
+        Duration::from_millis(archive.manifest.runtime.timeout_ms)
+    };
     let deadline = Instant::now() + WORKER_STARTUP_BUDGET + execution_budget;
     let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
     let mut worker = ProcessCommand::new(executable)

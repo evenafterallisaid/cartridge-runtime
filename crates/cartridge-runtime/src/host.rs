@@ -47,6 +47,7 @@ pub(crate) struct HostState {
     trace_limit_reached: bool,
     next_sequence: u64,
     replay: Option<ReplayCursor>,
+    apply_replay_storage: bool,
     divergence: Option<ReplayError>,
     started_at: StdInstant,
     deadline: StdInstant,
@@ -101,10 +102,16 @@ impl HostState {
             trace_limit_reached: false,
             next_sequence: 0,
             replay: replay_events.map(ReplayCursor::new),
+            apply_replay_storage: false,
             divergence: None,
             started_at,
             deadline: started_at + Duration::from_millis(manifest.runtime.timeout_ms),
         }
+    }
+
+    pub(crate) fn apply_replay_storage(mut self) -> Self {
+        self.apply_replay_storage = true;
+        self
     }
 
     pub(crate) fn finish_replay(&mut self) -> Result<(), ReplayError> {
@@ -805,6 +812,47 @@ mod tests {
         assert_eq!(
             storage.get("dev.example.host", "settings/theme").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn state_replay_applies_validated_writes_to_its_branch() {
+        let permissions = Permissions {
+            storage: true,
+            ..Permissions::default()
+        };
+        let value = b"dark";
+        let event = TraceEvent {
+            sequence: 0,
+            capability: "storage".into(),
+            operation: "put".into(),
+            outcome: json!({
+                "key": "settings/theme",
+                "length": value.len(),
+                "sha256": hex::encode(Sha256::digest(value)),
+                "stored": true,
+            }),
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            storage.clone(),
+            Some(vec![event]),
+        )
+        .apply_replay_storage();
+
+        cartridge::api::host::Host::storage_put(
+            &mut state,
+            "settings/theme".into(),
+            value.to_vec(),
+        )
+        .unwrap();
+
+        state.finish_replay().unwrap();
+        assert_eq!(
+            storage.get("dev.example.host", "settings/theme").unwrap(),
+            Some(value.to_vec())
         );
     }
 

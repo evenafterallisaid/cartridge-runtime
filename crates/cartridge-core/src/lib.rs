@@ -3,7 +3,7 @@ mod manifest;
 mod pack;
 mod resolver;
 
-pub use archive::{CartridgeArchive, PackageLimits};
+pub use archive::{AssetVerification, CartridgeArchive, PackageLimits};
 pub use manifest::{
     CURRENT_FORMAT_VERSION, CartridgeDependency, CartridgeMetadata, Integrity,
     MIGRATION_PLAN_FORMAT_VERSION, MigrationPlan, PackageManifest, Permissions, ProvidedService,

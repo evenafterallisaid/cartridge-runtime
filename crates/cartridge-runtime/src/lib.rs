@@ -5,9 +5,10 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
 pub use cartridge_storage::{
-    CapturedState, DirectoryStorage, GenerationEvidence, MemoryStorage, RecoveryReport,
-    RestorePlan, SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage,
-    StorageBackend, StorageLimits, StorageSnapshot, StorageSnapshotSummary, StorageUsage,
+    BlobGcReport, BlobInfo, BlobStore, CapturedState, DirectoryStorage, GenerationEvidence,
+    MAX_BLOB_BYTES, MemoryStorage, RecoveryReport, RestorePlan, SnapshotComparison,
+    SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageBackend, StorageLimits,
+    StorageSnapshot, StorageSnapshotSummary, StorageUsage,
 };
 pub use cartridge_trace::{
     CURRENT_TRACE_FORMAT_VERSION, ExecutionTrace, MAX_TRACE_BYTES, MAX_TRACE_DOCUMENT_BYTES,
@@ -73,7 +74,7 @@ impl Runtime {
     }
 
     pub fn run(&self, archive: CartridgeArchive, args: &[String]) -> Result<RunReport> {
-        self.execute(archive, args, None)
+        self.execute(archive, args, None, false)
     }
 
     pub fn replay_file(
@@ -97,7 +98,37 @@ impl Runtime {
             trace_identity(&archive.manifest),
             args,
         )?;
-        self.execute(archive, args, Some(trace))
+        self.execute(archive, args, Some(trace), false)
+    }
+
+    pub fn replay_from_snapshot(
+        &self,
+        archive: CartridgeArchive,
+        args: &[String],
+        trace: ExecutionTrace,
+        source: &StorageSnapshot,
+    ) -> Result<StateReplayReport> {
+        trace.validate_invocation(
+            env!("CARGO_PKG_VERSION"),
+            trace_identity(&archive.manifest),
+            args,
+        )?;
+        let cartridge_id = archive.manifest.cartridge.id.clone();
+        let state_schema = archive.manifest.state.schema;
+        let limits = storage_limits(&archive.manifest);
+        let branch = Arc::new(SnapshotStorage::from_snapshot(
+            source,
+            &cartridge_id,
+            limits,
+        )?);
+        branch.prepare(&cartridge_id, state_schema, limits)?;
+        let runtime = Self {
+            engine: self.engine.clone(),
+            storage: branch.clone(),
+        };
+        let run = runtime.execute(archive, args, Some(trace), true)?;
+        let snapshot = branch.export_snapshot()?;
+        Ok(StateReplayReport { run, snapshot })
     }
 
     fn execute(
@@ -105,6 +136,7 @@ impl Runtime {
         archive: CartridgeArchive,
         args: &[String],
         replay: Option<ExecutionTrace>,
+        apply_replay_storage: bool,
     ) -> Result<RunReport> {
         if replay.is_none() && archive.manifest.permissions.storage {
             self.storage.prepare(
@@ -120,15 +152,16 @@ impl Runtime {
         let manifest = archive.manifest;
         let expected_result = replay.as_ref().map(|trace| trace.result.clone());
         let expected_events = replay.map(|trace| trace.events);
-        let mut store = Store::new(
-            &self.engine,
-            HostState::new(
-                &manifest,
-                Arc::new(archive.assets),
-                self.storage.clone(),
-                expected_events,
-            ),
+        let mut host = HostState::new(
+            &manifest,
+            Arc::new(archive.assets),
+            self.storage.clone(),
+            expected_events,
         );
+        if apply_replay_storage {
+            host = host.apply_replay_storage();
+        }
+        let mut store = Store::new(&self.engine, host);
         store.limiter(|state| &mut state.limits);
         store.set_fuel(manifest.runtime.fuel)?;
         store.set_epoch_deadline(timeout_ticks(manifest.runtime.timeout_ms));
@@ -381,6 +414,12 @@ pub struct RunReport {
     pub output: String,
     pub fuel_consumed: u64,
     pub trace: ExecutionTrace,
+}
+
+#[derive(Debug)]
+pub struct StateReplayReport {
+    pub run: RunReport,
+    pub snapshot: StorageSnapshot,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

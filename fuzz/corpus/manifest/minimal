@@ -1,0 +1,6 @@
+format_version = 1
+
+[cartridge]
+id = "dev.example.fuzz"
+name = "Fuzz"
+version = "0.1.0"

@@ -1,9 +1,17 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-use crate::{Error, PackageManifest, Result, normalize_relative_path};
+use crate::{
+    Error, PackageManifest, Result, manifest::asset_integrity_root, normalize_relative_path,
+};
 
 const MANIFEST_PATH: &str = "cartridge.toml";
 const COMPONENT_PATH: &str = "component.wasm";
@@ -34,6 +42,16 @@ pub struct CartridgeArchive {
     pub manifest: PackageManifest,
     pub component: Vec<u8>,
     pub assets: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AssetVerification {
+    pub cartridge_id: String,
+    pub cartridge_version: String,
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub assets_root_sha256: String,
 }
 
 impl CartridgeArchive {
@@ -123,6 +141,142 @@ impl CartridgeArchive {
             assets,
         })
     }
+
+    pub fn verify_asset(path: impl AsRef<Path>, asset_path: &str) -> Result<AssetVerification> {
+        let limits = PackageLimits::default();
+        let requested = normalize_relative_path(asset_path)?;
+        let requested_entry = format!("assets/{requested}");
+        let file = File::open(path)?;
+        let mut zip = ZipArchive::new(file)?;
+        let entries = scan_selective_entries(&mut zip, limits, &requested_entry)?;
+        let manifest = {
+            let mut entry = zip.by_index(entries.manifest)?;
+            let declared = entry.size();
+            let bytes =
+                read_bounded_entry(&mut entry, declared, limits.manifest_bytes, MANIFEST_PATH)?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| Error::Manifest("manifest must be UTF-8".into()))?;
+            let manifest: PackageManifest = toml::from_str(text)?;
+            manifest.validate()?;
+            manifest
+        };
+        let declared_assets: BTreeSet<_> =
+            manifest.integrity.assets_sha256.keys().cloned().collect();
+        if entries.assets != declared_assets {
+            return Err(Error::Integrity(
+                "archive asset names do not match the manifest".into(),
+            ));
+        }
+        if manifest.integrity.assets_root_sha256.is_empty() {
+            return Err(Error::Integrity(
+                "selective asset verification requires an asset integrity root".into(),
+            ));
+        }
+        let expected = manifest
+            .integrity
+            .assets_sha256
+            .get(&requested)
+            .ok_or_else(|| Error::Archive(format!("asset not found: {requested}")))?;
+        let requested_index = entries
+            .requested
+            .ok_or_else(|| Error::Archive(format!("asset not found: {requested}")))?;
+        let (bytes, sha256) = {
+            let mut entry = zip.by_index(requested_index)?;
+            let declared = entry.size();
+            let bytes =
+                read_bounded_entry(&mut entry, declared, limits.asset_bytes, &requested_entry)?;
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            (declared, sha256)
+        };
+        if !sha256.eq_ignore_ascii_case(expected) {
+            return Err(Error::Integrity(format!(
+                "asset digest mismatch for {requested}"
+            )));
+        }
+        Ok(AssetVerification {
+            cartridge_id: manifest.cartridge.id,
+            cartridge_version: manifest.cartridge.version,
+            path: requested,
+            bytes,
+            sha256,
+            assets_root_sha256: manifest.integrity.assets_root_sha256,
+        })
+    }
+}
+
+struct SelectiveEntries {
+    manifest: usize,
+    requested: Option<usize>,
+    assets: BTreeSet<String>,
+}
+
+fn scan_selective_entries(
+    zip: &mut ZipArchive<File>,
+    limits: PackageLimits,
+    requested: &str,
+) -> Result<SelectiveEntries> {
+    if zip.len() > limits.entries {
+        return Err(Error::Archive(format!(
+            "archive contains {} entries; maximum is {}",
+            zip.len(),
+            limits.entries
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    let mut assets = BTreeSet::new();
+    let mut manifest = None;
+    let mut component_found = false;
+    let mut requested_index = None;
+    let mut total_size = 0_u64;
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = normalize_relative_path(entry.name())?;
+        if !seen.insert(name.clone()) {
+            return Err(Error::Archive(format!("duplicate archive entry: {name}")));
+        }
+        let limit = match name.as_str() {
+            MANIFEST_PATH => {
+                manifest = Some(index);
+                limits.manifest_bytes
+            }
+            COMPONENT_PATH => {
+                component_found = true;
+                limits.component_bytes
+            }
+            _ if name.starts_with("assets/") => {
+                assets.insert(name["assets/".len()..].to_owned());
+                if name == requested {
+                    requested_index = Some(index);
+                }
+                limits.asset_bytes
+            }
+            _ => return Err(Error::Archive(format!("unexpected archive entry: {name}"))),
+        };
+        if entry.size() > limit {
+            return Err(Error::Archive(format!(
+                "archive entry is too large: {name}"
+            )));
+        }
+        total_size = total_size
+            .checked_add(entry.size())
+            .ok_or_else(|| Error::Archive("archive size overflow".into()))?;
+        if total_size > limits.total_bytes {
+            return Err(Error::Archive(
+                "archive exceeds the total uncompressed size limit".into(),
+            ));
+        }
+    }
+    if !component_found {
+        return Err(Error::Archive(format!("missing {COMPONENT_PATH}")));
+    }
+    Ok(SelectiveEntries {
+        manifest: manifest.ok_or_else(|| Error::Archive(format!("missing {MANIFEST_PATH}")))?,
+        requested: requested_index,
+        assets,
+    })
 }
 
 fn read_bounded_entry(
@@ -167,6 +321,14 @@ fn verify_component(manifest: &PackageManifest, component: &[u8]) -> Result<()> 
 }
 
 fn verify_assets(manifest: &PackageManifest, assets: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    if !manifest.integrity.assets_root_sha256.is_empty() {
+        let actual = asset_integrity_root(&manifest.integrity.assets_sha256)?;
+        if !actual.eq_ignore_ascii_case(&manifest.integrity.assets_root_sha256) {
+            return Err(Error::Integrity(
+                "asset integrity root does not match the manifest".into(),
+            ));
+        }
+    }
     if manifest.integrity.assets_sha256.len() != assets.len() {
         return Err(Error::Integrity(format!(
             "asset digest set contains {} entries but the package contains {} assets",
@@ -216,6 +378,7 @@ mod tests {
             integrity: Integrity {
                 component_sha256: hex::encode(Sha256::digest(original)),
                 assets_sha256: BTreeMap::new(),
+                assets_root_sha256: String::new(),
             },
         };
 

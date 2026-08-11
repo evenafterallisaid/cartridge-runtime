@@ -134,9 +134,14 @@ Delivery slices:
 6. Migration execution against a snapshot branch before committing changes.
 7. Automatic rollback capture, race-safe durable migration commit, and failure-preserving CLI supervision.
 8. Pre-commit migration receipts and evidence-based recovery after supervisor or host interruption.
-9. Content-addressed blobs, garbage collection, and references from key/value records.
+9. Content-addressed blobs, garbage collection, and references from key/value records:
+   - [implemented] bounded streaming ingestion, verification, deduplication, and materialization
+   - [implemented] finite-wait cross-process exclusion for reads, writes, and collection
+   - [implemented] safe-by-default explicit-retain garbage collection
+   - derive reachability from snapshots and capsules
+   - add guest-visible blob references after reachability and quota semantics are fixed
 
-The first eight slices are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
+The first eight slices and the host-side foundation of slice nine are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
 
 Migration design constraints:
 
@@ -762,11 +767,14 @@ The next concrete sequence is:
    - [implemented] add bounded create, inspect, and verify commands without embedding private state values by default
    - [implemented] add capsule-to-capsule first-divergence reporting across identity, invocation, source, trace, and result state
    - [implemented] replay a fully reverified capsule in a deadline-supervised worker and compare runtime, invocation, ordered events, output, and fuel
-   - apply validated replay writes to a disposable source branch and independently reproduce the result-state digest
+   - [implemented] apply validated replay writes to a disposable source branch and independently reproduce the result-state digest
    - minimize failing capsules while preserving the first divergence
-2. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
-3. Add content-addressed blobs, streaming access, reachability-based garbage collection, and snapshot references for larger state.
-4. Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
+2. Finish content-addressed state integration:
+   - derive live blob reachability from snapshots and capsules
+   - make collection consume verified reachability manifests instead of hand-written retain lists
+   - define blob-reference quota, lifecycle, and replay rules before adding the guest ABI
+3. Generalize migration's conditional commit into guest-facing compare-and-swap and bounded atomic batches, with trace events and ABA-safe revision tokens.
+4. [implemented] Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
 5. Create a minimal 2D window and input prototype behind new WIT packages.
 6. Build a small trace and capsule viewer after there is enough real trace data to design around.
 7. Prototype crash-consistent composition activation only after package signing establishes trustworthy principals.
@@ -785,6 +793,11 @@ Completed foundations:
 - isolated multi-step migration rehearsals with intermediate schema and quota validation
 - checksummed pre-commit migration receipts with committed, not-committed, changed, and indeterminate recovery states
 - portable execution capsule manifests with path confinement, raw artifact digests, and semantic cross-file verification
+- state-reproducing capsule replay on disposable snapshot branches
+- privacy-safe non-replayable trace summary and metadata exports
+- content-addressed blob storage with bounded streaming I/O and safe-by-default garbage collection
+- Merkle-style package asset roots and selective payload verification
+- seeded archive, manifest, snapshot, and trace fuzz targets with scheduled bounded runs
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals
@@ -795,7 +808,7 @@ Security work immediately ahead:
 
 1. Bind package identity to developer signatures before treating cartridge ids as storage principals.
 2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
-3. Add trace redaction profiles and encrypted support bundles.
-4. Add archive, manifest, snapshot, receipt, and trace fuzz targets seeded with the security regression corpus.
+3. [partially implemented] Trace redaction profiles are available; encrypted support bundles remain.
+4. [partially implemented] Keep expanding the seeded archive, manifest, snapshot, and trace fuzz suite; capsule and receipt parsers still need library boundaries before they can join it cleanly.
 
 The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.

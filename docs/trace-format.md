@@ -22,7 +22,7 @@ A trace is an executable record of one cartridge invocation. It identifies the e
 
 Each event receives a zero-based sequence number. An event contains a capability name, an operation name, and the value observable by the guest. Clock and random values are stored in full because replay must return the same inputs without consulting the live host.
 
-Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so replay does not consult live state; writes and deletes record their inputs and result without being applied again during replay.
+Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so ordinary replay does not consult live state; writes and deletes record their inputs and result without being applied to live storage.
 
 ## Replay
 
@@ -45,6 +45,8 @@ Trace tooling does not compile or execute the cartridge:
 cartridge trace inspect run.trace.json
 cartridge trace inspect run.trace.json --json
 cartridge trace diff first.trace.json second.trace.json
+cartridge trace redact run.trace.json --output share.trace-summary.json
+cartridge trace redact run.trace.json --profile metadata --output debug.trace-metadata.json
 ```
 
 Inspection validates the header, component digest, zero-based event sequence, and capability labels before producing a summary. Comparison reports one difference at a time in execution order: invocation identity, the first changed event, then the final output or fuel use. The same comparison is available as structured JSON for future debugger and editor integrations.
@@ -55,6 +57,8 @@ The trace format is versioned independently from the cartridge archive and WIT A
 
 Runtime upgrades may change fuel accounting or capability behavior. A future trace migration command can convert formats when the semantic difference is understood; the runtime should not guess.
 
-## Privacy
+## Redaction and privacy
 
-Traces can contain command arguments, logs, random bytes, storage values, network responses, and input events. They are created with private Unix permissions but must still be treated as sensitive diagnostic files. Redaction and encrypted crash bundles are required before traces are convenient to share publicly.
+Traces can contain command arguments, logs, random bytes, storage values, network responses, and input events. They are created with private Unix permissions but must still be treated as sensitive diagnostic files.
+
+Redacted exports are separate, explicitly non-replayable documents. The `summary` profile keeps identity, counts, sizes, capability totals, fuel, and equality-bearing hashes. The `metadata` profile additionally keeps each bounded capability/operation label, sequence, outcome size, and outcome hash. Neither profile writes arguments, output, event outcomes, storage keys or values, logs, or random bytes. Hashes can still reveal equality or permit guesses against low-entropy values, so redacted exports are diagnostics rather than anonymous data. Encrypted support bundles remain future work.

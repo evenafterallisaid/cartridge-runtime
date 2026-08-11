@@ -8,7 +8,9 @@ component.wasm
 assets/<relative paths>
 ```
 
-`cartridge.toml` is the canonical, normalized manifest produced by the packer. Its integrity block contains the lowercase SHA-256 digest of `component.wasm` and a path-to-digest map covering every packaged asset. The runtime rejects archives containing unsafe names, duplicate entries, unexpected files, files larger than the configured package limits, missing integrity entries, or mismatched content.
+`cartridge.toml` is the canonical, normalized manifest produced by the packer. Its integrity block contains the lowercase SHA-256 digest of `component.wasm`, a path-to-digest map covering every packaged asset, and a deterministic Merkle-style root over that sorted map. Leaves bind a domain byte, path length, path, and decoded content digest; parent nodes use a separate domain byte. The runtime rejects archives containing unsafe names, duplicate entries, unexpected files, files larger than the configured package limits, missing integrity entries, a mismatched asset root, or mismatched content.
+
+`cartridge asset verify app.cartridge path/to/asset` scans bounded archive metadata, verifies the complete declared asset-name set and root, then inflates and hashes only the requested asset. It deliberately does not claim whole-package verification; `cartridge verify` remains the command that validates the component and every asset payload.
 
 ## Source manifest
 

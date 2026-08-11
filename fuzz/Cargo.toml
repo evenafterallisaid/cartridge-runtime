@@ -1,0 +1,48 @@
+[package]
+name = "cartridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cartridge-core = { path = "../crates/cartridge-core" }
+cartridge-storage = { path = "../crates/cartridge-storage" }
+cartridge-trace = { path = "../crates/cartridge-trace" }
+libfuzzer-sys = "0.4.10"
+serde_json = "1.0.145"
+tempfile = "3.27.0"
+toml = "1.0.3"
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trace"
+path = "fuzz_targets/trace.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

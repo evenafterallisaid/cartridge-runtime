@@ -1,3 +1,4 @@
+mod blob;
 mod directory;
 mod snapshot;
 
@@ -10,6 +11,7 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 
+pub use blob::{BlobGcReport, BlobInfo, BlobStore, MAX_BLOB_BYTES};
 pub use directory::{
     CapturedState, DirectoryStorage, GenerationEvidence, RecoveryReport, RestorePlan,
 };

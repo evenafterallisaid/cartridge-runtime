@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const CURRENT_TRACE_FORMAT_VERSION: u32 = 2;
@@ -9,6 +10,7 @@ pub const MAX_TRACE_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_TRACE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRACE_EVENTS: usize = 100_000;
 pub const MAX_TRACE_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_REDACTED_TRACE_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 const MAX_TRACE_ARGUMENTS: usize = 4096;
 const MAX_TRACE_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -185,6 +187,94 @@ impl ExecutionTrace {
             difference,
         }
     }
+
+    pub fn redact(&self, profile: RedactionProfile) -> Result<RedactedTrace, ReplayError> {
+        self.validate()?;
+        let mut capabilities = BTreeMap::new();
+        for event in &self.events {
+            *capabilities.entry(event.capability.clone()).or_insert(0) += 1;
+        }
+        let events = match profile {
+            RedactionProfile::Summary => Vec::new(),
+            RedactionProfile::Metadata => self
+                .events
+                .iter()
+                .map(|event| {
+                    let outcome = serde_json::to_vec(&event.outcome).map_err(|error| {
+                        invalid(format!("trace event outcome could not be encoded: {error}"))
+                    })?;
+                    Ok(RedactedEvent {
+                        sequence: event.sequence,
+                        capability: event.capability.clone(),
+                        operation: event.operation.clone(),
+                        outcome_bytes: outcome.len(),
+                        outcome_sha256: hex::encode(Sha256::digest(outcome)),
+                    })
+                })
+                .collect::<Result<_, ReplayError>>()?,
+        };
+        let arguments = serde_json::to_vec(&self.args)
+            .map_err(|error| invalid(format!("trace arguments could not be encoded: {error}")))?;
+        let payload = serde_json::to_vec(self)
+            .map_err(|error| invalid(format!("trace could not be encoded: {error}")))?;
+        Ok(RedactedTrace {
+            format_version: 1,
+            replayable: false,
+            profile,
+            trace_payload_sha256: hex::encode(Sha256::digest(payload)),
+            runtime_version: self.runtime_version.clone(),
+            cartridge_id: self.cartridge_id.clone(),
+            cartridge_version: self.cartridge_version.clone(),
+            component_sha256: self.component_sha256.clone(),
+            argument_count: self.args.len(),
+            argument_bytes: self.args.iter().map(String::len).sum(),
+            arguments_sha256: hex::encode(Sha256::digest(arguments)),
+            event_count: self.events.len(),
+            capabilities,
+            events,
+            output_bytes: self.result.output.len(),
+            output_sha256: hex::encode(Sha256::digest(self.result.output.as_bytes())),
+            fuel_consumed: self.result.fuel_consumed,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RedactionProfile {
+    Summary,
+    Metadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RedactedTrace {
+    pub format_version: u32,
+    pub replayable: bool,
+    pub profile: RedactionProfile,
+    pub trace_payload_sha256: String,
+    pub runtime_version: String,
+    pub cartridge_id: String,
+    pub cartridge_version: String,
+    pub component_sha256: String,
+    pub argument_count: usize,
+    pub argument_bytes: usize,
+    pub arguments_sha256: String,
+    pub event_count: usize,
+    pub capabilities: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<RedactedEvent>,
+    pub output_bytes: usize,
+    pub output_sha256: String,
+    pub fuel_consumed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RedactedEvent {
+    pub sequence: u64,
+    pub capability: String,
+    pub operation: String,
+    pub outcome_bytes: usize,
+    pub outcome_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -429,6 +519,19 @@ mod tests {
 
         trace.validate().unwrap();
         assert_eq!(trace.summary().capabilities.get("log"), Some(&1));
+    }
+
+    #[test]
+    fn redacted_exports_do_not_contain_arguments_outcomes_or_output() {
+        let trace = trace();
+        let redacted = trace.redact(RedactionProfile::Metadata).unwrap();
+        let encoded = serde_json::to_string(&redacted).unwrap();
+
+        assert!(!redacted.replayable);
+        assert_eq!(redacted.events.len(), 1);
+        assert!(!encoded.contains("hello"));
+        assert!(!encoded.contains("done"));
+        assert!(!encoded.contains("\"one\""));
     }
 
     #[test]

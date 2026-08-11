@@ -7,13 +7,13 @@ The project is deliberately small at this stage: it proves the complete path fro
 ## What works
 
 - WebAssembly Component Model guests built against a versioned WIT contract
-- Reproducible `.cartridge` packages with SHA-256 component verification
+- Reproducible `.cartridge` packages with component hashes and Merkle-style asset roots
 - Manifest-declared clock, randomness, packaged-asset, and scoped-storage capabilities
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
 - Bounded archive inflation, Wasm tables, WASI waits, traces, and storage-lock acquisition
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
 - Deterministic trace recording, replay, and first-divergence detection
-- Standalone trace validation, summaries, and trace-to-trace diffing
+- Standalone trace validation, summaries, diffing, and privacy-safe redacted exports
 - Namespaced key/value storage with atomic quota checks and deterministic replay
 - Checksummed durable storage with process locking and generation recovery
 - Portable storage snapshots with inspection, diffing, dry runs, and transactional restore
@@ -21,6 +21,8 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Manifest-declared state schemas with deterministic planning and isolated migration rehearsals
 - Durable migration commits with automatic rollback capture, receipts, and recovery evidence
 - Reproducible capsule manifests binding packages, source state, traces, and result state
+- State-reproducing capsule replay on disposable snapshot branches
+- Streaming content-addressed blobs with verification, materialization, and safe GC dry runs
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -49,6 +51,7 @@ cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml \
 
 cargo run -p cartridge-cli -- inspect dist/hello.cartridge
 cargo run -p cartridge-cli -- verify dist/hello.cartridge
+cargo run -p cartridge-cli -- asset verify dist/hello.cartridge message.txt
 cargo run -p cartridge-cli -- deps dist/hello.cartridge
 cargo run -p cartridge-cli -- resolve dist/hello.cartridge
 cargo run -p cartridge-cli -- run dist/hello.cartridge --trace dist/hello.trace.json -- Clyde
@@ -68,6 +71,9 @@ cargo run -p cartridge-cli -- run dist/hello.cartridge --from-snapshot backup.ca
 cargo run -p cartridge-cli -- storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
 cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
 cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
+cargo run -p cartridge-cli -- trace redact dist/hello.trace.json --output dist/hello.trace-summary.json
+cargo run -p cartridge-cli -- blob put dist/hello.trace.json --store dist/blobs
+cargo run -p cartridge-cli -- blob gc --store dist/blobs
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 ```
 
@@ -84,7 +90,7 @@ The initial API is intentionally narrow. Filesystem directories, network sockets
 ```text
 crates/cartridge-core/      package format, validation, and packing
 crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
-crates/cartridge-storage/   isolated storage contract and in-memory backend
+crates/cartridge-storage/   isolated state backends, snapshots, and content-addressed blobs
 crates/cartridge-trace/     versioned trace model, validation, and comparison
 crates/cartridge-cli/       pack, inspect, and run commands
 examples/hello-cartridge/   minimal Rust component and packaged asset
@@ -92,7 +98,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 

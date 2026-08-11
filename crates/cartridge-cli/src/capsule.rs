@@ -137,6 +137,7 @@ pub struct CapsuleReplayInputs {
     pub package_path: PathBuf,
     pub package: CartridgeArchive,
     pub trace: ExecutionTrace,
+    pub source: StorageSnapshot,
     pub arguments: Vec<String>,
     pub summary: CapsuleSummary,
 }
@@ -295,6 +296,17 @@ pub fn replay_inputs(path: &Path) -> Result<CapsuleReplayInputs> {
     let package_path = verify_artifact(&root, &capsule.payload.package, MAX_PACKAGE_FILE_BYTES)?;
     let package = CartridgeArchive::open(&package_path)?;
     verify_artifact(&root, &capsule.payload.package, MAX_PACKAGE_FILE_BYTES)?;
+    let source_path = verify_artifact(
+        &root,
+        &capsule.payload.source_snapshot.artifact,
+        MAX_SNAPSHOT_FILE_BYTES,
+    )?;
+    let source = StorageSnapshot::read(&source_path)?;
+    verify_artifact(
+        &root,
+        &capsule.payload.source_snapshot.artifact,
+        MAX_SNAPSHOT_FILE_BYTES,
+    )?;
     let trace_path = verify_artifact(
         &root,
         &capsule.payload.trace.artifact,
@@ -315,6 +327,7 @@ pub fn replay_inputs(path: &Path) -> Result<CapsuleReplayInputs> {
         package_path,
         package,
         trace,
+        source,
         arguments,
         summary: capsule.summary(),
     })

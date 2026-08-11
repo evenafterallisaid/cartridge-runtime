@@ -16,6 +16,17 @@ impl HostState {
             let result = decode_recorded_get(&outcome).inspect_err(|error| {
                 self.set_divergence(error.clone());
             });
+            if self.apply_replay_storage {
+                let actual = self
+                    .storage
+                    .get(&self.storage_namespace, key)
+                    .map_err(|error| error.to_string())?;
+                if result.as_ref().is_ok_and(|expected| expected != &actual) {
+                    let error = "source state does not match recorded storage get".to_owned();
+                    self.set_divergence(error.clone());
+                    return Err(error);
+                }
+            }
             self.record("storage", "get", outcome);
             return result;
         }
@@ -74,6 +85,15 @@ impl HostState {
             let result = decode_recorded_unit(&outcome).inspect_err(|error| {
                 self.set_divergence(error.clone());
             });
+            if self.apply_replay_storage && result.is_ok() {
+                self.storage
+                    .put(&self.storage_namespace, key, value, self.storage_limits)
+                    .map_err(|error| {
+                        let error = format!("replayed storage put failed: {error}");
+                        self.set_divergence(error.clone());
+                        error
+                    })?;
+            }
             self.record("storage", "put", outcome);
             return result;
         }
@@ -113,6 +133,20 @@ impl HostState {
             let result = decode_recorded_bool(&outcome, "deleted").inspect_err(|error| {
                 self.set_divergence(error.clone());
             });
+            if self.apply_replay_storage {
+                if let Ok(expected) = &result {
+                    let actual = self
+                        .storage
+                        .delete(&self.storage_namespace, key)
+                        .map_err(|error| error.to_string())?;
+                    if actual != *expected {
+                        let error =
+                            "source state does not match recorded storage delete".to_owned();
+                        self.set_divergence(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
             self.record("storage", "delete", outcome);
             return result;
         }
@@ -149,6 +183,17 @@ impl HostState {
             let result = decode_recorded_list(&outcome).inspect_err(|error| {
                 self.set_divergence(error.clone());
             });
+            if self.apply_replay_storage {
+                let actual = self
+                    .storage
+                    .list(&self.storage_namespace, prefix)
+                    .map_err(|error| error.to_string())?;
+                if result.as_ref().is_ok_and(|expected| expected != &actual) {
+                    let error = "source state does not match recorded storage list".to_owned();
+                    self.set_divergence(error.clone());
+                    return Err(error);
+                }
+            }
             self.record("storage", "list", outcome);
             return result;
         }
