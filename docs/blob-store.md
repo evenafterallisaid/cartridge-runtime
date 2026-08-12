@@ -6,9 +6,16 @@ The blob store keeps immutable files under their lowercase SHA-256 address. It i
 cartridge blob put video.bin --store ./blobs
 cartridge blob verify <sha256> --store ./blobs
 cartridge blob get <sha256> --store ./blobs --output restored.bin
+cartridge blob list --store ./blobs
+cartridge blob audit --store ./blobs
+cartridge blob roots create --snapshot backup.cartridge-state.json \
+  --capsule run.cartridge-capsule.json --output backup.cartridge-blobs.json
+cartridge blob roots inspect backup.cartridge-blobs.json
+cartridge blob roots verify backup.cartridge-blobs.json --store ./blobs
 cartridge blob gc --store ./blobs --keep <sha256>
 cartridge blob gc --store ./blobs --snapshot backup.cartridge-state.json
 cartridge blob gc --store ./blobs --capsule run.cartridge-capsule.json
+cartridge blob gc --store ./blobs --manifest backup.cartridge-blobs.json
 cartridge blob gc --store ./blobs --keep <sha256> --apply
 ```
 
@@ -27,6 +34,16 @@ A blob reference is a canonical storage value rather than a filename or host pat
 `BlobReference::new`, `encode`, and `decode` are public from `cartridge-storage` and re-exported by `cartridge-runtime`. Snapshot reachability ignores ordinary values. A value beginning with the reference prefix must have the exact length, lowercase digest, and a declared size no larger than the global blob limit or reachability extraction fails. Two references to the same digest must agree on size.
 
 References count toward normal key/value quotas. The referenced object does not: its separate store quota and lifecycle remain future guest-ABI work. Deleting a reference makes the object eligible for a later collection but never deletes it synchronously. Traces record the reference bytes like any other small storage value; they do not embed blob contents.
+
+## Root manifests
+
+`blob roots create` resolves up to 256 validated snapshots and capsules into a portable, path-free manifest. It records each source by kind and semantic payload digest, sorts and deduplicates sources and objects, and binds the complete payload with SHA-256. The command refuses to overwrite an existing output. `roots inspect` validates and summarizes the document; `roots verify` checks every declared object and byte length under the store lock. Garbage collection accepts multiple manifests alongside direct artifact and explicit digest roots.
+
+Root manifests avoid repeatedly opening large capsule backup sets, but they are integrity records rather than signatures. A valid manifest proves its object set has not changed since creation; it does not establish who selected those roots. See the [format document](blob-reachability-format.md).
+
+## Inventory and audit
+
+`blob list` walks the complete store under its lock, validates layout and every object digest, and emits objects in deterministic address order. It fails instead of returning a partial inventory if any object is corrupt. `blob audit` uses the same bounded walk but reports every content-corrupt object it can safely identify, then exits unsuccessfully when issues exist. Unsafe shard names, symlinks, unexpected entries, and stores over 100,000 objects fail immediately because continuing would make path or resource assumptions unsafe.
 
 Blob hashes provide integrity and deduplication, not authenticity or confidentiality. Low-entropy content is guessable from its address. Package signing and encrypted stores are separate concerns.
 

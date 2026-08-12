@@ -16,6 +16,7 @@ use crate::{Error, Result};
 
 pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_BLOB_GC_ROOTS: usize = 100_000;
+pub const MAX_BLOB_OBJECTS: usize = 100_000;
 const BLOB_REFERENCE_PREFIX: &[u8] = b"cartridge-blob-v1\0";
 const BLOB_REFERENCE_BYTES: usize = BLOB_REFERENCE_PREFIX.len() + 64 + 8;
 
@@ -103,6 +104,38 @@ pub struct BlobGcReport {
     pub removed: usize,
     pub removed_bytes: u64,
     pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct BlobInventory {
+    pub objects: Vec<BlobReference>,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlobAuditIssue {
+    pub sha256: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct BlobAuditReport {
+    pub valid_objects: usize,
+    pub valid_bytes: u64,
+    pub issues: Vec<BlobAuditIssue>,
+}
+
+impl BlobAuditReport {
+    #[must_use]
+    pub fn healthy(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct BlobReferenceVerification {
+    pub objects: usize,
+    pub bytes: u64,
 }
 
 impl BlobStore {
@@ -212,7 +245,12 @@ impl BlobStore {
     fn verify_locked(&self, sha256: &str) -> Result<BlobInfo> {
         self.validate_layout()?;
         let path = self.object_path(sha256)?;
-        reject_symlink(&path)?;
+        self.verify_object_path_locked(sha256, &path)
+    }
+
+    fn verify_object_path_locked(&self, sha256: &str, path: &Path) -> Result<BlobInfo> {
+        validate_digest(sha256)?;
+        reject_symlink(path)?;
         let shard = path
             .parent()
             .ok_or_else(|| Error::UnsafePath(path.display().to_string()))?;
@@ -220,7 +258,7 @@ impl BlobStore {
         if !fs::canonicalize(shard)?.starts_with(&self.objects) {
             return Err(Error::UnsafePath(shard.display().to_string()));
         }
-        let canonical = fs::canonicalize(&path)?;
+        let canonical = fs::canonicalize(path)?;
         if !canonical.starts_with(&self.objects) {
             return Err(Error::UnsafePath(path.display().to_string()));
         }
@@ -270,6 +308,93 @@ impl BlobStore {
         Ok(verified)
     }
 
+    pub fn inventory(&self) -> Result<BlobInventory> {
+        let lock = self.acquire_lock()?;
+        let result = self.inventory_locked();
+        drop(lock);
+        result
+    }
+
+    fn inventory_locked(&self) -> Result<BlobInventory> {
+        self.validate_layout()?;
+        let mut inventory = BlobInventory::default();
+        for path in self.object_files()? {
+            let sha256 = object_digest(&path)?;
+            let info = self.verify_object_path_locked(&sha256, &path)?;
+            inventory.total_bytes = inventory
+                .total_bytes
+                .checked_add(info.bytes)
+                .ok_or_else(|| Error::Corrupt("blob inventory size overflowed".into()))?;
+            inventory
+                .objects
+                .push(BlobReference::new(info.sha256, info.bytes)?);
+        }
+        Ok(inventory)
+    }
+
+    pub fn audit(&self) -> Result<BlobAuditReport> {
+        let lock = self.acquire_lock()?;
+        let result = self.audit_locked();
+        drop(lock);
+        result
+    }
+
+    fn audit_locked(&self) -> Result<BlobAuditReport> {
+        self.validate_layout()?;
+        let mut report = BlobAuditReport::default();
+        for path in self.object_files()? {
+            let sha256 = object_digest(&path)?;
+            match self.verify_object_path_locked(&sha256, &path) {
+                Ok(info) => {
+                    report.valid_objects += 1;
+                    report.valid_bytes = report
+                        .valid_bytes
+                        .checked_add(info.bytes)
+                        .ok_or_else(|| Error::Corrupt("blob audit size overflowed".into()))?;
+                }
+                Err(error) => report.issues.push(BlobAuditIssue {
+                    sha256,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn verify_references(
+        &self,
+        references: &BTreeMap<String, u64>,
+    ) -> Result<BlobReferenceVerification> {
+        let lock = self.acquire_lock()?;
+        let result = self.verify_references_locked(references);
+        drop(lock);
+        result
+    }
+
+    fn verify_references_locked(
+        &self,
+        references: &BTreeMap<String, u64>,
+    ) -> Result<BlobReferenceVerification> {
+        validate_gc_root_count(0, references.len())?;
+        let mut report = BlobReferenceVerification::default();
+        for (sha256, expected_bytes) in references {
+            let reference = BlobReference::new(sha256, *expected_bytes)?;
+            let actual = self.verify_locked(&reference.sha256)?;
+            if actual.bytes != reference.bytes {
+                return Err(Error::Corrupt(format!(
+                    "blob {} has {} bytes; reference declares {}",
+                    reference.sha256, actual.bytes, reference.bytes
+                )));
+            }
+            report.objects += 1;
+            report.bytes = report
+                .bytes
+                .checked_add(actual.bytes)
+                .ok_or_else(|| Error::Corrupt("blob reference size overflowed".into()))?;
+        }
+        Ok(report)
+    }
+
     pub fn gc(&self, retained: &BTreeSet<String>, dry_run: bool) -> Result<BlobGcReport> {
         self.gc_with_references(retained, &BTreeMap::new(), dry_run)
     }
@@ -294,17 +419,8 @@ impl BlobStore {
     ) -> Result<BlobGcReport> {
         validate_gc_root_count(retained.len(), references.len())?;
         let mut all_retained = retained.clone();
-        for (sha256, expected_bytes) in references {
-            let reference = BlobReference::new(sha256, *expected_bytes)?;
-            let actual = self.verify_locked(&reference.sha256)?;
-            if actual.bytes != reference.bytes {
-                return Err(Error::Corrupt(format!(
-                    "blob {} has {} bytes; reference declares {}",
-                    reference.sha256, actual.bytes, reference.bytes
-                )));
-            }
-            all_retained.insert(reference.sha256);
-        }
+        self.verify_references_locked(references)?;
+        all_retained.extend(references.keys().cloned());
         self.gc_locked(&all_retained, dry_run)
     }
 
@@ -419,8 +535,14 @@ impl BlobStore {
                     return Err(Error::UnsafePath(entry.path().display().to_string()));
                 }
                 files.push(entry.path());
+                if files.len() > MAX_BLOB_OBJECTS {
+                    return Err(Error::Corrupt(format!(
+                        "blob store exceeds the {MAX_BLOB_OBJECTS}-object limit"
+                    )));
+                }
             }
         }
+        files.sort();
         Ok(files)
     }
 
@@ -518,6 +640,13 @@ fn validate_digest(value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn object_digest(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::UnsafePath(path.display().to_string()))
 }
 
 fn validate_gc_root_count(retained: usize, references: usize) -> Result<()> {
@@ -684,6 +813,53 @@ mod tests {
 
         assert!(store.gc(&BTreeSet::new(), false).is_err());
         store.verify(&objects[0].sha256).unwrap();
+    }
+
+    #[test]
+    fn inventory_is_sorted_and_audit_reports_every_corrupt_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_input = directory.path().join("first.bin");
+        let second_input = directory.path().join("second.bin");
+        fs::write(&first_input, b"first").unwrap();
+        fs::write(&second_input, b"second").unwrap();
+        let store = BlobStore::open(directory.path().join("store")).unwrap();
+        let first = store.put(&first_input).unwrap();
+        let second = store.put(&second_input).unwrap();
+
+        let inventory = store.inventory().unwrap();
+        assert_eq!(inventory.objects.len(), 2);
+        assert_eq!(inventory.total_bytes, first.bytes + second.bytes);
+        assert!(inventory.objects[0].sha256 < inventory.objects[1].sha256);
+
+        fs::write(store.object_path(&first.sha256).unwrap(), b"broken one").unwrap();
+        fs::write(store.object_path(&second.sha256).unwrap(), b"broken two").unwrap();
+        let audit = store.audit().unwrap();
+        assert!(!audit.healthy());
+        assert_eq!(audit.valid_objects, 0);
+        assert_eq!(audit.valid_bytes, 0);
+        assert_eq!(audit.issues.len(), 2);
+        assert!(audit.issues[0].sha256 < audit.issues[1].sha256);
+        assert!(store.inventory().is_err());
+    }
+
+    #[test]
+    fn reference_verification_checks_every_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.bin");
+        fs::write(&input, b"content").unwrap();
+        let store = BlobStore::open(directory.path().join("store")).unwrap();
+        let info = store.put(&input).unwrap();
+
+        let verified = store
+            .verify_references(&BTreeMap::from([(info.sha256.clone(), info.bytes)]))
+            .unwrap();
+        assert_eq!(verified.objects, 1);
+        assert_eq!(verified.bytes, info.bytes);
+        assert!(
+            store
+                .verify_references(&BTreeMap::from([(info.sha256, info.bytes + 1)]))
+                .is_err()
+        );
     }
 
     #[test]

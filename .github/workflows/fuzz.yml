@@ -26,3 +26,4 @@ jobs:
       - run: cargo +nightly fuzz run snapshot -- -max_total_time=30 -rss_limit_mb=2048
       - run: cargo +nightly fuzz run trace -- -max_total_time=30 -rss_limit_mb=2048
       - run: cargo +nightly fuzz run transaction -- -max_total_time=30 -rss_limit_mb=2048
+      - run: cargo +nightly fuzz run reachability -- -max_total_time=30 -rss_limit_mb=2048

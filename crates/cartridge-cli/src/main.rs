@@ -17,8 +17,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
-    BlobStore, DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
-    Runtime, SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
+    BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
+    DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS, Runtime,
+    SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
 };
 use cartridge_trace::{
     ExecutionTrace, MAX_REDACTED_TRACE_DOCUMENT_BYTES, MAX_TRACE_DOCUMENT_BYTES, RedactionProfile,
@@ -210,6 +211,25 @@ enum BlobCommand {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// list every verified object in address order
+    List {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify every object and report all content failures
+    Audit {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// create and verify reusable reachability root sets
+    Roots {
+        #[command(subcommand)]
+        command: BlobRootsCommand,
+    },
     /// find or remove objects not listed by digest
     Gc {
         #[arg(long)]
@@ -220,8 +240,37 @@ enum BlobCommand {
         snapshot: Vec<PathBuf>,
         #[arg(long, value_name = "CAPSULE")]
         capsule: Vec<PathBuf>,
+        #[arg(long, value_name = "MANIFEST")]
+        manifest: Vec<PathBuf>,
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlobRootsCommand {
+    /// resolve snapshots and capsules into one checksummed root set
+    Create {
+        #[arg(long, value_name = "SNAPSHOT")]
+        snapshot: Vec<PathBuf>,
+        #[arg(long, value_name = "CAPSULE")]
+        capsule: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// validate and summarize a reachability manifest
+    Inspect {
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify every object retained by a reachability manifest
+    Verify {
+        manifest: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -535,52 +584,197 @@ fn run_blob_command(command: BlobCommand) -> Result<()> {
             );
             Ok(())
         }
+        BlobCommand::List { store, json } => blob_list_command(&store, json),
+        BlobCommand::Audit { store, json } => blob_audit_command(&store, json),
+        BlobCommand::Roots { command } => run_blob_roots_command(command),
         BlobCommand::Gc {
             store,
             keep,
             snapshot,
             capsule,
+            manifest,
             apply,
             json,
+        } => blob_gc_command(&store, keep, snapshot, capsule, manifest, apply, json),
+    }
+}
+
+fn blob_list_command(store: &Path, json: bool) -> Result<()> {
+    let inventory = BlobStore::open(store)?.inventory()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inventory)?);
+    } else {
+        for object in &inventory.objects {
+            println!("{} {}", object.sha256, object.bytes);
+        }
+        println!("objects: {}", inventory.objects.len());
+        println!("bytes: {}", inventory.total_bytes);
+    }
+    Ok(())
+}
+
+fn blob_audit_command(store: &Path, json: bool) -> Result<()> {
+    let report = BlobStore::open(store)?.audit()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("valid objects: {}", report.valid_objects);
+        println!("valid bytes: {}", report.valid_bytes);
+        println!("issues: {}", report.issues.len());
+        for issue in &report.issues {
+            println!("  {}: {}", issue.sha256, issue.error);
+        }
+    }
+    if !report.healthy() {
+        bail!("blob store audit found {} issue(s)", report.issues.len());
+    }
+    Ok(())
+}
+
+fn blob_gc_command(
+    store: &Path,
+    keep: Vec<String>,
+    snapshots: Vec<PathBuf>,
+    capsules: Vec<PathBuf>,
+    manifests: Vec<PathBuf>,
+    apply: bool,
+    json: bool,
+) -> Result<()> {
+    let root_count = snapshots
+        .len()
+        .checked_add(capsules.len())
+        .and_then(|count| count.checked_add(manifests.len()))
+        .context("blob reachability root count overflowed")?;
+    if root_count > MAX_BLOB_GC_ROOT_ARTIFACTS {
+        bail!(
+            "blob garbage collection accepts at most {MAX_BLOB_GC_ROOT_ARTIFACTS} artifact roots"
+        );
+    }
+    let retained: BTreeSet<_> = keep.into_iter().collect();
+    let mut references = BTreeMap::new();
+    for path in snapshots {
+        let snapshot = StorageSnapshot::read(&path)
+            .with_context(|| format!("could not read snapshot {}", path.display()))?;
+        merge_blob_references(&mut references, snapshot.blob_references()?)?;
+    }
+    for path in capsules {
+        let reachability = capsule::blob_references(&path)?;
+        merge_blob_references(&mut references, reachability.references)?;
+    }
+    for path in manifests {
+        let manifest = BlobReachabilityManifest::read(&path)
+            .with_context(|| format!("could not read reachability manifest {}", path.display()))?;
+        merge_blob_references(&mut references, manifest.objects().clone())?;
+    }
+    let report = BlobStore::open(store)?.gc_with_references(&retained, &references, !apply)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("retained: {}", report.retained);
+        println!(
+            "removable: {} object(s), {} bytes",
+            report.removable, report.removable_bytes
+        );
+        println!(
+            "removed: {} object(s), {} bytes",
+            report.removed, report.removed_bytes
+        );
+        println!("dry run: {}", report.dry_run);
+    }
+    Ok(())
+}
+
+fn run_blob_roots_command(command: BlobRootsCommand) -> Result<()> {
+    match command {
+        BlobRootsCommand::Create {
+            snapshot,
+            capsule,
+            output,
         } => {
-            let root_count = snapshot
-                .len()
-                .checked_add(capsule.len())
-                .context("blob reachability root count overflowed")?;
-            if root_count > MAX_BLOB_GC_ROOT_ARTIFACTS {
-                bail!(
-                    "blob garbage collection accepts at most {MAX_BLOB_GC_ROOT_ARTIFACTS} snapshot and capsule roots"
-                );
-            }
-            let retained: BTreeSet<_> = keep.into_iter().collect();
-            let mut references = BTreeMap::new();
-            for path in snapshot {
-                let snapshot = StorageSnapshot::read(&path)
-                    .with_context(|| format!("could not read snapshot {}", path.display()))?;
-                merge_blob_references(&mut references, snapshot.blob_references()?)?;
-            }
-            for path in capsule {
-                merge_blob_references(&mut references, capsule::blob_references(&path)?)?;
-            }
-            let report =
-                BlobStore::open(store)?.gc_with_references(&retained, &references, !apply)?;
+            let (sources, references) = collect_blob_reachability(snapshot, capsule)?;
+            let manifest = BlobReachabilityManifest::new(sources, references)?;
+            let summary = manifest.summary()?;
+            manifest.write_new(&output)?;
+            println!(
+                "wrote {} source(s) and {} object(s) -> {}",
+                summary.sources,
+                summary.objects,
+                output.display()
+            );
+            Ok(())
+        }
+        BlobRootsCommand::Inspect { manifest, json } => {
+            let summary = BlobReachabilityManifest::read(manifest)?.summary()?;
+            print_blob_reachability_summary(&summary, json)
+        }
+        BlobRootsCommand::Verify {
+            manifest,
+            store,
+            json,
+        } => {
+            let manifest = BlobReachabilityManifest::read(manifest)?;
+            let verification = BlobStore::open(store)?.verify_references(manifest.objects())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", serde_json::to_string_pretty(&verification)?);
             } else {
-                println!("retained: {}", report.retained);
-                println!(
-                    "removable: {} object(s), {} bytes",
-                    report.removable, report.removable_bytes
-                );
-                println!(
-                    "removed: {} object(s), {} bytes",
-                    report.removed, report.removed_bytes
-                );
-                println!("dry run: {}", report.dry_run);
+                println!("verified objects: {}", verification.objects);
+                println!("verified bytes: {}", verification.bytes);
             }
             Ok(())
         }
     }
+}
+
+fn collect_blob_reachability(
+    snapshots: Vec<PathBuf>,
+    capsules: Vec<PathBuf>,
+) -> Result<(BTreeSet<BlobReachabilitySource>, BTreeMap<String, u64>)> {
+    let root_count = snapshots
+        .len()
+        .checked_add(capsules.len())
+        .context("blob reachability root count overflowed")?;
+    if root_count == 0 || root_count > MAX_BLOB_GC_ROOT_ARTIFACTS {
+        bail!(
+            "blob reachability requires between 1 and {MAX_BLOB_GC_ROOT_ARTIFACTS} snapshot or capsule roots"
+        );
+    }
+    let mut sources = BTreeSet::new();
+    let mut references = BTreeMap::new();
+    for path in snapshots {
+        let snapshot = StorageSnapshot::read(&path)
+            .with_context(|| format!("could not read snapshot {}", path.display()))?;
+        let summary = snapshot.summary()?;
+        sources.insert(BlobReachabilitySource::new(
+            BlobReachabilitySourceKind::Snapshot,
+            summary.payload_sha256,
+        )?);
+        merge_blob_references(&mut references, snapshot.blob_references()?)?;
+    }
+    for path in capsules {
+        let reachability = capsule::blob_references(&path)?;
+        sources.insert(BlobReachabilitySource::new(
+            BlobReachabilitySourceKind::Capsule,
+            reachability.capsule_sha256,
+        )?);
+        merge_blob_references(&mut references, reachability.references)?;
+    }
+    Ok((sources, references))
+}
+
+fn print_blob_reachability_summary(
+    summary: &cartridge_runtime::BlobReachabilitySummary,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(summary)?);
+    } else {
+        println!("reachability format: {}", summary.format_version);
+        println!("sources: {}", summary.sources);
+        println!("objects: {}", summary.objects);
+        println!("bytes: {}", summary.bytes);
+        println!("payload sha256: {}", summary.payload_sha256);
+    }
+    Ok(())
 }
 
 fn merge_blob_references(
@@ -2037,12 +2231,30 @@ mod tests {
             .write_new(&snapshot_path)
             .unwrap();
 
+        let manifest_path = directory.path().join("roots.json");
+        let (sources, references) =
+            collect_blob_reachability(vec![snapshot_path], Vec::new()).unwrap();
+        BlobReachabilityManifest::new(sources, references)
+            .unwrap()
+            .write_new(&manifest_path)
+            .unwrap();
         run_blob_command(BlobCommand::Gc {
-            store: store_path,
+            store: store_path.clone(),
             keep: Vec::new(),
-            snapshot: vec![snapshot_path],
+            snapshot: Vec::new(),
             capsule: Vec::new(),
+            manifest: vec![manifest_path],
             apply: true,
+            json: true,
+        })
+        .unwrap();
+        run_blob_command(BlobCommand::List {
+            store: store_path.clone(),
+            json: true,
+        })
+        .unwrap();
+        run_blob_command(BlobCommand::Audit {
+            store: store_path,
             json: true,
         })
         .unwrap();

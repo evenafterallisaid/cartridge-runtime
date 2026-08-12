@@ -144,6 +144,11 @@ pub struct CapsuleReplayInputs {
     pub summary: CapsuleSummary,
 }
 
+pub struct CapsuleBlobReachability {
+    pub capsule_sha256: String,
+    pub references: BTreeMap<String, u64>,
+}
+
 pub fn create(
     package_path: &Path,
     source_path: &Path,
@@ -283,7 +288,7 @@ pub fn verify(path: &Path) -> Result<CapsuleVerification> {
     })
 }
 
-pub fn blob_references(path: &Path) -> Result<BTreeMap<String, u64>> {
+pub fn blob_references(path: &Path) -> Result<CapsuleBlobReachability> {
     let initial = verify(path)?;
     let capsule = Capsule::read(path)?;
     if capsule.payload_sha256 != initial.capsule.capsule_sha256 {
@@ -303,7 +308,10 @@ pub fn blob_references(path: &Path) -> Result<BTreeMap<String, u64>> {
     if final_verification.capsule.capsule_sha256 != initial.capsule.capsule_sha256 {
         bail!("capsule changed while blob references were being loaded");
     }
-    Ok(references)
+    Ok(CapsuleBlobReachability {
+        capsule_sha256: initial.capsule.capsule_sha256,
+        references,
+    })
 }
 
 pub fn replay_inputs(path: &Path) -> Result<CapsuleReplayInputs> {

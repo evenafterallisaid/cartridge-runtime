@@ -139,11 +139,12 @@ Delivery slices:
    - [implemented] finite-wait cross-process exclusion for reads, writes, and collection
    - [implemented] safe-by-default explicit-retain garbage collection
    - [implemented] canonical references and verified reachability from snapshots and capsules
-   - persist signed or checksummed multi-artifact reachability manifests for backup sets
+   - [implemented] checksummed, path-free multi-artifact reachability manifests for backup sets
+   - sign reachability manifests after package signing and trust-store policy exist
    - add guest-visible streaming blob resources after store quota and authorization semantics are fixed
 10. [implemented] ABA-safe namespace revisions, compare-exchange, and bounded atomic guest batches across memory, snapshot, and durable backends.
 
-The first eight slices, the host-side foundation of slice nine, and slice ten are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata while preserving the monotonic revision clock. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source and isolated migration revision to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
+The first eight slices, the storage-management plane of slice nine, and slice ten are implemented. Slice nine now has canonical references, artifact-derived reachability, reusable root manifests, verified inventory, integrity auditing, and fail-closed collection. Its remaining boundary is guest authority and streaming: per-cartridge store quotas, lifecycle ownership, and an async resource API must be fixed before cartridges can create or read blobs themselves. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata while preserving the monotonic revision clock. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source and isolated migration revision to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
 
 Migration design constraints:
 
@@ -775,7 +776,9 @@ The next concrete sequence is:
    - [implemented] define canonical digest-and-size references with fail-closed decoding
    - [implemented] derive live reachability from checksum-validated snapshots and fully verified capsules
    - [implemented] verify every artifact-derived retained object under the collection lock before deletion
-   - add a checksummed reachability manifest that can bind larger backup sets without rescanning every capsule
+   - [implemented] add a checksummed reachability manifest that binds larger backup sets without rescanning every capsule
+   - [implemented] add deterministic verified inventory and bounded full-store integrity auditing
+   - sign root manifests once developer identities and trust-store policy exist
    - define per-cartridge blob-store quotas and authorization before adding the streaming guest ABI
 3. [implemented] Generalize migration's conditional commit into guest-facing compare-exchange and bounded atomic batches, with trace events and ABA-safe portable revision tokens.
 4. [implemented] Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
@@ -799,10 +802,10 @@ Completed foundations:
 - portable execution capsule manifests with path confinement, raw artifact digests, and semantic cross-file verification
 - state-reproducing capsule replay on disposable snapshot branches
 - privacy-safe non-replayable trace summary and metadata exports
-- content-addressed blob storage with bounded streaming I/O, verified artifact reachability, and safe-by-default garbage collection
+- content-addressed blob storage with bounded streaming I/O, checksummed reachability manifests, deterministic inventory, full-store audits, and safe-by-default garbage collection
 - ABA-safe compare-exchange and bounded atomic state batches across all storage backends
 - Merkle-style package asset roots and selective payload verification
-- seeded archive, manifest, snapshot, trace, and atomic-transaction fuzz targets with scheduled bounded runs
+- seeded archive, package-manifest, snapshot, trace, atomic-transaction, and blob-reachability fuzz targets with scheduled bounded runs
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals

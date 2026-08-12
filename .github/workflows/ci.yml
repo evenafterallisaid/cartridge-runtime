@@ -86,6 +86,12 @@ jobs:
           cargo run -p cartridge-cli -- blob verify "$blob_digest" --store blobs
           cargo run -p cartridge-cli -- blob get "$blob_digest" --store blobs --output restored.trace.json
           cmp hello.trace.json restored.trace.json
+          cargo run -p cartridge-cli -- blob list --store blobs
+          cargo run -p cartridge-cli -- blob audit --store blobs
+          cargo run -p cartridge-cli -- blob roots create --snapshot first.cartridge-state.json --capsule run.cartridge-capsule.json --output roots.cartridge-blobs.json
+          cargo run -p cartridge-cli -- blob roots inspect roots.cartridge-blobs.json
+          cargo run -p cartridge-cli -- blob roots verify roots.cartridge-blobs.json --store blobs
+          cargo run -p cartridge-cli -- blob gc --store blobs --manifest roots.cartridge-blobs.json --keep "$blob_digest"
           cargo run -p cartridge-cli -- blob gc --store blobs --keep "$blob_digest"
           cargo run -p cartridge-cli -- replay hello.cartridge hello.trace.json -- CI
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/Cartridge.toml --component tests/fixtures/migration-cartridge/target/wasm32-wasip2/release/migration_cartridge.wasm --output migration.cartridge

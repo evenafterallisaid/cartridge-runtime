@@ -1,5 +1,6 @@
 mod blob;
 mod directory;
+mod reachability;
 mod snapshot;
 
 use std::{
@@ -12,10 +13,16 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub use blob::{
-    BlobGcReport, BlobInfo, BlobReference, BlobStore, MAX_BLOB_BYTES, MAX_BLOB_GC_ROOTS,
+    BlobAuditIssue, BlobAuditReport, BlobGcReport, BlobInfo, BlobInventory, BlobReference,
+    BlobReferenceVerification, BlobStore, MAX_BLOB_BYTES, MAX_BLOB_GC_ROOTS, MAX_BLOB_OBJECTS,
 };
 pub use directory::{
     CapturedState, DirectoryStorage, GenerationEvidence, RecoveryReport, RestorePlan,
+};
+pub use reachability::{
+    BLOB_REACHABILITY_FORMAT_VERSION, BlobReachabilityManifest, BlobReachabilitySource,
+    BlobReachabilitySourceKind, BlobReachabilitySummary, MAX_BLOB_REACHABILITY_DOCUMENT_BYTES,
+    MAX_BLOB_REACHABILITY_SOURCES,
 };
 pub use snapshot::{
     SnapshotComparison, SnapshotDifference, SnapshotEntry, SnapshotStorage, StorageSnapshot,

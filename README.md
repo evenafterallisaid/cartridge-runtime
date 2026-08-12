@@ -23,6 +23,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Reproducible capsule manifests binding packages, source state, traces, and result state
 - State-reproducing capsule replay on disposable snapshot branches
 - Streaming content-addressed blobs with verified snapshot/capsule reachability and safe GC dry runs
+- Checksummed blob root manifests plus deterministic inventory and full-store integrity audits
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -73,6 +74,10 @@ cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
 cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
 cargo run -p cartridge-cli -- trace redact dist/hello.trace.json --output dist/hello.trace-summary.json
 cargo run -p cartridge-cli -- blob put dist/hello.trace.json --store dist/blobs
+cargo run -p cartridge-cli -- blob list --store dist/blobs
+cargo run -p cartridge-cli -- blob audit --store dist/blobs
+cargo run -p cartridge-cli -- blob roots create --snapshot backup.cartridge-state.json --output backup.cartridge-blobs.json
+cargo run -p cartridge-cli -- blob roots verify backup.cartridge-blobs.json --store dist/blobs
 cargo run -p cartridge-cli -- blob gc --store dist/blobs --snapshot backup.cartridge-state.json
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 ```
@@ -98,7 +103,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 
