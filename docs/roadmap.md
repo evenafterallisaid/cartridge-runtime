@@ -435,9 +435,9 @@ Purpose: let independently developed cartridges form applications and workflows 
 
 Work:
 
-- installed-cartridge catalog
+- installed-cartridge catalog with immutable package identities
 - transitive semantic-version resolver
-- exact launch-plan lockfiles
+- [implemented] bounded exact-byte direct launch-plan lockfiles and verification
 - service discovery separated from permission
 - persistent and session-only relationship grants
 - multi-instance supervisor
@@ -450,6 +450,17 @@ Work:
 - side-by-side major versions
 - graph view in the desktop permission UI
 - composition events in deterministic traces
+
+Build order:
+
+1. [implemented] persist the direct resolver result as a create-new lock that binds package bytes, component/assets, versions, aliases, and interfaces
+2. resolve from the installed catalog and verify that every selected package still matches its library record
+3. expand the lock into a transitive graph with side-by-side major versions and minimal unsatisfied-constraint diagnostics
+4. separate graph compatibility, user approval, and activation into independently inspectable documents
+5. supervise provider instances with deadlines, restart budgets, cancellation, and bounded queues before exposing calls
+6. add typed synchronous calls, then async calls and resource delegation with provenance
+7. record activation, calls, cancellation, backpressure, crashes, and revocation in deterministic traces
+8. add desktop graph inspection and per-edge persistent/session grants
 
 Exit criteria:
 

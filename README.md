@@ -65,6 +65,8 @@ cargo run -p cartridge-cli -- platform dist/hello.cartridge
 cargo run -p cartridge-cli -- asset verify dist/hello.cartridge message.txt
 cargo run -p cartridge-cli -- deps dist/hello.cartridge
 cargo run -p cartridge-cli -- resolve dist/hello.cartridge
+cargo run -p cartridge-cli -- resolve app.cartridge provider.cartridge --lock app.cartridge-lock.json
+cargo run -p cartridge-cli -- resolve app.cartridge provider.cartridge --locked app.cartridge-lock.json
 cargo run -p cartridge-cli -- run dist/hello.cartridge --trace dist/hello.trace.json -- Clyde
 cargo run -p cartridge-cli -- identity keygen --output developer.key.json
 cargo run -p cartridge-cli -- identity sign dist/hello.cartridge --key developer.key.json --output hello.signature.json

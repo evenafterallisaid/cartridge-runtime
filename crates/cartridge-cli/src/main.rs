@@ -16,7 +16,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use cartridge_core::{
-    CartridgeArchive, PackOptions, ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
+    CartridgeArchive, CompositionLock, LockedPackage, PackOptions, ResolutionPlan,
+    negotiate_platform, pack, resolve_dependencies,
 };
 use cartridge_desktop::{Capability, LaunchStatus, Library};
 use cartridge_dev::{
@@ -188,6 +189,10 @@ enum Command {
         candidates: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        #[arg(long, conflicts_with = "locked")]
+        lock: Option<PathBuf>,
+        #[arg(long, conflicts_with = "lock")]
+        locked: Option<PathBuf>,
     },
     /// selectively verify package assets
     Asset {
@@ -942,7 +947,9 @@ fn run_cli() -> Result<()> {
             root,
             candidates,
             json,
-        } => resolve_command(&root, &candidates, json),
+            lock,
+            locked,
+        } => resolve_command(&root, &candidates, json, lock.as_deref(), locked.as_deref()),
         Command::Asset { command } => run_asset_command(command),
         Command::Blob { command } => run_blob_command(command),
         Command::Run {
@@ -2934,22 +2941,95 @@ fn deps_command(package: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn resolve_command(root: &Path, candidates: &[PathBuf], json: bool) -> Result<()> {
-    let root = CartridgeArchive::open(root)
-        .with_context(|| format!("could not inspect {}", root.display()))?;
+fn resolve_command(
+    root_path: &Path,
+    candidates: &[PathBuf],
+    json: bool,
+    lock_output: Option<&Path>,
+    locked: Option<&Path>,
+) -> Result<()> {
+    let root = CartridgeArchive::open(root_path)
+        .with_context(|| format!("could not inspect {}", root_path.display()))?;
     let mut manifests = Vec::with_capacity(candidates.len());
+    let mut packages = Vec::with_capacity(candidates.len());
     for path in candidates {
         let candidate = CartridgeArchive::open(path)
             .with_context(|| format!("could not inspect {}", path.display()))?;
+        packages.push(locked_package(&candidate));
         manifests.push(candidate.manifest);
     }
     let plan = resolve_dependencies(&root.manifest, &manifests)?;
+    let mut selected = Vec::with_capacity(plan.resolved.len());
+    for dependency in &plan.resolved {
+        let package = packages
+            .iter()
+            .find(|package| {
+                package.cartridge_id == dependency.cartridge
+                    && package.version == dependency.version
+            })
+            .context("resolver selected a provider without package identity")?;
+        if !selected.iter().any(|selected: &LockedPackage| {
+            selected.cartridge_id == package.cartridge_id && selected.version == package.version
+        }) {
+            selected.push(package.clone());
+        }
+    }
+    let lock = CompositionLock::new(locked_package(&root), selected, plan.clone())
+        .map_err(anyhow::Error::msg)?;
+    if let Some(path) = locked {
+        let expected: CompositionLock = serde_json::from_slice(&read_bounded_json(path)?)?;
+        expected.validate().map_err(anyhow::Error::msg)?;
+        if expected != lock {
+            bail!("composition lock does not match the current package set");
+        }
+        println!("verified composition lock {}", path.display());
+        return Ok(());
+    }
+    if let Some(path) = lock_output {
+        write_private(path, &serde_json::to_vec_pretty(&lock)?)?;
+        println!("locked composition plan -> {}", path.display());
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
-        print_resolution(&plan);
+        print_resolution(&lock.plan);
     }
     Ok(())
+}
+
+fn locked_package(archive: &CartridgeArchive) -> LockedPackage {
+    LockedPackage {
+        cartridge_id: archive.manifest.cartridge.id.clone(),
+        version: archive.manifest.cartridge.version.clone(),
+        package_sha256: archive.package_sha256.clone(),
+        package_bytes: archive.package_bytes,
+        component_sha256: archive
+            .manifest
+            .integrity
+            .component_sha256
+            .to_ascii_lowercase(),
+        assets_root_sha256: archive
+            .manifest
+            .integrity
+            .assets_root_sha256
+            .to_ascii_lowercase(),
+    }
+}
+
+fn read_bounded_json(path: &Path) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > LIMIT {
+        bail!("composition lock is not a bounded regular file");
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("composition lock exceeded its byte limit while reading");
+    }
+    Ok(bytes)
 }
 
 fn run_command(options: RunCommandOptions<'_>) -> Result<()> {

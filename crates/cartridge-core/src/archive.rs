@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Cursor, Read, Seek},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -18,6 +18,7 @@ const COMPONENT_PATH: &str = "component.wasm";
 
 #[derive(Clone, Copy, Debug)]
 pub struct PackageLimits {
+    pub archive_bytes: u64,
     pub manifest_bytes: u64,
     pub component_bytes: u64,
     pub asset_bytes: u64,
@@ -28,6 +29,7 @@ pub struct PackageLimits {
 impl Default for PackageLimits {
     fn default() -> Self {
         Self {
+            archive_bytes: 160 * 1024 * 1024,
             manifest_bytes: 1024 * 1024,
             component_bytes: 32 * 1024 * 1024,
             asset_bytes: 16 * 1024 * 1024,
@@ -39,6 +41,8 @@ impl Default for PackageLimits {
 
 #[derive(Debug)]
 pub struct CartridgeArchive {
+    pub package_sha256: String,
+    pub package_bytes: u64,
     pub manifest: PackageManifest,
     pub component: Vec<u8>,
     pub assets: BTreeMap<String, Vec<u8>>,
@@ -68,8 +72,10 @@ impl CartridgeArchive {
         Self::open_reader(Cursor::new(bytes), PackageLimits::default())
     }
 
-    fn open_reader(reader: impl Read + Seek, limits: PackageLimits) -> Result<Self> {
-        let mut zip = ZipArchive::new(reader)?;
+    fn open_reader(mut reader: impl Read + Seek, limits: PackageLimits) -> Result<Self> {
+        let (bytes, package_bytes, package_sha256) =
+            package_snapshot(&mut reader, limits.archive_bytes)?;
+        let mut zip = ZipArchive::new(Cursor::new(bytes))?;
         if zip.len() > limits.entries {
             return Err(Error::Archive(format!(
                 "archive contains {} entries; maximum is {}",
@@ -144,6 +150,8 @@ impl CartridgeArchive {
         verify_assets(&manifest, &assets)?;
 
         Ok(Self {
+            package_sha256,
+            package_bytes,
             manifest,
             component,
             assets,
@@ -210,6 +218,27 @@ impl CartridgeArchive {
             assets_root_sha256: manifest.integrity.assets_root_sha256,
         })
     }
+}
+
+fn package_snapshot(reader: &mut (impl Read + Seek), limit: u64) -> Result<(Vec<u8>, u64, String)> {
+    let package_bytes = reader.seek(SeekFrom::End(0))?;
+    if package_bytes == 0 || package_bytes > limit {
+        return Err(Error::Archive(format!(
+            "archive byte length must be between 1 and {limit}"
+        )));
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let capacity = usize::try_from(package_bytes)
+        .map_err(|_| Error::Archive("archive is too large for this platform".into()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != package_bytes {
+        return Err(Error::Archive(
+            "archive byte length changed while reading".into(),
+        ));
+    }
+    let package_sha256 = hex::encode(Sha256::digest(&bytes));
+    Ok((bytes, package_bytes, package_sha256))
 }
 
 struct SelectiveEntries {
@@ -366,6 +395,62 @@ mod tests {
     use crate::{CartridgeMetadata, Integrity, Permissions, RuntimeLimits, Services, StateConfig};
     use std::io::{Cursor, Write};
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    fn package_bytes(component: &[u8]) -> Vec<u8> {
+        let manifest = PackageManifest {
+            format_version: 1,
+            cartridge: CartridgeMetadata {
+                id: "dev.example.archive".into(),
+                name: "Archive".into(),
+                version: "0.1.0".into(),
+                description: String::new(),
+            },
+            permissions: Permissions::default(),
+            http: cartridge_network::HttpPolicy::default(),
+            compatibility: crate::Compatibility::default(),
+            runtime: RuntimeLimits::default(),
+            state: StateConfig::default(),
+            dependencies: Vec::new(),
+            services: Services::default(),
+            integrity: Integrity {
+                component_sha256: hex::encode(Sha256::digest(component)),
+                assets_sha256: BTreeMap::new(),
+                assets_root_sha256: String::new(),
+            },
+        };
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer.start_file(MANIFEST_PATH, options).unwrap();
+        writer
+            .write_all(toml::to_string(&manifest).unwrap().as_bytes())
+            .unwrap();
+        writer.start_file(COMPONENT_PATH, options).unwrap();
+        writer.write_all(component).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn records_the_identity_of_the_exact_package_bytes() {
+        let bytes = package_bytes(b"component");
+        let expected_digest = hex::encode(Sha256::digest(&bytes));
+        let archive = CartridgeArchive::open_bytes(bytes.clone()).unwrap();
+
+        assert_eq!(archive.package_bytes, bytes.len() as u64);
+        assert_eq!(archive.package_sha256, expected_digest);
+    }
+
+    #[test]
+    fn rejects_an_archive_over_the_compressed_size_limit() {
+        let limits = PackageLimits {
+            archive_bytes: 3,
+            ..PackageLimits::default()
+        };
+
+        assert!(matches!(
+            CartridgeArchive::open_reader(Cursor::new(vec![0_u8; 4]), limits),
+            Err(Error::Archive(message)) if message.contains("archive byte length")
+        ));
+    }
 
     #[test]
     fn rejects_a_component_that_changed_after_packing() {

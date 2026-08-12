@@ -138,7 +138,16 @@ Potential rules:
 
 ## Upgrades
 
-An installed provider update must not silently alter the selected service contract. The resolver pins an exact selected version for a launch plan. Upgrades create a new plan, rerun compatibility checks, and may require renewed permission if interfaces or requested authority change.
+An installed provider update must not silently alter the selected service contract. The resolver pins the exact package length and SHA-256, component digest, asset root, version, and approved interface edge in a launch plan. Upgrades create a new plan, rerun compatibility checks, and may require renewed permission if interfaces or requested authority change.
+
+```sh
+cartridge resolve app.cartridge provider.cartridge --lock app.cartridge-lock.json
+cartridge resolve app.cartridge provider.cartridge --locked app.cartridge-lock.json
+```
+
+Lock files are bounded, create-new JSON. Verification rebuilds the plan from fully validated packages and compares every recorded byte identity and edge. Duplicate candidate id/version pairs are rejected rather than allowing filesystem order to choose one.
+
+A lock is a reproducibility boundary, not publisher authorization. Package signatures and the trust store establish who produced a package; a future approved-graph document will establish which service relationships the user allowed.
 
 Side-by-side provider versions may be necessary when two callers require incompatible major versions. Persistent data migration belongs to the provider and must be transactional.
 
@@ -191,11 +200,11 @@ Remote execution is a post-local-composition feature, not a shortcut around impl
 
 1. Manifest declarations and validation.
 2. Direct dependency resolver and CLI inspection.
-3. Installed-cartridge catalog and exact-version lock plans.
+3. [partially implemented] Exact-byte direct lock plans are implemented; installed-catalog lookup remains.
 4. Persistent user grants.
 5. In-process broker for synchronous typed services.
 6. Async calls, cancellation, and activation supervision.
 7. Opaque resource delegation with provenance.
-8. Transitive graph solving and cycle diagnostics.
+8. Transitive graph solving, side-by-side majors, minimal conflict explanations, and cycle diagnostics.
 9. Worker-process isolation for selected providers.
 10. Optional encrypted routing between devices.

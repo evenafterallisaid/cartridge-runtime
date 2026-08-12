@@ -102,6 +102,18 @@ jobs:
           cargo run -p cartridge-cli -- asset verify hello.cartridge message.txt
           cargo run -p cartridge-cli -- deps hello.cartridge
           cargo run -p cartridge-cli -- resolve hello.cartridge
+          cargo run -p cartridge-cli -- resolve hello.cartridge --lock hello.cartridge-lock.json
+          cargo run -p cartridge-cli -- resolve hello.cartridge --locked hello.cartridge-lock.json
+          cp hello.cartridge changed.cartridge
+          printf ' ' >> changed.cartridge
+          set +e
+          "$binary" resolve changed.cartridge --locked hello.cartridge-lock.json
+          changed_lock_status=$?
+          set -e
+          if [ "$changed_lock_status" -eq 0 ]; then
+            echo "composition lock accepted changed package bytes"
+            exit 1
+          fi
           cargo run -p cartridge-cli -- run hello.cartridge --trace hello.trace.json -- CI
           cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json run hello.cartridge --state-dir state -- First
           cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage export hello.cartridge --state-dir state --output first.cartridge-state.json
