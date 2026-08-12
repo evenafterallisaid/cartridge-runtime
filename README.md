@@ -2,13 +2,13 @@
 
 Cartridge Runtime is an experimental, capability-based host for portable WebAssembly applications. An application and its assets are packed into one `.cartridge` file, then run through the same versioned interface on Windows, macOS, and Linux.
 
-The project is deliberately small at this stage: it proves the complete path from a Rust component to a validated cartridge, a permission-aware Wasmtime host, and a replay-oriented execution trace.
+The project now covers the path from a Rust component to a validated cartridge, a permission-aware Wasmtime host, deterministic media output, persistent state, and replay-oriented execution traces.
 
 ## What works
 
 - WebAssembly Component Model guests built against a versioned WIT contract
 - Reproducible `.cartridge` packages with component hashes and Merkle-style asset roots
-- Manifest-declared clock, randomness, packaged-asset, and scoped-storage capabilities
+- Manifest-declared clock, randomness, packaged-asset, scoped-storage, graphics, audio, and MIDI capabilities
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
 - Bounded archive inflation, Wasm tables, WASI waits, traces, and storage-lock acquisition
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
@@ -25,7 +25,9 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Streaming content-addressed blobs with verified snapshot/capsule reachability and safe GC dry runs
 - Checksummed blob root manifests plus deterministic inventory and full-store integrity audits
 - Typed inter-cartridge service declarations and direct dependency resolution
-- A complete example cartridge
+- Deterministic virtual windows, resolution-independent drawing, image/font assets, input queues, and PNG capture
+- Fixed-format audio graphs, sample-accurate events, bounded delay/effect nodes, deterministic WAV rendering, and callback telemetry
+- Visual, synthesizer, and effect reference cartridges
 
 ## Quick start
 
@@ -82,28 +84,45 @@ cargo run -p cartridge-cli -- blob gc --store dist/blobs --snapshot backup.cartr
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 ```
 
+Build and run the visual reference with a replayable screenshot sidecar:
+
+```sh
+cargo build --manifest-path examples/visual-cartridge/Cargo.toml --target wasm32-wasip2 --release
+cargo run -p cartridge-cli -- pack examples/visual-cartridge/Cartridge.toml \
+  --component examples/visual-cartridge/target/wasm32-wasip2/release/visual_cartridge.wasm \
+  --output dist/visual.cartridge
+cargo run -p cartridge-cli -- run dist/visual.cartridge --trace dist/visual.trace.json --media-dir dist/visual-media --input examples/visual-cartridge/input.json
+cargo run -p cartridge-cli -- replay dist/visual.cartridge dist/visual.trace.json --media-dir dist/visual-replay
+```
+
+`--input` and `--midi` accept bounded JSON arrays of canonical events. Their values enter the trace, so replay does not consult live devices. Every captured PNG and WAV has a receipt in both its capability event and `media-report.json`; `trace diff` and replay therefore act as screenshot and audio regression runners.
+
 PowerShell accepts the same commands on one line, or with backticks in place of the shell continuations above.
 
 ## Why capabilities
 
 A cartridge does not receive ambient access to the host computer. It can only call interfaces exposed by the runtime, and sensitive interfaces must also be granted in `Cartridge.toml`. Denials are normal return values rather than host crashes.
 
-The initial API is intentionally narrow. Filesystem directories, network sockets, windows, audio, and GPU access will be added as separately versioned capabilities rather than as a single unrestricted system interface.
+The API is intentionally narrow. Arbitrary filesystem directories, network sockets, native desktop presentation, and GPU access remain separate future capabilities rather than one unrestricted system interface. Graphics and audio currently use deterministic host-owned command graphs; guests never receive a native window, device, or callback handle.
 
 ## Repository layout
 
 ```text
 crates/cartridge-core/      package format, validation, and packing
+crates/cartridge-media/     deterministic drawing, input, audio, and realtime buffers
 crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
 crates/cartridge-storage/   isolated state backends, snapshots, and content-addressed blobs
 crates/cartridge-trace/     versioned trace model, validation, and comparison
 crates/cartridge-cli/       pack, inspect, and run commands
 examples/hello-cartridge/   minimal Rust component and packaged asset
+examples/visual-cartridge/  deterministic 2D and input reference
+examples/synth-cartridge/   sample-accurate synth reference
+examples/effect-cartridge/  bounded delay-effect reference
 wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 

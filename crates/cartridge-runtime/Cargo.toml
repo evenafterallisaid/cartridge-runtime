@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 cartridge-core = { path = "../cartridge-core" }
+cartridge-media = { path = "../cartridge-media" }
 cartridge-storage = { path = "../cartridge-storage" }
 cartridge-trace = { path = "../cartridge-trace" }
 hex.workspace = true

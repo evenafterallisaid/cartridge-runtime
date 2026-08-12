@@ -4,6 +4,12 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
+pub use cartridge_media::{
+    AudioDevice, AudioDeviceCatalog, AudioDocument, AudioLimits, AudioNode, AudioParameter,
+    AudioReceipt, AudioRender, AudioTelemetry, Color, DrawCommand, FrameDocument, FrameReceipt,
+    GraphicsLimits, InputEvent, MidiEvent, ParameterEvent, RealtimeBuffer, RenderedFrame,
+    SAMPLE_RATE, Waveform, WindowConfig,
+};
 pub use cartridge_storage::{
     BLOB_REACHABILITY_FORMAT_VERSION, BlobAuditIssue, BlobAuditReport, BlobGcReport, BlobInfo,
     BlobInventory, BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind,
@@ -41,6 +47,8 @@ wasmtime::component::bindgen!({
 pub struct Runtime {
     engine: Engine,
     storage: Arc<dyn StorageBackend>,
+    input_events: Vec<InputEvent>,
+    midi_events: Vec<MidiEvent>,
 }
 
 impl Runtime {
@@ -70,7 +78,31 @@ impl Runtime {
             .epoch_interruption(true);
         let engine = Engine::new(&config)?;
         start_epoch_ticker(&engine)?;
-        Ok(Self { engine, storage })
+        Ok(Self {
+            engine,
+            storage,
+            input_events: Vec::new(),
+            midi_events: Vec::new(),
+        })
+    }
+
+    pub fn with_media_input(
+        mut self,
+        input_events: Vec<InputEvent>,
+        midi_events: Vec<MidiEvent>,
+    ) -> Result<Self> {
+        if input_events.len() > cartridge_media::MAX_INPUT_EVENTS {
+            bail!("input event limit exceeded");
+        }
+        if midi_events.len() > cartridge_media::MAX_MIDI_EVENTS {
+            bail!("MIDI event limit exceeded");
+        }
+        for event in &midi_events {
+            event.validate().map_err(|error| anyhow!(error))?;
+        }
+        self.input_events = input_events;
+        self.midi_events = midi_events;
+        Ok(self)
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>, args: &[String]) -> Result<RunReport> {
@@ -130,6 +162,8 @@ impl Runtime {
         let runtime = Self {
             engine: self.engine.clone(),
             storage: branch.clone(),
+            input_events: self.input_events.clone(),
+            midi_events: self.midi_events.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -162,7 +196,9 @@ impl Runtime {
             Arc::new(archive.assets),
             self.storage.clone(),
             expected_events,
-        );
+        )
+        .with_media_input(&self.input_events, &self.midi_events)
+        .map_err(|error| anyhow!(error))?;
         if apply_replay_storage {
             host = host.apply_replay_storage();
         }
@@ -177,6 +213,7 @@ impl Runtime {
         let fuel_remaining = store.get_fuel()?;
         let mut state = store.into_data();
         state.finish_replay()?;
+        let (frames, audio) = state.take_media();
 
         let result =
             call_result.map_err(|error| anyhow!("the component trapped while running: {error}"))?;
@@ -217,6 +254,7 @@ impl Runtime {
             output,
             fuel_consumed,
             trace,
+            media: MediaArtifacts { frames, audio },
         })
     }
 
@@ -419,6 +457,13 @@ pub struct RunReport {
     pub output: String,
     pub fuel_consumed: u64,
     pub trace: ExecutionTrace,
+    pub media: MediaArtifacts,
+}
+
+#[derive(Debug, Default)]
+pub struct MediaArtifacts {
+    pub frames: Vec<RenderedFrame>,
+    pub audio: Vec<AudioRender>,
 }
 
 #[derive(Debug)]

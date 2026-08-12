@@ -1,12 +1,17 @@
 mod storage;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use cartridge_core::{PackageManifest, Permissions};
+use cartridge_media::{
+    AudioLimits, AudioRender, FrameReceipt as MediaFrameReceipt, GraphicsLimits, HeadlessDisplay,
+    InputEvent, InputQueue, MediaError, MidiEvent, RenderedFrame,
+    WindowConfig as MediaWindowConfig, render_audio_document,
+};
 use cartridge_storage::{StorageBackend, StorageLimits};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -51,6 +56,12 @@ pub(crate) struct HostState {
     divergence: Option<ReplayError>,
     started_at: StdInstant,
     deadline: StdInstant,
+    display: HeadlessDisplay,
+    input: InputQueue,
+    midi: VecDeque<MidiEvent>,
+    audio_renders: Vec<AudioRender>,
+    audio_limits: AudioLimits,
+    media_bytes: usize,
 }
 
 impl HostState {
@@ -84,6 +95,12 @@ impl HostState {
         let mut table = ResourceTable::new();
         table.set_max_capacity(MAX_HOST_RESOURCES);
         let started_at = StdInstant::now();
+        let graphics_limits = GraphicsLimits {
+            max_windows: cartridge_media::MAX_WINDOWS,
+            max_pixels: manifest.runtime.graphics_pixels,
+            max_commands: manifest.runtime.graphics_commands,
+            max_asset_bytes: cartridge_media::MAX_GRAPHICS_ASSET_BYTES,
+        };
         Self {
             table,
             wasi,
@@ -106,7 +123,43 @@ impl HostState {
             divergence: None,
             started_at,
             deadline: started_at + Duration::from_millis(manifest.runtime.timeout_ms),
+            display: HeadlessDisplay::new(graphics_limits),
+            input: InputQueue::new(cartridge_media::MAX_INPUT_EVENTS)
+                .expect("the built-in input limit is valid"),
+            midi: VecDeque::new(),
+            audio_renders: Vec::new(),
+            audio_limits: AudioLimits {
+                max_nodes: manifest.runtime.audio_nodes,
+                max_events: manifest.runtime.audio_events,
+                max_frames: manifest.runtime.audio_frames,
+                max_work_units: cartridge_media::MAX_AUDIO_WORK_UNITS,
+            },
+            media_bytes: 0,
         }
+    }
+
+    pub(crate) fn with_media_input(
+        mut self,
+        input: &[InputEvent],
+        midi: &[MidiEvent],
+    ) -> Result<Self, MediaError> {
+        for event in input {
+            self.input.push(event.clone())?;
+        }
+        if midi.len() > cartridge_media::MAX_MIDI_EVENTS {
+            return Err(MediaError::Limit("MIDI event limit exceeded".into()));
+        }
+        for event in midi {
+            self.midi.push_back(event.validate()?);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn take_media(&mut self) -> (Vec<RenderedFrame>, Vec<AudioRender>) {
+        (
+            self.display.take_frames(),
+            std::mem::take(&mut self.audio_renders),
+        )
     }
 
     pub(crate) fn apply_replay_storage(mut self) -> Self {
@@ -562,6 +615,295 @@ impl cartridge::api::host::Host for HostState {
                 revision: result.revision,
             })
     }
+
+    fn window_open(&mut self, config: cartridge::api::host::WindowConfig) -> Result<u32, String> {
+        if !self.permissions.graphics {
+            let error = "graphics capability was not granted".to_owned();
+            self.record("graphics", "window-open", json!({ "denied": error }));
+            return Err(error);
+        }
+        let config = MediaWindowConfig {
+            title: config.title,
+            width: config.width,
+            height: config.height,
+        };
+        match self.display.open(config) {
+            Ok(window) => {
+                self.record("graphics", "window-open", json!({ "window": window }));
+                Ok(window)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record("graphics", "window-open", json!({ "error": error }));
+                Err(error)
+            }
+        }
+    }
+
+    fn window_resize(&mut self, window: u32, width: u32, height: u32) -> Result<(), String> {
+        if !self.permissions.graphics {
+            let error = "graphics capability was not granted".to_owned();
+            self.record(
+                "graphics",
+                "window-resize",
+                json!({ "window": window, "denied": error }),
+            );
+            return Err(error);
+        }
+        match self.display.resize(window, width, height) {
+            Ok(()) => {
+                self.record(
+                    "graphics",
+                    "window-resize",
+                    json!({ "window": window, "width": width, "height": height }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record(
+                    "graphics",
+                    "window-resize",
+                    json!({ "window": window, "error": error }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn window_close(&mut self, window: u32) -> Result<(), String> {
+        if !self.permissions.graphics {
+            let error = "graphics capability was not granted".to_owned();
+            self.record(
+                "graphics",
+                "window-close",
+                json!({ "window": window, "denied": error }),
+            );
+            return Err(error);
+        }
+        match self.display.close(window) {
+            Ok(()) => {
+                self.record("graphics", "window-close", json!({ "window": window }));
+                Ok(())
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record(
+                    "graphics",
+                    "window-close",
+                    json!({ "window": window, "error": error }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn graphics_present(
+        &mut self,
+        window: u32,
+        document: Vec<u8>,
+    ) -> Result<cartridge::api::host::FrameReceipt, String> {
+        if !self.permissions.graphics {
+            let error = "graphics capability was not granted".to_owned();
+            self.record(
+                "graphics",
+                "present",
+                json!({ "window": window, "denied": error }),
+            );
+            return Err(error);
+        }
+        let document_sha256 = hex::encode(Sha256::digest(&document));
+        let assets = self.assets.clone();
+        match self.display.present(window, &document, |path| {
+            assets.get(path).map(Vec::as_slice)
+        }) {
+            Ok(receipt) => {
+                self.record(
+                    "graphics",
+                    "present",
+                    json!({ "document_sha256": document_sha256, "receipt": receipt }),
+                );
+                Ok(frame_receipt(receipt)?)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record(
+                    "graphics",
+                    "present",
+                    json!({ "window": window, "error": error }),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn input_next(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.permissions.graphics {
+            let error = "graphics capability was not granted".to_owned();
+            self.record("input", "next", json!({ "denied": error }));
+            return Err(error);
+        }
+        if let Some(outcome) = self.replay_outcome("input", "next") {
+            let outcome = outcome?;
+            let event: Option<InputEvent> =
+                serde_json::from_value(outcome.get("event").cloned().unwrap_or(Value::Null))
+                    .map_err(|error| {
+                        let message = format!("recorded input event is invalid: {error}");
+                        self.set_divergence(message.clone());
+                        message
+                    })?;
+            let event = event
+                .map(InputEvent::validate)
+                .transpose()
+                .map_err(|error| {
+                    let message = format!("recorded input event failed validation: {error}");
+                    self.set_divergence(message.clone());
+                    message
+                })?;
+            let encoded = event
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            self.record("input", "next", outcome);
+            return Ok(encoded);
+        }
+        let event = self.input.pop();
+        let encoded = event
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.record("input", "next", json!({ "event": event }));
+        Ok(encoded)
+    }
+
+    fn audio_render(
+        &mut self,
+        document: Vec<u8>,
+    ) -> Result<cartridge::api::host::AudioReceipt, String> {
+        if !self.permissions.audio {
+            let error = "audio capability was not granted".to_owned();
+            self.record("audio", "render", json!({ "denied": error }));
+            return Err(error);
+        }
+        if self.audio_renders.len() == cartridge_media::MAX_CAPTURED_AUDIO_RENDERS
+            || self.media_bytes >= cartridge_media::MAX_CAPTURED_AUDIO_BYTES
+        {
+            let error = "captured audio output limit exceeded".to_owned();
+            self.record("audio", "render", json!({ "denied": error }));
+            return Err(error);
+        }
+        let document_sha256 = hex::encode(Sha256::digest(&document));
+        match render_audio_document(&document, self.audio_limits) {
+            Ok(render) => {
+                let bytes = render
+                    .pcm
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|pcm_bytes| render.wav.len().checked_add(pcm_bytes))
+                    .ok_or_else(|| "captured audio size overflows".to_owned())?;
+                let next_bytes = self
+                    .media_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| "captured audio size overflows".to_owned())?;
+                if self.audio_renders.len() == cartridge_media::MAX_CAPTURED_AUDIO_RENDERS
+                    || next_bytes > cartridge_media::MAX_CAPTURED_AUDIO_BYTES
+                {
+                    self.media_bytes = cartridge_media::MAX_CAPTURED_AUDIO_BYTES;
+                    let error = "captured audio output limit exceeded".to_owned();
+                    self.record("audio", "render", json!({ "denied": error }));
+                    return Err(error);
+                }
+                let receipt = render.receipt.clone();
+                self.audio_renders.push(render);
+                self.media_bytes = next_bytes;
+                self.record(
+                    "audio",
+                    "render",
+                    json!({ "document_sha256": document_sha256, "receipt": receipt }),
+                );
+                Ok(audio_receipt(receipt)?)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.record("audio", "render", json!({ "error": error }));
+                Err(error)
+            }
+        }
+    }
+
+    fn midi_next(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.permissions.midi {
+            let error = "MIDI capability was not granted".to_owned();
+            self.record("midi", "next", json!({ "denied": error }));
+            return Err(error);
+        }
+        if let Some(outcome) = self.replay_outcome("midi", "next") {
+            let outcome = outcome?;
+            let event: Option<MidiEvent> =
+                serde_json::from_value(outcome.get("event").cloned().unwrap_or(Value::Null))
+                    .map_err(|error| {
+                        let message = format!("recorded MIDI event is invalid: {error}");
+                        self.set_divergence(message.clone());
+                        message
+                    })?;
+            let event = event
+                .map(MidiEvent::validate)
+                .transpose()
+                .map_err(|error| {
+                    let message = format!("recorded MIDI event failed validation: {error}");
+                    self.set_divergence(message.clone());
+                    message
+                })?;
+            let encoded = event
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            self.record("midi", "next", outcome);
+            return Ok(encoded);
+        }
+        let event = self.midi.pop_front();
+        let encoded = event
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.record("midi", "next", json!({ "event": event }));
+        Ok(encoded)
+    }
+}
+
+fn frame_receipt(receipt: MediaFrameReceipt) -> Result<cartridge::api::host::FrameReceipt, String> {
+    Ok(cartridge::api::host::FrameReceipt {
+        window: receipt.window,
+        frame: receipt.frame,
+        simulation_tick: receipt.simulation_tick,
+        width: receipt.width,
+        height: receipt.height,
+        command_count: u32::try_from(receipt.command_count)
+            .map_err(|_| "draw command count exceeds u32".to_owned())?,
+        rgba_sha256: receipt.rgba_sha256,
+        png_sha256: receipt.png_sha256,
+    })
+}
+
+fn audio_receipt(
+    receipt: cartridge_media::AudioReceipt,
+) -> Result<cartridge::api::host::AudioReceipt, String> {
+    Ok(cartridge::api::host::AudioReceipt {
+        frames: receipt.frames,
+        sample_rate: receipt.sample_rate,
+        channels: receipt.channels,
+        node_count: u16::try_from(receipt.node_count)
+            .map_err(|_| "audio node count exceeds u16".to_owned())?,
+        event_count: u32::try_from(receipt.event_count)
+            .map_err(|_| "audio event count exceeds u32".to_owned())?,
+        pcm_sha256: receipt.pcm_sha256,
+        wav_sha256: receipt.wav_sha256,
+        peak: receipt.peak,
+    })
 }
 
 fn terminal_safe(value: &str) -> String {
@@ -1043,6 +1385,107 @@ mod tests {
                 "operations": cartridge_storage::MAX_TRANSACTION_OPERATIONS + 1,
                 "oversized": true,
             }))
+        );
+    }
+
+    #[test]
+    fn media_permissions_are_independent_and_deny_by_default() {
+        let mut state = HostState::new(
+            &manifest(Permissions::default()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        assert!(
+            cartridge::api::host::Host::window_open(
+                &mut state,
+                cartridge::api::host::WindowConfig {
+                    title: "denied".into(),
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .is_err()
+        );
+        assert!(cartridge::api::host::Host::audio_render(&mut state, b"{}".to_vec()).is_err());
+        assert!(cartridge::api::host::Host::midi_next(&mut state).is_err());
+
+        let permissions = Permissions {
+            audio: true,
+            ..Permissions::default()
+        };
+        let mut audio_only = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        assert!(cartridge::api::host::Host::midi_next(&mut audio_only).is_err());
+    }
+
+    #[test]
+    fn replay_revalidates_untrusted_input_and_midi_events() {
+        let permissions = Permissions {
+            graphics: true,
+            midi: true,
+            ..Permissions::default()
+        };
+        let input = TraceEvent {
+            sequence: 0,
+            capability: "input".into(),
+            operation: "next".into(),
+            outcome: json!({ "event": { "type": "text", "value": "bad\u{0000}text" } }),
+        };
+        let mut state = HostState::new(
+            &manifest(permissions.clone()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            Some(vec![input]),
+        );
+        assert!(cartridge::api::host::Host::input_next(&mut state).is_err());
+        assert!(matches!(
+            state.finish_replay(),
+            Err(ReplayError::Divergence { .. })
+        ));
+
+        let midi = TraceEvent {
+            sequence: 0,
+            capability: "midi".into(),
+            operation: "next".into(),
+            outcome: json!({ "event": { "timestamp_frames": 0, "cable": 0, "status": 1, "data1": 0, "data2": 0 } }),
+        };
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            Some(vec![midi]),
+        );
+        assert!(cartridge::api::host::Host::midi_next(&mut state).is_err());
+        assert!(matches!(
+            state.finish_replay(),
+            Err(ReplayError::Divergence { .. })
+        ));
+    }
+
+    #[test]
+    fn exhausted_audio_quota_rejects_before_decoding() {
+        let permissions = Permissions {
+            audio: true,
+            ..Permissions::default()
+        };
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+        state.media_bytes = cartridge_media::MAX_CAPTURED_AUDIO_BYTES;
+        assert!(
+            cartridge::api::host::Host::audio_render(&mut state, b"not json".to_vec()).is_err()
+        );
+        assert_eq!(
+            state.events[0].outcome.get("denied"),
+            Some(&json!("captured audio output limit exceeded"))
         );
     }
 

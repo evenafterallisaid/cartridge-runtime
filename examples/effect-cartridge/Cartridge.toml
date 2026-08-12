@@ -1,0 +1,15 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.effect-reference"
+name = "Effect Reference"
+version = "0.1.0"
+description = "bounded delay effect reference cartridge"
+
+[permissions]
+audio = true
+
+[runtime]
+audio_nodes = 8
+audio_events = 32
+audio_frames = 48000

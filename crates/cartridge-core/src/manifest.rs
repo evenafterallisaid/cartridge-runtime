@@ -18,12 +18,22 @@ const DEFAULT_STORAGE_BYTES: usize = 1024 * 1024;
 const DEFAULT_STORAGE_KEYS: usize = 1024;
 const DEFAULT_STORAGE_VALUE_BYTES: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_GRAPHICS_PIXELS: usize = 2 * 1024 * 1024;
+const DEFAULT_GRAPHICS_COMMANDS: usize = 8192;
+const DEFAULT_AUDIO_NODES: usize = 64;
+const DEFAULT_AUDIO_EVENTS: usize = 16_384;
+const DEFAULT_AUDIO_FRAMES: u64 = 480_000;
 const MAX_FUEL: u64 = 1_000_000_000_000;
 const MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_STORAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORAGE_KEYS: usize = 100_000;
 const MAX_STORAGE_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+const MAX_GRAPHICS_PIXELS: usize = 4 * 1024 * 1024;
+const MAX_GRAPHICS_COMMANDS: usize = 32_768;
+const MAX_AUDIO_NODES: usize = 128;
+const MAX_AUDIO_EVENTS: usize = 65_536;
+const MAX_AUDIO_FRAMES: u64 = 48_000 * 30;
 const MAX_MIGRATIONS: usize = 256;
 const MAX_DEPENDENCIES: usize = 128;
 const MAX_SERVICES: usize = 128;
@@ -49,6 +59,7 @@ pub struct PackageManifest {
 }
 
 impl PackageManifest {
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<()> {
         if self.format_version != CURRENT_FORMAT_VERSION {
             return Err(Error::Manifest(format!(
@@ -100,6 +111,31 @@ impl PackageManifest {
         {
             return Err(Error::Manifest(format!(
                 "runtime storage_value_bytes must be positive, no larger than storage_bytes, and at most {MAX_STORAGE_VALUE_BYTES}"
+            )));
+        }
+        if !(1..=MAX_GRAPHICS_PIXELS).contains(&self.runtime.graphics_pixels) {
+            return Err(Error::Manifest(format!(
+                "runtime graphics_pixels must be between 1 and {MAX_GRAPHICS_PIXELS}"
+            )));
+        }
+        if !(1..=MAX_GRAPHICS_COMMANDS).contains(&self.runtime.graphics_commands) {
+            return Err(Error::Manifest(format!(
+                "runtime graphics_commands must be between 1 and {MAX_GRAPHICS_COMMANDS}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_NODES).contains(&self.runtime.audio_nodes) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_nodes must be between 1 and {MAX_AUDIO_NODES}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_EVENTS).contains(&self.runtime.audio_events) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_events must be between 1 and {MAX_AUDIO_EVENTS}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_FRAMES).contains(&self.runtime.audio_frames) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_frames must be between 1 and {MAX_AUDIO_FRAMES}"
             )));
         }
 
@@ -196,6 +232,9 @@ pub struct Permissions {
     pub random: bool,
     pub assets: bool,
     pub storage: bool,
+    pub graphics: bool,
+    pub audio: bool,
+    pub midi: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -207,6 +246,11 @@ pub struct RuntimeLimits {
     pub storage_bytes: usize,
     pub storage_keys: usize,
     pub storage_value_bytes: usize,
+    pub graphics_pixels: usize,
+    pub graphics_commands: usize,
+    pub audio_nodes: usize,
+    pub audio_events: usize,
+    pub audio_frames: u64,
 }
 
 impl Default for RuntimeLimits {
@@ -218,6 +262,11 @@ impl Default for RuntimeLimits {
             storage_bytes: DEFAULT_STORAGE_BYTES,
             storage_keys: DEFAULT_STORAGE_KEYS,
             storage_value_bytes: DEFAULT_STORAGE_VALUE_BYTES,
+            graphics_pixels: DEFAULT_GRAPHICS_PIXELS,
+            graphics_commands: DEFAULT_GRAPHICS_COMMANDS,
+            audio_nodes: DEFAULT_AUDIO_NODES,
+            audio_events: DEFAULT_AUDIO_EVENTS,
+            audio_frames: DEFAULT_AUDIO_FRAMES,
         }
     }
 }
@@ -674,6 +723,29 @@ mod tests {
     fn rejects_unbounded_wall_time() {
         let mut value = manifest();
         value.runtime.timeout_ms = MAX_TIMEOUT_MS + 1;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_media_limits() {
+        let mut value = manifest();
+        value.runtime.graphics_pixels = MAX_GRAPHICS_PIXELS + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.runtime.graphics_commands = MAX_GRAPHICS_COMMANDS + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.runtime.audio_nodes = MAX_AUDIO_NODES + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.runtime.audio_events = MAX_AUDIO_EVENTS + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = manifest();
+        value.runtime.audio_frames = MAX_AUDIO_FRAMES + 1;
         assert!(value.validate().is_err());
     }
 

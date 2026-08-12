@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: the 0.1 vertical slice and 0.2 replay milestone are implemented. Runtime work is moving into 0.3 storage. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.5 are implemented at the portable runtime boundary. Runtime work is moving into 0.6 developer workflow. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -86,7 +86,7 @@ Exit criteria:
 
 Purpose: turn traces into executable bug reports.
 
-Work:
+Implemented:
 
 - versioned trace headers with component identity and invocation arguments
 - replay clock and random results without contacting the host
@@ -191,7 +191,7 @@ Exit criteria:
 
 Purpose: make cartridges visible and interactive.
 
-Work:
+Implemented:
 
 - window lifecycle capability
 - keyboard, pointer, controller, and text input events
@@ -203,7 +203,19 @@ Work:
 - graphics limits and validation
 - first visual reference cartridges
 
+Delivery slices:
+
+1. WIT 0.3 virtual-window lifecycle with opaque bounded handles.
+2. Integer-scaled 2D command documents for clears, rectangles, lines, packaged RGBA images, and bitmap fonts.
+3. Canonical keyboard, pointer, controller, text, and close events with bounded injection.
+4. Cross-platform headless rasterizer with fixed PNG settings and raw/presentation digests.
+5. Monotonic simulation ticks, trace-bound frame receipts, deterministic replay, and CLI media sidecars.
+6. Pre-raster geometry, command, pixel, asset, work, frame-count, and captured-byte validation.
+7. Visual reference cartridge and byte-for-byte replay regression in all-platform CI.
+
 The first renderer should be deliberately constrained. A stable 2D command stream is more valuable than immediately exposing a complete native GUI toolkit. A later GPU interface can coexist with it.
+
+The portable 0.4 boundary is complete. Native presentation is intentionally owned by the 0.7 desktop shell; adding an OS window adapter must not change the guest command stream or headless output.
 
 Exit criteria:
 
@@ -216,7 +228,7 @@ Exit criteria:
 
 Purpose: support instruments, effects, games, and visualizers.
 
-Work:
+Implemented:
 
 - audio device discovery outside the guest
 - fixed-format audio graph contract
@@ -227,6 +239,20 @@ Work:
 - WASM DSP node limits
 - MIDI input as a separate permission
 - example synthesizer and effect cartridges
+
+Delivery slices:
+
+1. Fixed 48 kHz stereo signed-16-bit graph with contiguous topological node ids.
+2. Deterministic integer oscillator, gain, low-pass, delay, and output nodes.
+3. Ordered sample-accurate parameter events with Q15 validation.
+4. Reproducible PCM/WAV offline renderer and trace-bound render receipts.
+5. Preallocated atomic single-producer/single-consumer callback buffer with underrun, overrun, and peak-fill telemetry.
+6. Host-owned device catalog generations that cannot mutate guest state.
+7. Separate validated and replayable MIDI permission and event queue.
+8. Node, event, frame, work, aggregate delay-storage, render-count, and captured-byte limits.
+9. Synthesizer and delay-effect reference cartridges with byte-for-byte replay regression in all-platform CI.
+
+The portable 0.5 boundary is complete. Native device enumeration and callback hookup stay in host adapters delivered with the desktop shell. Guests cannot enumerate devices or execute inside the real-time callback; that separation is part of the stable contract rather than missing guest functionality.
 
 Exit criteria:
 

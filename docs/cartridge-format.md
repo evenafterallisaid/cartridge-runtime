@@ -28,6 +28,9 @@ clock = true
 random = false
 assets = true
 storage = true
+graphics = false
+audio = false
+midi = false
 
 [runtime]
 fuel = 10000000
@@ -36,6 +39,11 @@ timeout_ms = 30000
 storage_bytes = 1048576
 storage_keys = 1024
 storage_value_bytes = 262144
+graphics_pixels = 2097152
+graphics_commands = 8192
+audio_nodes = 64
+audio_events = 16384
+audio_frames = 480000
 
 [state]
 schema = 1
@@ -46,7 +54,7 @@ from = 0
 to = 1
 ```
 
-The packer supplies the integrity block. Cartridge IDs use reverse-domain notation and versions follow Semantic Versioning. Runtime limits include an instruction budget, a linear-memory ceiling, a wall-time deadline between 1 millisecond and 5 minutes, and three independent storage ceilings. Storage values cannot be larger than the total storage quota.
+The packer supplies the integrity block. Cartridge IDs use reverse-domain notation and versions follow Semantic Versioning. Runtime limits include an instruction budget, a linear-memory ceiling, a wall-time deadline between 1 millisecond and 5 minutes, three independent storage ceilings, graphics pixel/command ceilings, and audio node/event/frame ceilings. Storage values cannot be larger than the total storage quota. Graphics, audio, and MIDI are independent deny-by-default permissions; granting audio does not grant MIDI.
 
 The optional state section declares the schema expected by the current component and the monotonic upgrade paths it supports. Packages without the section use schema `0`. See [state migrations](migrations.md) for validation and planning rules.
 

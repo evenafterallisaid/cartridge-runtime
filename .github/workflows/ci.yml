@@ -42,6 +42,13 @@ jobs:
       - name: Build example component
         run: cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
+      - name: Build media reference components
+        shell: bash
+        run: |
+          cargo build --manifest-path examples/visual-cartridge/Cargo.toml --target wasm32-wasip2 --release
+          cargo build --manifest-path examples/synth-cartridge/Cargo.toml --target wasm32-wasip2 --release
+          cargo build --manifest-path examples/effect-cartridge/Cargo.toml --target wasm32-wasip2 --release
+
       - name: Build timeout regression component
         run: cargo build --manifest-path tests/fixtures/timeout-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
@@ -94,6 +101,17 @@ jobs:
           cargo run -p cartridge-cli -- blob gc --store blobs --manifest roots.cartridge-blobs.json --keep "$blob_digest"
           cargo run -p cartridge-cli -- blob gc --store blobs --keep "$blob_digest"
           cargo run -p cartridge-cli -- replay hello.cartridge hello.trace.json -- CI
+          cargo run -p cartridge-cli -- pack examples/visual-cartridge/Cartridge.toml --component examples/visual-cartridge/target/wasm32-wasip2/release/visual_cartridge.wasm --output visual.cartridge
+          cargo run -p cartridge-cli -- run visual.cartridge --trace visual.trace.json --media-dir visual-media --input examples/visual-cartridge/input.json
+          cargo run -p cartridge-cli -- replay visual.cartridge visual.trace.json --media-dir visual-replay
+          cmp visual-media/frame-0000-window-1.png visual-replay/frame-0000-window-1.png
+          cargo run -p cartridge-cli -- trace diff visual.trace.json visual.trace.json
+          cargo run -p cartridge-cli -- pack examples/synth-cartridge/Cartridge.toml --component examples/synth-cartridge/target/wasm32-wasip2/release/synth_cartridge.wasm --output synth.cartridge
+          cargo run -p cartridge-cli -- run synth.cartridge --trace synth.trace.json --media-dir synth-media --midi examples/synth-cartridge/midi.json
+          cargo run -p cartridge-cli -- replay synth.cartridge synth.trace.json --media-dir synth-replay
+          cmp synth-media/audio-0000.wav synth-replay/audio-0000.wav
+          cargo run -p cartridge-cli -- pack examples/effect-cartridge/Cartridge.toml --component examples/effect-cartridge/target/wasm32-wasip2/release/effect_cartridge.wasm --output effect.cartridge
+          cargo run -p cartridge-cli -- run effect.cartridge --media-dir effect-media
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/Cartridge.toml --component tests/fixtures/migration-cartridge/target/wasm32-wasip2/release/migration_cartridge.wasm --output migration.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/legacy.Cartridge.toml --component tests/fixtures/migration-cartridge/target/wasm32-wasip2/release/migration_cartridge.wasm --output legacy-migration.cartridge
           cargo run -p cartridge-cli -- storage migrate migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --output migrated.cartridge-state.json

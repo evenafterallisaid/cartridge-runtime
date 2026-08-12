@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cartridge-media",
     "crates/cartridge-cli",
     "crates/cartridge-core",
     "crates/cartridge-runtime",
@@ -25,6 +26,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.0"
 thiserror = "2.0.17"
+png = "0.18.0"
 tokio = { version = "1.47.1", features = ["time"] }
 toml = "1.0.3"
 walkdir = "2.5.0"

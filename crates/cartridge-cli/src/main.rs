@@ -18,8 +18,9 @@ use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
-    DirectoryStorage, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS, Runtime,
-    SnapshotDifference, SnapshotStorage, StorageLimits, StorageSnapshot,
+    DirectoryStorage, InputEvent, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
+    MediaArtifacts, MidiEvent, Runtime, SnapshotDifference, SnapshotStorage, StorageLimits,
+    StorageSnapshot,
 };
 use cartridge_trace::{
     ExecutionTrace, MAX_REDACTED_TRACE_DOCUMENT_BYTES, MAX_TRACE_DOCUMENT_BYTES, RedactionProfile,
@@ -33,6 +34,20 @@ const WORKER_STARTUP_BUDGET: Duration = Duration::from_secs(10);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BLOB_GC_ROOT_ARTIFACTS: usize = 256;
 const MAX_BLOB_GC_REFERENCES: usize = 100_000;
+const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct RunCommandOptions<'a> {
+    package: &'a Path,
+    trace: Option<&'a Path>,
+    state_dir: Option<&'a Path>,
+    from_snapshot: Option<&'a Path>,
+    snapshot_output: Option<&'a Path>,
+    input: Option<&'a Path>,
+    midi: Option<&'a Path>,
+    media_dir: Option<&'a Path>,
+    args: &'a [String],
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -99,6 +114,12 @@ enum Command {
         from_snapshot: Option<PathBuf>,
         #[arg(long, requires = "from_snapshot")]
         snapshot_output: Option<PathBuf>,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        #[arg(long)]
+        media_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -106,6 +127,8 @@ enum Command {
     Replay {
         package: PathBuf,
         trace: PathBuf,
+        #[arg(long)]
+        media_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -120,6 +143,12 @@ enum Command {
         from_snapshot: Option<PathBuf>,
         #[arg(long, requires = "from_snapshot")]
         snapshot_output: Option<PathBuf>,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        midi: Option<PathBuf>,
+        #[arg(long)]
+        media_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -127,6 +156,8 @@ enum Command {
     WorkerReplay {
         package: PathBuf,
         trace: PathBuf,
+        #[arg(long)]
+        media_dir: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -458,6 +489,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_cli() -> Result<()> {
     match Cli::parse().command {
         Command::Pack {
@@ -482,45 +514,59 @@ fn run_cli() -> Result<()> {
             state_dir,
             from_snapshot,
             snapshot_output,
+            input,
+            midi,
+            media_dir,
             args,
-        } => supervised_run_command(
-            &package,
-            trace.as_deref(),
-            state_dir.as_deref(),
-            from_snapshot.as_deref(),
-            snapshot_output.as_deref(),
-            &args,
-        ),
+        } => supervised_run_command(RunCommandOptions {
+            package: &package,
+            trace: trace.as_deref(),
+            state_dir: state_dir.as_deref(),
+            from_snapshot: from_snapshot.as_deref(),
+            snapshot_output: snapshot_output.as_deref(),
+            input: input.as_deref(),
+            midi: midi.as_deref(),
+            media_dir: media_dir.as_deref(),
+            args: &args,
+        }),
         Command::Replay {
             package,
             trace,
+            media_dir,
             args,
-        } => supervised_replay_command(&package, &trace, &args),
+        } => supervised_replay_command(&package, &trace, media_dir.as_deref(), &args),
         Command::WorkerRun {
             package,
             trace,
             state_dir,
             from_snapshot,
             snapshot_output,
+            input,
+            midi,
+            media_dir,
             args,
         } => {
             require_worker_context()?;
-            run_command(
-                &package,
-                trace.as_deref(),
-                state_dir.as_deref(),
-                from_snapshot.as_deref(),
-                snapshot_output.as_deref(),
-                &args,
-            )
+            run_command(RunCommandOptions {
+                package: &package,
+                trace: trace.as_deref(),
+                state_dir: state_dir.as_deref(),
+                from_snapshot: from_snapshot.as_deref(),
+                snapshot_output: snapshot_output.as_deref(),
+                input: input.as_deref(),
+                midi: midi.as_deref(),
+                media_dir: media_dir.as_deref(),
+                args: &args,
+            })
         }
         Command::WorkerReplay {
             package,
             trace,
+            media_dir,
             args,
         } => {
             require_worker_context()?;
-            replay_command(&package, &trace, &args)
+            replay_command(&package, &trace, media_dir.as_deref(), &args)
         }
         Command::WorkerCapsuleReplay { capsule, json } => {
             require_worker_context()?;
@@ -1097,32 +1143,38 @@ fn run_storage_command(command: StorageCommand) -> Result<()> {
     }
 }
 
-fn supervised_run_command(
-    package: &Path,
-    trace: Option<&Path>,
-    state_dir: Option<&Path>,
-    from_snapshot: Option<&Path>,
-    snapshot_output: Option<&Path>,
-    args: &[String],
-) -> Result<()> {
+fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
     let mut worker_args = vec![
         OsString::from("__worker-run"),
-        package.as_os_str().to_owned(),
+        options.package.as_os_str().to_owned(),
     ];
-    push_path_option(&mut worker_args, "--trace", trace);
-    push_path_option(&mut worker_args, "--state-dir", state_dir);
-    push_path_option(&mut worker_args, "--from-snapshot", from_snapshot);
-    push_path_option(&mut worker_args, "--snapshot-output", snapshot_output);
-    push_worker_arguments(&mut worker_args, args);
-    supervise_worker(package, &worker_args, None)
+    push_path_option(&mut worker_args, "--trace", options.trace);
+    push_path_option(&mut worker_args, "--state-dir", options.state_dir);
+    push_path_option(&mut worker_args, "--from-snapshot", options.from_snapshot);
+    push_path_option(
+        &mut worker_args,
+        "--snapshot-output",
+        options.snapshot_output,
+    );
+    push_path_option(&mut worker_args, "--input", options.input);
+    push_path_option(&mut worker_args, "--midi", options.midi);
+    push_path_option(&mut worker_args, "--media-dir", options.media_dir);
+    push_worker_arguments(&mut worker_args, options.args);
+    supervise_worker(options.package, &worker_args, None)
 }
 
-fn supervised_replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
+fn supervised_replay_command(
+    package: &Path,
+    trace: &Path,
+    media_dir: Option<&Path>,
+    args: &[String],
+) -> Result<()> {
     let mut worker_args = vec![
         OsString::from("__worker-replay"),
         package.as_os_str().to_owned(),
         trace.as_os_str().to_owned(),
     ];
+    push_path_option(&mut worker_args, "--media-dir", media_dir);
     push_worker_arguments(&mut worker_args, args);
     supervise_worker(package, &worker_args, None)
 }
@@ -1387,18 +1439,13 @@ fn resolve_command(root: &Path, candidates: &[PathBuf], json: bool) -> Result<()
     Ok(())
 }
 
-fn run_command(
-    package: &Path,
-    trace: Option<&Path>,
-    state_dir: Option<&Path>,
-    from_snapshot: Option<&Path>,
-    snapshot_output: Option<&Path>,
-    args: &[String],
-) -> Result<()> {
+fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
+    let input: Vec<InputEvent> = read_optional_event_file(options.input, "input")?;
+    let midi: Vec<MidiEvent> = read_optional_event_file(options.midi, "MIDI")?;
     let mut branch = None;
-    let report = if let Some(path) = from_snapshot {
-        let archive = CartridgeArchive::open(package)
-            .with_context(|| format!("could not inspect {}", package.display()))?;
+    let report = if let Some(path) = options.from_snapshot {
+        let archive = CartridgeArchive::open(options.package)
+            .with_context(|| format!("could not inspect {}", options.package.display()))?;
         let snapshot = StorageSnapshot::read(path)
             .with_context(|| format!("could not read snapshot {}", path.display()))?;
         let storage = Arc::new(SnapshotStorage::from_snapshot(
@@ -1406,26 +1453,37 @@ fn run_command(
             &archive.manifest.cartridge.id,
             storage_limits(&archive.manifest),
         )?);
-        let runtime = Runtime::with_storage(storage.clone())?;
+        let runtime = Runtime::with_storage(storage.clone())?
+            .with_media_input(input.clone(), midi.clone())?;
         branch = Some(storage);
-        runtime.run(archive, args)?
+        runtime.run(archive, options.args)?
     } else {
-        let runtime = match state_dir {
+        let runtime = match options.state_dir {
             Some(path) => Runtime::with_storage(Arc::new(DirectoryStorage::open(path)?))?,
             None => Runtime::new()?,
-        };
-        runtime.run_file(package, args)?
+        }
+        .with_media_input(input, midi)?;
+        runtime.run_file(options.package, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
     eprintln!("fuel consumed: {}", report.fuel_consumed);
-    if let Some(path) = trace {
+    if let Some(path) = options.media_dir {
+        write_media_artifacts(path, &report.media)?;
+        eprintln!(
+            "media: {} frame(s), {} audio render(s) -> {}",
+            report.media.frames.len(),
+            report.media.audio.len(),
+            path.display()
+        );
+    }
+    if let Some(path) = options.trace {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         write_private(path, &serde_json::to_vec_pretty(&report.trace)?)?;
         eprintln!("trace: {}", path.display());
     }
-    if let Some(path) = snapshot_output {
+    if let Some(path) = options.snapshot_output {
         let snapshot = branch
             .context("snapshot output requires a snapshot branch")?
             .export_snapshot()?;
@@ -1940,7 +1998,12 @@ fn storage_limits(manifest: &cartridge_core::PackageManifest) -> StorageLimits {
     }
 }
 
-fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
+fn replay_command(
+    package: &Path,
+    trace: &Path,
+    media_dir: Option<&Path>,
+    args: &[String],
+) -> Result<()> {
     let trace = read_trace(trace)?;
     let event_count = trace.events.len();
     let report = Runtime::new()?.replay_file(package, args, trace)?;
@@ -1949,7 +2012,58 @@ fn replay_command(package: &Path, trace: &Path, args: &[String]) -> Result<()> {
         "replay matched {event_count} event(s), {} fuel",
         report.fuel_consumed
     );
+    if let Some(path) = media_dir {
+        write_media_artifacts(path, &report.media)?;
+        eprintln!(
+            "media: {} frame(s), {} audio render(s) -> {}",
+            report.media.frames.len(),
+            report.media.audio.len(),
+            path.display()
+        );
+    }
     Ok(())
+}
+
+fn read_optional_event_file<T>(path: Option<&Path>, label: &str) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("could not open {label} events {}", path.display()))?
+        .take(MAX_EVENT_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_EVENT_DOCUMENT_BYTES {
+        bail!("{label} event document exceeds {MAX_EVENT_DOCUMENT_BYTES} bytes");
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("could not parse {label} events {}", path.display()))
+}
+
+fn write_media_artifacts(directory: &Path, media: &MediaArtifacts) -> Result<()> {
+    fs::create_dir_all(directory)
+        .with_context(|| format!("could not create media directory {}", directory.display()))?;
+    let mut frames = Vec::with_capacity(media.frames.len());
+    for (index, frame) in media.frames.iter().enumerate() {
+        let name = format!("frame-{index:04}-window-{}.png", frame.receipt.window);
+        write_private(&directory.join(&name), &frame.png)?;
+        frames.push(serde_json::json!({ "file": name, "receipt": frame.receipt }));
+    }
+    let mut audio = Vec::with_capacity(media.audio.len());
+    for (index, render) in media.audio.iter().enumerate() {
+        let name = format!("audio-{index:04}.wav");
+        write_private(&directory.join(&name), &render.wav)?;
+        audio.push(serde_json::json!({ "file": name, "receipt": render.receipt }));
+    }
+    let report = serde_json::to_vec_pretty(&serde_json::json!({
+        "format_version": 1,
+        "frames": frames,
+        "audio": audio,
+    }))?;
+    write_private(&directory.join("media-report.json"), &report)
 }
 
 fn trace_inspect_command(trace: &Path, json: bool) -> Result<()> {

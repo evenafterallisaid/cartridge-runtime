@@ -1,0 +1,14 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.visual-reference"
+name = "Visual Reference"
+version = "0.1.0"
+description = "deterministic drawing and input reference cartridge"
+
+[permissions]
+graphics = true
+
+[runtime]
+graphics_pixels = 307200
+graphics_commands = 256

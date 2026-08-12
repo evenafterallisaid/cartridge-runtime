@@ -20,20 +20,23 @@ A trace is an executable record of one cartridge invocation. It identifies the e
 
 ## Recording
 
-Each event receives a zero-based sequence number. An event contains a capability name, an operation name, and the value observable by the guest. Clock and random values are stored in full because replay must return the same inputs without consulting the live host.
+Each event receives a zero-based sequence number. An event contains a capability name, an operation name, and the value observable by the guest. Clock, random, input, and MIDI values are stored in full because replay must return the same inputs without consulting the live host.
 
 Packaged asset reads record their path, length, and SHA-256 digest instead of duplicating asset contents. Logs record the level and bounded message that reached the host. Storage reads include the returned bytes so ordinary replay does not consult live state; writes and deletes record their inputs and result without being applied to live storage. Atomic storage events bind revisions and request identities, and stateful capsule replay applies them only to its disposable snapshot branch before comparing the final revision-bearing snapshot digest.
+
+Graphics and audio calls record the submitted document digest plus a deterministic receipt. Frame receipts bind the simulation tick, size, command count, raw RGBA digest, and PNG digest. Audio receipts bind the fixed format, graph/event size, peak sample, PCM digest, and WAV digest. Binary media stays in optional sidecars rather than inflating the trace.
 
 ## Replay
 
 The runtime validates these fields before compiling the component:
 
 - trace format version
+- runtime version
 - cartridge id and version
 - component digest
 - invocation arguments
 
-During execution, clock and random calls take their results from the next trace event. Deterministic calls such as logs and asset reads are executed normally and compared with the recorded event. The runtime stops at the first different sequence and reports the expected and actual operations or values.
+During execution, clock, random, input, and MIDI calls take their results from the next trace event. Deterministic calls such as logs, asset reads, graphics rendering, and offline audio rendering are executed normally and compared with the recorded event. The runtime stops at the first different sequence and reports the expected and actual operations or values.
 
 Replay also fails when the runtime version differs, execution produces an extra event, leaves recorded events unused, changes its final output, consumes a different amount of fuel, or exceeds the trace budget.
 

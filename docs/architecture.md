@@ -19,7 +19,11 @@ The current execution path is:
 
 ## Trust boundaries
 
-The component is untrusted. The host validates all paths, bounds random-data requests, caps fuel, linear memory, table elements, table count, memory count, instance count, trace growth, and final output, and never extracts archive entries onto disk. Packaged assets are held in memory and addressed by normalized relative paths.
+The component is untrusted. The host validates all paths, bounds random-data requests, caps fuel, linear memory, table elements, table count, memory count, instance count, trace growth, media work, captured artifacts, and final output, and never extracts archive entries onto disk. Packaged assets are held in memory and addressed by normalized relative paths.
+
+Graphics and audio calls execute native host code, so Wasm fuel alone cannot bound them. The renderer validates logical coordinates and dimensions, estimates pixel work before rasterization, clips image loops to the target, limits commands, assets, windows, frames, pixels, and captured bytes, and uses checked size arithmetic. The audio engine validates an ordered acyclic graph, node/event/frame work, aggregate delay storage, output capture, and sample ranges before allocation. These budgets are independent from guest linear memory.
+
+The current window host is deterministic and headless. Window handles are opaque lifecycle tokens, not native OS objects. The first audio backend is a fixed 48 kHz stereo offline renderer. Native window and audio-device adapters will remain outside guest memory and connect to the same command contracts when the desktop shell arrives. The realtime PCM queue is preallocated and atomic; its consumer callback performs no allocation and never invokes guest code.
 
 WASI is linked for language-runtime compatibility, but it is not the cartridge permission model. The context has no terminal, environment, arguments, or preopened directories, and its network interfaces are disabled. When clock or randomness permission is absent, the corresponding WASI services use inert deterministic providers instead of host state. Cartridges should use `cartridge:api/host` when they need observable, traceable capability results.
 
@@ -64,7 +68,7 @@ The manifest and direct resolver are implemented. Live multi-instance wiring and
 
 ## Tracing and replay
 
-Every call through the cartridge capability API receives a monotonically increasing sequence number. Trace format v2 binds the recording to a runtime version, component digest, and argument list. During replay, nondeterministic clock and random results come from the trace; deterministic calls are recomputed and compared. Output, fuel usage, missing events, extra events, and trace growth limits are checked after execution.
+Every call through the cartridge capability API receives a monotonically increasing sequence number. Trace format v2 binds the recording to a runtime version, component digest, and argument list. During replay, nondeterministic clock, random, input, and MIDI results come from the trace; deterministic graphics and audio receipts are recomputed and compared. Output, fuel usage, missing events, extra events, media digests, and trace growth limits are checked after execution.
 
 Trace types live in `cartridge-trace`, which does not depend on Wasmtime or the package reader. This lets the CLI and future debugger validate, summarize, and compare recordings without loading executable code.
 

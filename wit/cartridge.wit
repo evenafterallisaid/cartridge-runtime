@@ -1,4 +1,4 @@
-package cartridge:api@0.2.0;
+package cartridge:api@0.3.0;
 
 interface host {
     enum log-level {
@@ -18,6 +18,34 @@ interface host {
         revision: u64,
     }
 
+    record window-config {
+        title: string,
+        width: u32,
+        height: u32,
+    }
+
+    record frame-receipt {
+        window: u32,
+        frame: u64,
+        simulation-tick: u64,
+        width: u32,
+        height: u32,
+        command-count: u32,
+        rgba-sha256: string,
+        png-sha256: string,
+    }
+
+    record audio-receipt {
+        frames: u64,
+        sample-rate: u32,
+        channels: u16,
+        node-count: u16,
+        event-count: u32,
+        pcm-sha256: string,
+        wav-sha256: string,
+        peak: s16,
+    }
+
     log: func(level: log-level, message: string);
     wall-clock-ms: func() -> result<u64, string>;
     random-bytes: func(length: u32) -> result<list<u8>, string>;
@@ -29,6 +57,13 @@ interface host {
     storage-revision: func() -> result<u64, string>;
     storage-compare-exchange: func(revision: u64, key: string, expected: option<list<u8>>, replacement: option<list<u8>>) -> result<storage-transaction-result, string>;
     storage-apply: func(revision: u64, mutations: list<storage-mutation>) -> result<storage-transaction-result, string>;
+    window-open: func(config: window-config) -> result<u32, string>;
+    window-resize: func(window: u32, width: u32, height: u32) -> result<_, string>;
+    window-close: func(window: u32) -> result<_, string>;
+    graphics-present: func(window: u32, document: list<u8>) -> result<frame-receipt, string>;
+    input-next: func() -> result<option<list<u8>>, string>;
+    audio-render: func(document: list<u8>) -> result<audio-receipt, string>;
+    midi-next: func() -> result<option<list<u8>>, string>;
 }
 world cartridge {
     import host;

@@ -4,7 +4,7 @@ Cartridge storage is a capability, not a filesystem mount. A guest works with bo
 
 ## Guest interface
 
-The WIT 0.2 contract exposes the original key/value operations plus revision-guarded transactions:
+The storage portion of the WIT 0.3 contract exposes the original key/value operations plus revision-guarded transactions:
 
 ```text
 storage-get(key) -> value or none
@@ -16,7 +16,7 @@ storage-compare-exchange(revision, key, expected, replacement) -> applied, revis
 storage-apply(revision, mutations) -> applied, revision
 ```
 
-WIT 0.2 is a deliberate pre-1.0 ABI break. Cartridges built against `cartridge:api@0.1.0` must be rebuilt; the versioned import makes an old binary fail at linking instead of silently receiving different storage semantics.
+WIT 0.2 introduced these transaction semantics. WIT 0.3 preserves them and adds media capabilities. Cartridges built against either older package version must be rebuilt; the versioned import makes an old binary fail at linking instead of silently receiving different semantics.
 
 Keys are ASCII, at most 256 bytes, and may contain alphanumeric characters, `-`, `_`, `.`, and `/`. Empty path segments, `.` and `..` segments, drive prefixes, backslashes, and leading or trailing slashes are rejected. These rules keep snapshots portable even though the in-memory backend does not turn keys into paths.
 
