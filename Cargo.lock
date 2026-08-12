@@ -189,6 +189,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cartridge-core",
+ "cartridge-desktop",
+ "cartridge-dev",
  "cartridge-runtime",
  "cartridge-trace",
  "clap",
@@ -212,6 +214,32 @@ dependencies = [
  "toml",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "cartridge-desktop"
+version = "0.1.0"
+dependencies = [
+ "cartridge-core",
+ "fs4",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+]
+
+[[package]]
+name = "cartridge-dev"
+version = "0.1.0"
+dependencies = [
+ "cartridge-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 cartridge-core = { path = "../crates/cartridge-core" }
+cartridge-desktop = { path = "../crates/cartridge-desktop" }
 cartridge-media = { path = "../crates/cartridge-media" }
 cartridge-storage = { path = "../crates/cartridge-storage" }
 cartridge-trace = { path = "../crates/cartridge-trace" }
@@ -69,6 +70,13 @@ bench = false
 [[bin]]
 name = "audio"
 path = "fuzz_targets/audio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpu-stream"
+path = "fuzz_targets/gpu_stream.rs"
 test = false
 doc = false
 bench = false

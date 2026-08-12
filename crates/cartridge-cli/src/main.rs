@@ -16,6 +16,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
+use cartridge_desktop::{Capability, LaunchStatus, Library};
+use cartridge_dev::{
+    Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
+    source_fingerprint,
+};
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
     DirectoryStorage, InputEvent, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
@@ -62,6 +67,53 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// create a cartridge project from a tested language template
+    New {
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = DevLanguage::Rust)]
+        language: DevLanguage,
+    },
+    /// validate a developer project before building it
+    Check {
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// build and run a project, optionally watching for changes
+    Dev {
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        preserve_state: bool,
+    },
+    /// profile project size and declared runtime budgets
+    Profile {
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// emit editor metadata for Cartridge.toml
+    Schema {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// run API preflight, execution, and deterministic replay checks
+    Conformance {
+        package: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// manage the installed desktop cartridge library
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommand,
+    },
     /// build a cartridge archive from a manifest and component
     Pack {
         manifest: PathBuf,
@@ -205,6 +257,127 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DevLanguage {
+    Rust,
+    TinyGo,
+    JavaScript,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PermissionName {
+    Clock,
+    Random,
+    Assets,
+    Storage,
+    Graphics,
+    Audio,
+    Midi,
+}
+
+#[derive(Debug, Subcommand)]
+enum LibraryCommand {
+    /// verify and install a package
+    Install {
+        package: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// search installed cartridges
+    List {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// show requested, granted, and missing permissions
+    Preflight {
+        cartridge: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// approve requested capabilities
+    Grant {
+        cartridge: String,
+        capabilities: Vec<PermissionName>,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// revoke one capability or every grant
+    Revoke {
+        cartridge: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        capability: Option<PermissionName>,
+    },
+    /// launch an installed cartridge after permission preflight
+    Run {
+        cartridge: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        allow: Vec<PermissionName>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// show bounded launch and resource history
+    History {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// clear crash-loop safe mode for one cartridge
+    ResetSafeMode {
+        cartridge: String,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// manage named cartridge profiles
+    Profile {
+        #[command(subcommand)]
+        command: LibraryProfileCommand,
+    },
+    /// select an independently versioned runtime release
+    RuntimeRelease {
+        #[arg(long)]
+        root: PathBuf,
+        channel: String,
+        version: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LibraryProfileCommand {
+    /// create or replace a profile
+    Set {
+        name: String,
+        cartridges: Vec<String>,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// list profiles
+    List {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum AssetCommand {
     /// verify one asset without inflating unrelated asset payloads
@@ -329,6 +502,12 @@ enum TraceCommand {
         output: PathBuf,
         #[arg(long, value_enum, default_value_t = TraceRedactionProfile::Summary)]
         profile: TraceRedactionProfile,
+    },
+    /// export a bounded timeline document for trace viewers
+    Export {
+        trace: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -492,6 +671,21 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn run_cli() -> Result<()> {
     match Cli::parse().command {
+        Command::New { path, language } => new_command(&path, language),
+        Command::Check { project, json } => check_command(&project, json),
+        Command::Dev {
+            project,
+            once,
+            preserve_state,
+        } => dev_command(&project, once, preserve_state),
+        Command::Profile { project, json } => profile_command(&project, json),
+        Command::Schema { output } => schema_command(output.as_deref()),
+        Command::Conformance {
+            package,
+            json,
+            args,
+        } => conformance_command(&package, json, &args),
+        Command::Library { command } => run_library_command(command),
         Command::Pack {
             manifest,
             component,
@@ -601,6 +795,447 @@ fn run_cli() -> Result<()> {
         Command::Capsule { command } => run_capsule_command(command),
         Command::Storage { command } => run_storage_command(command),
     }
+}
+
+fn new_command(path: &Path, language: DevLanguage) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("project path must end in a UTF-8 project name")?;
+    let language = match language {
+        DevLanguage::Rust => Language::Rust,
+        DevLanguage::TinyGo => Language::TinyGo,
+        DevLanguage::JavaScript => Language::JavaScript,
+    };
+    create_project(path, name, language).map_err(anyhow::Error::msg)?;
+    println!(
+        "created {} project at {}",
+        language_name(language),
+        path.display()
+    );
+    Ok(())
+}
+
+fn language_name(language: Language) -> &'static str {
+    match language {
+        Language::Rust => "rust",
+        Language::TinyGo => "tinygo",
+        Language::JavaScript => "javascript",
+    }
+}
+
+fn check_command(project: &Path, json: bool) -> Result<()> {
+    let report = profile_project(project).map_err(anyhow::Error::msg)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{} {}", report.cartridge_id, report.cartridge_version);
+        println!("language: {}", report.language);
+        println!("files: {}", report.files);
+        println!("source bytes: {}", report.source_bytes);
+        println!("asset bytes: {}", report.asset_bytes);
+        println!("component: {}", report.component.display());
+        println!("component built: {}", report.component_exists);
+        println!("component bytes: {}", report.component_bytes);
+        println!("fuel budget: {}", report.fuel_budget);
+        println!("memory budget: {}", report.memory_budget_bytes);
+        println!("timeout budget: {} ms", report.timeout_budget_ms);
+        println!("permissions: {}", report.requested_permissions.join(", "));
+    }
+    Ok(())
+}
+
+fn profile_command(project: &Path, json: bool) -> Result<()> {
+    check_command(project, json)
+}
+
+fn schema_command(output: Option<&Path>) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(&manifest_schema())?;
+    if let Some(output) = output {
+        write_private(output, &bytes)?;
+        println!("wrote manifest schema -> {}", output.display());
+    } else {
+        println!("{}", String::from_utf8(bytes)?);
+    }
+    Ok(())
+}
+
+fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()> {
+    let manifest = Runtime::new()?.validate_file(package)?;
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "cartridge-conformance-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory)
+        .with_context(|| format!("could not reserve {}", directory.display()))?;
+    let trace = directory.join("run.trace.json");
+    let run = supervised_run_command(RunCommandOptions {
+        package,
+        trace: Some(&trace),
+        state_dir: None,
+        from_snapshot: None,
+        snapshot_output: None,
+        input: None,
+        midi: None,
+        media_dir: None,
+        args,
+    });
+    let replay = run.and_then(|()| supervised_replay_command(package, &trace, None, args));
+    let cleanup = fs::remove_file(&trace).and_then(|()| fs::remove_dir(&directory));
+    replay?;
+    cleanup.with_context(|| format!("could not clean {}", directory.display()))?;
+    let report = serde_json::json!({
+        "conformance_format": 1,
+        "cartridge_id": manifest.cartridge.id,
+        "cartridge_version": manifest.cartridge.version,
+        "api_preflight": true,
+        "execution": true,
+        "deterministic_replay": true
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("API preflight: passed");
+        println!("execution: passed");
+        println!("deterministic replay: passed");
+    }
+    Ok(())
+}
+
+fn dev_command(project: &Path, once: bool, preserve_state: bool) -> Result<()> {
+    let project = fs::canonicalize(project)
+        .with_context(|| format!("could not open project {}", project.display()))?;
+    let mut fingerprint = String::new();
+    let mut previous_manifest = None;
+    loop {
+        let next_fingerprint = source_fingerprint(&project).map_err(anyhow::Error::msg)?;
+        if next_fingerprint != fingerprint {
+            let (config, manifest) = inspect_project(&project).map_err(anyhow::Error::msg)?;
+            if preserve_state {
+                if let Some(previous) = &previous_manifest {
+                    match reload_decision(previous, &manifest) {
+                        cartridge_dev::ReloadDecision::Reject { reason } => {
+                            bail!("hot reload refused state handoff: {reason}")
+                        }
+                        cartridge_dev::ReloadDecision::Migrate { from, to } => bail!(
+                            "state schema changed from {from} to {to}; run the declared migration before reloading"
+                        ),
+                        cartridge_dev::ReloadDecision::Fresh
+                        | cartridge_dev::ReloadDecision::PreserveState => {}
+                    }
+                }
+            }
+            run_dev_build(&project, &config, &manifest, preserve_state)?;
+            previous_manifest = Some(manifest);
+            fingerprint = next_fingerprint;
+        }
+        if once {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn run_dev_build(
+    project: &Path,
+    config: &cartridge_dev::ProjectConfig,
+    manifest: &cartridge_core::PackageManifest,
+    preserve_state: bool,
+) -> Result<()> {
+    let (program, arguments) = config
+        .build
+        .split_first()
+        .context("build command is empty")?;
+    println!("building {}", manifest.cartridge.id);
+    let status = ProcessCommand::new(program)
+        .args(arguments)
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("could not start build command {program:?}"))?;
+    if !status.success() {
+        bail!("build command exited with {status}");
+    }
+
+    let component = project.join(&config.component);
+    if !component.is_file() {
+        bail!("build did not create {}", component.display());
+    }
+    let work = project.join(".cartridge");
+    fs::create_dir_all(&work)?;
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let package = work.join(format!("dev-{}-{sequence}.cartridge", std::process::id()));
+    let assets = project.join("assets");
+    pack(&PackOptions {
+        manifest: project.join("Cartridge.toml"),
+        component,
+        assets: assets.is_dir().then_some(assets),
+        output: package.clone(),
+    })?;
+    let state = preserve_state
+        .then(|| work.join("state"))
+        .filter(|_| manifest.permissions.storage);
+    let result = supervised_run_command(RunCommandOptions {
+        package: &package,
+        trace: None,
+        state_dir: state.as_deref(),
+        from_snapshot: None,
+        snapshot_output: None,
+        input: None,
+        midi: None,
+        media_dir: None,
+        args: &[],
+    });
+    fs::remove_file(&package)
+        .with_context(|| format!("could not remove temporary package {}", package.display()))?;
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_library_command(command: LibraryCommand) -> Result<()> {
+    match command {
+        LibraryCommand::Install {
+            package,
+            root,
+            json,
+        } => {
+            let installed = Library::open(root)
+                .map_err(anyhow::Error::msg)?
+                .install(&package)
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&installed)?);
+            } else {
+                println!(
+                    "installed {} ({} bytes)",
+                    installed.name, installed.package_bytes
+                );
+                println!("sha256: {}", installed.package_sha256);
+            }
+            Ok(())
+        }
+        LibraryCommand::List { root, query, json } => {
+            let library = Library::open(root).map_err(anyhow::Error::msg)?;
+            let entries = library.list(query.as_deref());
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                for entry in entries {
+                    let safe = if entry.safe_mode { " [safe mode]" } else { "" };
+                    println!(
+                        "{} {} {}{safe}",
+                        entry.cartridge_id,
+                        entry.versions.join(","),
+                        entry.name
+                    );
+                }
+            }
+            Ok(())
+        }
+        LibraryCommand::Preflight {
+            cartridge,
+            root,
+            version,
+            json,
+        } => {
+            let report = Library::open(root)
+                .map_err(anyhow::Error::msg)?
+                .preflight(&cartridge, version.as_deref())
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{} {}", report.cartridge_id, report.version);
+                println!("requested: {}", capability_list(&report.requested));
+                println!("granted: {}", capability_list(&report.granted));
+                println!("missing: {}", capability_list(&report.missing));
+            }
+            Ok(())
+        }
+        LibraryCommand::Grant {
+            cartridge,
+            capabilities,
+            root,
+        } => {
+            let mut library = Library::open(root).map_err(anyhow::Error::msg)?;
+            let capabilities = capabilities.into_iter().map(capability).collect();
+            library
+                .grant(&cartridge, &capabilities, true)
+                .map_err(anyhow::Error::msg)?;
+            println!("updated persistent grants for {cartridge}");
+            Ok(())
+        }
+        LibraryCommand::Revoke {
+            cartridge,
+            root,
+            capability: value,
+        } => {
+            Library::open(root)
+                .map_err(anyhow::Error::msg)?
+                .revoke(&cartridge, value.map(capability))
+                .map_err(anyhow::Error::msg)?;
+            println!("revoked grant for {cartridge}");
+            Ok(())
+        }
+        LibraryCommand::Run {
+            cartridge,
+            root,
+            version,
+            trace,
+            allow,
+            args,
+        } => library_run_command(
+            &root,
+            &cartridge,
+            version.as_deref(),
+            trace.as_deref(),
+            allow,
+            &args,
+        ),
+        LibraryCommand::History { root, json } => {
+            let library = Library::open(root).map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(library.history())?);
+            } else {
+                for record in library.history() {
+                    println!(
+                        "{} {} {} {:?} fuel={}",
+                        record.id,
+                        record.cartridge_id,
+                        record.version,
+                        record.status,
+                        record
+                            .fuel_consumed
+                            .map_or_else(|| "-".into(), |value| value.to_string())
+                    );
+                }
+            }
+            Ok(())
+        }
+        LibraryCommand::ResetSafeMode { cartridge, root } => {
+            Library::open(root)
+                .map_err(anyhow::Error::msg)?
+                .reset_safe_mode(&cartridge)
+                .map_err(anyhow::Error::msg)?;
+            println!("safe mode cleared for {cartridge}");
+            Ok(())
+        }
+        LibraryCommand::Profile { command } => match command {
+            LibraryProfileCommand::Set {
+                name,
+                cartridges,
+                root,
+            } => {
+                Library::open(root)
+                    .map_err(anyhow::Error::msg)?
+                    .set_profile(&name, cartridges.into_iter().collect())
+                    .map_err(anyhow::Error::msg)?;
+                println!("updated profile {name}");
+                Ok(())
+            }
+            LibraryProfileCommand::List { root, json } => {
+                let library = Library::open(root).map_err(anyhow::Error::msg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&library.profiles())?);
+                } else {
+                    for profile in library.profiles() {
+                        println!(
+                            "{}: {}",
+                            profile.name,
+                            profile
+                                .cartridges
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
+        LibraryCommand::RuntimeRelease {
+            root,
+            channel,
+            version,
+        } => {
+            Library::open(root)
+                .map_err(anyhow::Error::msg)?
+                .set_runtime_release(&channel, &version)
+                .map_err(anyhow::Error::msg)?;
+            println!("runtime release set to {channel} {version}");
+            Ok(())
+        }
+    }
+}
+
+fn library_run_command(
+    root: &Path,
+    cartridge: &str,
+    version: Option<&str>,
+    trace: Option<&Path>,
+    allow: Vec<PermissionName>,
+    args: &[String],
+) -> Result<()> {
+    let mut library = Library::open(root).map_err(anyhow::Error::msg)?;
+    let session = allow.into_iter().map(capability).collect();
+    library
+        .grant(cartridge, &session, false)
+        .map_err(anyhow::Error::msg)?;
+    let package = library
+        .package_path(cartridge, version)
+        .map_err(anyhow::Error::msg)?;
+    let launch = library
+        .begin_launch(cartridge, version)
+        .map_err(anyhow::Error::msg)?;
+    let state = root.join("state");
+    let result = supervised_run_command(RunCommandOptions {
+        package: &package,
+        trace,
+        state_dir: Some(&state),
+        from_snapshot: None,
+        snapshot_output: None,
+        input: None,
+        midi: None,
+        media_dir: None,
+        args,
+    });
+    let status = if result.is_ok() {
+        LaunchStatus::Succeeded
+    } else {
+        LaunchStatus::Failed
+    };
+    library
+        .finish_launch(
+            launch.id,
+            status,
+            None,
+            None,
+            trace.map(|path| path.display().to_string()),
+        )
+        .map_err(anyhow::Error::msg)?;
+    result
+}
+
+fn capability(value: PermissionName) -> Capability {
+    match value {
+        PermissionName::Clock => Capability::Clock,
+        PermissionName::Random => Capability::Random,
+        PermissionName::Assets => Capability::Assets,
+        PermissionName::Storage => Capability::Storage,
+        PermissionName::Graphics => Capability::Graphics,
+        PermissionName::Audio => Capability::Audio,
+        PermissionName::Midi => Capability::Midi,
+    }
+}
+
+fn capability_list(values: &BTreeSet<Capability>) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}").to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn run_blob_command(command: BlobCommand) -> Result<()> {
@@ -861,7 +1496,24 @@ fn run_trace_command(command: TraceCommand) -> Result<()> {
             output,
             profile,
         } => trace_redact_command(&trace, &output, profile),
+        TraceCommand::Export { trace, output } => trace_export_command(&trace, &output),
     }
+}
+
+fn trace_export_command(trace: &Path, output: &Path) -> Result<()> {
+    let trace = read_trace(trace)?;
+    let document = serde_json::json!({
+        "viewer_format": 1,
+        "summary": trace.summary(),
+        "events": trace.events
+    });
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    if bytes.len() as u64 > MAX_TRACE_DOCUMENT_BYTES {
+        bail!("trace viewer export exceeds the {MAX_TRACE_DOCUMENT_BYTES}-byte limit");
+    }
+    write_private(output, &bytes)?;
+    println!("wrote trace viewer data -> {}", output.display());
+    Ok(())
 }
 
 fn run_asset_command(command: AssetCommand) -> Result<()> {

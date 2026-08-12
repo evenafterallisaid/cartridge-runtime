@@ -42,6 +42,14 @@ jobs:
       - name: Build example component
         run: cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
+      - name: Run developer workflow scaffold
+        shell: bash
+        run: |
+          cargo run -p cartridge-cli -- new "$RUNNER_TEMP/cartridge-sdk-smoke" --language rust
+          cargo run -p cartridge-cli -- check "$RUNNER_TEMP/cartridge-sdk-smoke"
+          cargo run -p cartridge-cli -- schema --output "$RUNNER_TEMP/Cartridge.schema.json"
+          cargo run -p cartridge-cli -- dev "$RUNNER_TEMP/cartridge-sdk-smoke" --once
+
       - name: Build media reference components
         shell: bash
         run: |
@@ -88,6 +96,12 @@ jobs:
           cargo run -p cartridge-cli -- trace inspect hello.trace.json
           cargo run -p cartridge-cli -- trace diff hello.trace.json hello.trace.json
           cargo run -p cartridge-cli -- trace redact hello.trace.json --output hello.trace-summary.json
+          cargo run -p cartridge-cli -- trace export hello.trace.json --output hello.timeline.json
+          cargo run -p cartridge-cli -- conformance hello.cartridge -- CI
+          cargo run -p cartridge-cli -- library install hello.cartridge --root library
+          cargo run -p cartridge-cli -- library preflight dev.cartridge.hello --root library
+          cargo run -p cartridge-cli -- library grant dev.cartridge.hello clock assets storage --root library
+          cargo run -p cartridge-cli -- library run dev.cartridge.hello --root library -- CI
           blob_json=$(cargo run -q -p cartridge-cli -- blob put hello.trace.json --store blobs --json)
           blob_digest=$(printf '%s' "$blob_json" | grep '"sha256"' | head -1 | cut -d '"' -f4)
           cargo run -p cartridge-cli -- blob verify "$blob_digest" --store blobs

@@ -110,6 +110,16 @@ impl Runtime {
         self.run(archive, args)
     }
 
+    pub fn validate_file(&self, path: impl AsRef<Path>) -> Result<PackageManifest> {
+        let archive = open_archive(path)?;
+        let component = Component::new(&self.engine, &archive.component)
+            .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
+        self.linker()?
+            .instantiate_pre(&component)
+            .map_err(|error| anyhow!("the package API does not match this runtime: {error}"))?;
+        Ok(archive.manifest)
+    }
+
     pub fn run(&self, archive: CartridgeArchive, args: &[String]) -> Result<RunReport> {
         self.execute(archive, args, None, false)
     }

@@ -1,23 +1,15 @@
 [package]
-name = "cartridge-cli"
+name = "cartridge-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "cartridge"
-path = "src/main.rs"
-
 [dependencies]
-anyhow.workspace = true
 cartridge-core = { path = "../cartridge-core" }
-cartridge-desktop = { path = "../cartridge-desktop" }
-cartridge-dev = { path = "../cartridge-dev" }
-cartridge-runtime = { path = "../cartridge-runtime" }
-cartridge-trace = { path = "../cartridge-trace" }
-clap.workspace = true
+fs4 = "1.1.0"
 hex.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

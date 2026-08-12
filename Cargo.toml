@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/cartridge-dev",
+    "crates/cartridge-desktop",
     "crates/cartridge-media",
     "crates/cartridge-cli",
     "crates/cartridge-core",

@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: milestones 0.1 through 0.5 are implemented at the portable runtime boundary. Runtime work is moving into 0.6 developer workflow. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.7 are implemented. The runtime now includes its portable media boundary, developer workflow, and cross-platform desktop-library core. Work is moving into 0.8 identity and signing. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -285,6 +285,17 @@ Exit criteria:
 - hot reload never overwrites persistent state without a migration
 - SDK examples are tested against the current runtime in CI
 
+Implemented delivery slices:
+
+1. Exclusive Rust, TinyGo, and JavaScript project scaffolds with a checked-in WIT contract.
+2. Bounded project validation, stable source fingerprints, package sizing, and declared fuel/memory/time profiles.
+3. Argument-array build commands and a supervised build/watch/run loop with a one-shot CI mode.
+4. State handoff that permits identical schemas, identifies declared migrations, and refuses unsafe schema changes.
+5. Runtime import preflight before guest execution and a run-plus-replay conformance command.
+6. JSON Schema output for editor integrations and a bounded full-fidelity trace timeline format.
+
+The 0.6 workflow boundary is complete. Language toolchains remain external developer dependencies; installed packages can never supply or execute a build command.
+
 ### 0.7 — desktop library and permission UX
 
 Purpose: provide a real home for installed cartridges.
@@ -308,6 +319,18 @@ Exit criteria:
 - grants can be inspected and revoked later
 - a broken cartridge cannot prevent the library from opening
 - the shell passes keyboard and screen-reader navigation checks
+
+Implemented delivery slices:
+
+1. Cross-platform native library core and CLI shell with verified content-addressed installs, search, versions, and profiles.
+2. Stable preflight prompt models with readable capability descriptions and named keyboard/screen-reader actions.
+3. Session-only and persistent grants, granular revocation, and automatic reapproval when the requested capability set changes.
+4. Bounded launch history and monotonic resource samples for fuel, memory, and audio underruns.
+5. Interrupted-launch recovery, per-cartridge crash-loop safe mode, and corrupt-index quarantine.
+6. `.cartridge` association recognition, separate runtime release channels, and trace timeline integration.
+7. A graphics presenter boundary with canonical CPU and policy-gated GPU modes. Accelerated mode requires robust buffer access, process isolation, and explicit resource limits.
+
+The 0.7 library boundary is complete. The CLI is the first accessible shell; richer graphical frontends remain consumers of this library rather than new security boundaries. GPU-backed 2D and future 3D adapters must preserve the validation contract described below.
 
 ### 0.8 — identity, signing, and distribution
 
@@ -505,6 +528,34 @@ Exit criteria:
 - sync converges after long offline periods
 - remote execution is always distinguishable from local execution
 - no registry account is required for direct device-to-device use
+
+### 1.5 — portable GPU and 3D
+
+Purpose: support modern interactive graphics without handing native device authority to a cartridge or pretending that every driver produces identical pixels.
+
+Work:
+
+- versioned WebGPU-style buffer, texture, sampler, bind-group, pipeline, and render-pass resources
+- host-validated WGSL subset with compilation limits and diagnostic normalization
+- isolated GPU helper with a restart budget and device-loss recovery
+- Metal, Vulkan, Direct3D 12, and software adapters behind one presenter contract
+- explicit video-memory, upload, command, pass, shader, and pipeline-cache quotas
+- generation-checked opaque handles and deterministic resource destruction
+- indirect-draw, query, readback, and timestamp restrictions that prevent bounds and fingerprinting leaks
+- structural replay of resource creation and command submission
+- selectable canonical CPU, accelerated, and validation-layer execution modes
+- tolerance-based screenshot comparison alongside byte-exact command-stream receipts
+- frame pacing, pipeline compilation, upload, and GPU-time telemetry
+- glTF reference viewer and a moderately complex 3D game scene in the shared platform corpus
+
+Exit criteria:
+
+- guests never receive a native API handle, mapped host pointer, or driver object
+- malformed shaders and command streams cannot reach a backend before validation
+- GPU-process failure cannot take down the library or corrupt cartridge state
+- every resource is charged before native allocation and released after a bounded lifetime
+- the same cartridge runs through all supported backends with equivalent observable behavior
+- replay distinguishes command divergence from permitted driver-level pixel variation
 
 ### 2.0 — multiple execution environments
 

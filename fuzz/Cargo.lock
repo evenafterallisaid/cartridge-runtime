@@ -50,10 +50,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cartridge-desktop"
+version = "0.1.0"
+dependencies = [
+ "cartridge-core",
+ "fs4",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cartridge-fuzz"
 version = "0.0.0"
 dependencies = [
  "cartridge-core",
+ "cartridge-desktop",
  "cartridge-media",
  "cartridge-storage",
  "cartridge-trace",
