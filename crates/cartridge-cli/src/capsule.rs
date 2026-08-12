@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -24,6 +25,7 @@ const MAX_EVENTS: usize = 100_000;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_STORAGE_KEYS: usize = 100_000;
 const MAX_STORAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BLOB_REFERENCES: usize = 100_000;
 
 static CAPSULE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -279,6 +281,29 @@ pub fn verify(path: &Path) -> Result<CapsuleVerification> {
         trace_path: payload.trace.artifact.path.clone(),
         result_snapshot_path: payload.result_snapshot.artifact.path.clone(),
     })
+}
+
+pub fn blob_references(path: &Path) -> Result<BTreeMap<String, u64>> {
+    let initial = verify(path)?;
+    let capsule = Capsule::read(path)?;
+    if capsule.payload_sha256 != initial.capsule.capsule_sha256 {
+        bail!("capsule changed while blob references were being loaded");
+    }
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = fs::canonicalize(directory)?;
+    let source = read_verified_snapshot(&root, &capsule.payload.source_snapshot)?;
+    let result = read_verified_snapshot(&root, &capsule.payload.result_snapshot)?;
+    let mut references = source.blob_references()?;
+    merge_blob_references(&mut references, result.blob_references()?)?;
+
+    let final_verification = verify(path)?;
+    if final_verification.capsule.capsule_sha256 != initial.capsule.capsule_sha256 {
+        bail!("capsule changed while blob references were being loaded");
+    }
+    Ok(references)
 }
 
 pub fn replay_inputs(path: &Path) -> Result<CapsuleReplayInputs> {
@@ -781,6 +806,63 @@ fn verify_artifact(root: &Path, artifact: &ArtifactReference, limit: u64) -> Res
     Ok(canonical)
 }
 
+fn read_verified_snapshot(root: &Path, reference: &SnapshotReference) -> Result<StorageSnapshot> {
+    validate_artifact(&reference.artifact, MAX_SNAPSHOT_FILE_BYTES)?;
+    let joined = root.join(path_from_portable(&reference.artifact.path)?);
+    let canonical = fs::canonicalize(&joined).with_context(|| {
+        format!(
+            "could not resolve capsule artifact {}",
+            reference.artifact.path
+        )
+    })?;
+    if !canonical.starts_with(root) {
+        bail!(
+            "capsule artifact {} escapes its directory",
+            reference.artifact.path
+        );
+    }
+    let bytes = read_bounded(&canonical, MAX_SNAPSHOT_FILE_BYTES)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != reference.artifact.bytes
+        || digest_bytes(&bytes) != reference.artifact.sha256
+    {
+        bail!(
+            "capsule artifact {} does not match its digest",
+            reference.artifact.path
+        );
+    }
+    let snapshot = StorageSnapshot::from_slice(&bytes)?;
+    let summary = snapshot.summary()?;
+    if summary.state_schema != reference.state_schema
+        || summary.entries != reference.entries
+        || summary.bytes != reference.bytes
+        || summary.payload_sha256 != reference.payload_sha256
+    {
+        bail!(
+            "capsule snapshot {} does not match its metadata",
+            reference.artifact.path
+        );
+    }
+    Ok(snapshot)
+}
+
+fn merge_blob_references(
+    target: &mut BTreeMap<String, u64>,
+    source: BTreeMap<String, u64>,
+) -> Result<()> {
+    for (sha256, bytes) in source {
+        match target.insert(sha256.clone(), bytes) {
+            Some(existing) if existing != bytes => {
+                bail!("capsule has conflicting sizes for blob {sha256}");
+            }
+            _ => {}
+        }
+        if target.len() > MAX_BLOB_REFERENCES {
+            bail!("capsule exceeds the {MAX_BLOB_REFERENCES}-reference limit");
+        }
+    }
+    Ok(())
+}
+
 fn validate_artifact(artifact: &ArtifactReference, limit: u64) -> Result<()> {
     if artifact.path.is_empty()
         || artifact.path.len() > MAX_ARTIFACT_PATH_BYTES
@@ -1014,5 +1096,63 @@ mod tests {
         let oversized = vec![b' '; usize::try_from(MAX_CAPSULE_BYTES).unwrap() + 1];
 
         assert!(Capsule::from_slice(&oversized).is_err());
+    }
+
+    #[test]
+    fn reachability_reads_the_exact_snapshot_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let source = StorageSnapshot::from_slice(include_bytes!(
+            "../../cartridge-storage/tests/fixtures/snapshot-v2.json"
+        ))
+        .unwrap();
+        let limits = cartridge_runtime::StorageLimits {
+            max_bytes: 1024,
+            max_keys: 8,
+            max_value_bytes: 512,
+        };
+        let branch = cartridge_runtime::SnapshotStorage::from_snapshot(
+            &source,
+            source.cartridge_id(),
+            limits,
+        )
+        .unwrap();
+        let reference = cartridge_runtime::BlobReference::new("a".repeat(64), 42)
+            .unwrap()
+            .encode()
+            .unwrap();
+        cartridge_runtime::StorageBackend::put(
+            &branch,
+            source.cartridge_id(),
+            "blobs/example",
+            &reference,
+            limits,
+        )
+        .unwrap();
+        let snapshot = branch.export_snapshot().unwrap();
+        let path = directory.path().join("state.json");
+        snapshot.write_new(&path).unwrap();
+        let summary = snapshot.summary().unwrap();
+        let snapshot_reference = SnapshotReference {
+            artifact: artifact_reference(&root, &path, MAX_SNAPSHOT_FILE_BYTES).unwrap(),
+            state_schema: summary.state_schema,
+            entries: summary.entries,
+            bytes: summary.bytes,
+            payload_sha256: summary.payload_sha256,
+        };
+
+        let loaded = read_verified_snapshot(&root, &snapshot_reference).unwrap();
+        assert_eq!(
+            loaded.blob_references().unwrap(),
+            BTreeMap::from([("a".repeat(64), 42)])
+        );
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" ")
+            .unwrap();
+        assert!(read_verified_snapshot(&root, &snapshot_reference).is_err());
     }
 }

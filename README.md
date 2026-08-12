@@ -22,7 +22,7 @@ The project is deliberately small at this stage: it proves the complete path fro
 - Durable migration commits with automatic rollback capture, receipts, and recovery evidence
 - Reproducible capsule manifests binding packages, source state, traces, and result state
 - State-reproducing capsule replay on disposable snapshot branches
-- Streaming content-addressed blobs with verification, materialization, and safe GC dry runs
+- Streaming content-addressed blobs with verified snapshot/capsule reachability and safe GC dry runs
 - Typed inter-cartridge service declarations and direct dependency resolution
 - A complete example cartridge
 
@@ -73,7 +73,7 @@ cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
 cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
 cargo run -p cartridge-cli -- trace redact dist/hello.trace.json --output dist/hello.trace-summary.json
 cargo run -p cartridge-cli -- blob put dist/hello.trace.json --store dist/blobs
-cargo run -p cartridge-cli -- blob gc --store dist/blobs
+cargo run -p cartridge-cli -- blob gc --store dist/blobs --snapshot backup.cartridge-state.json
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 ```
 

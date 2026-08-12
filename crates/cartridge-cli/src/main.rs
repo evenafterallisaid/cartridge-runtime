@@ -2,6 +2,7 @@ mod capsule;
 mod migration_receipt;
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     io::{Read, Write},
@@ -29,6 +30,8 @@ use migration_receipt::{MigrationReceipt, MigrationReceiptPayload};
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WORKER_STARTUP_BUDGET: Duration = Duration::from_secs(10);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BLOB_GC_ROOT_ARTIFACTS: usize = 256;
+const MAX_BLOB_GC_REFERENCES: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -213,6 +216,10 @@ enum BlobCommand {
         store: PathBuf,
         #[arg(long)]
         keep: Vec<String>,
+        #[arg(long, value_name = "SNAPSHOT")]
+        snapshot: Vec<PathBuf>,
+        #[arg(long, value_name = "CAPSULE")]
+        capsule: Vec<PathBuf>,
         #[arg(long)]
         apply: bool,
         #[arg(long)]
@@ -531,11 +538,32 @@ fn run_blob_command(command: BlobCommand) -> Result<()> {
         BlobCommand::Gc {
             store,
             keep,
+            snapshot,
+            capsule,
             apply,
             json,
         } => {
-            let retained = keep.into_iter().collect();
-            let report = BlobStore::open(store)?.gc(&retained, !apply)?;
+            let root_count = snapshot
+                .len()
+                .checked_add(capsule.len())
+                .context("blob reachability root count overflowed")?;
+            if root_count > MAX_BLOB_GC_ROOT_ARTIFACTS {
+                bail!(
+                    "blob garbage collection accepts at most {MAX_BLOB_GC_ROOT_ARTIFACTS} snapshot and capsule roots"
+                );
+            }
+            let retained: BTreeSet<_> = keep.into_iter().collect();
+            let mut references = BTreeMap::new();
+            for path in snapshot {
+                let snapshot = StorageSnapshot::read(&path)
+                    .with_context(|| format!("could not read snapshot {}", path.display()))?;
+                merge_blob_references(&mut references, snapshot.blob_references()?)?;
+            }
+            for path in capsule {
+                merge_blob_references(&mut references, capsule::blob_references(&path)?)?;
+            }
+            let report =
+                BlobStore::open(store)?.gc_with_references(&retained, &references, !apply)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -553,6 +581,24 @@ fn run_blob_command(command: BlobCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn merge_blob_references(
+    target: &mut BTreeMap<String, u64>,
+    source: BTreeMap<String, u64>,
+) -> Result<()> {
+    for (sha256, bytes) in source {
+        match target.insert(sha256.clone(), bytes) {
+            Some(existing) if existing != bytes => {
+                bail!("artifacts have conflicting sizes for blob {sha256}");
+            }
+            _ => {}
+        }
+        if target.len() > MAX_BLOB_GC_REFERENCES {
+            bail!("blob reachability exceeds the {MAX_BLOB_GC_REFERENCES}-reference limit");
+        }
+    }
+    Ok(())
 }
 
 fn print_blob_info(report: &cartridge_runtime::BlobInfo, json: bool) -> Result<()> {
@@ -1941,5 +1987,67 @@ fn print_resolution(plan: &ResolutionPlan) {
                 dependency.alias, dependency.cartridge, dependency.reason
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_gc_uses_snapshot_reachability_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("blobs");
+        let retained_input = directory.path().join("retained.bin");
+        let removable_input = directory.path().join("removable.bin");
+        fs::write(&retained_input, b"retained").unwrap();
+        fs::write(&removable_input, b"removable").unwrap();
+        let store = BlobStore::open(&store_path).unwrap();
+        let retained = store.put(&retained_input).unwrap();
+        let removable = store.put(&removable_input).unwrap();
+
+        let source = StorageSnapshot::from_slice(include_bytes!(
+            "../../cartridge-storage/tests/fixtures/snapshot-v2.json"
+        ))
+        .unwrap();
+        let limits = StorageLimits {
+            max_bytes: 1024,
+            max_keys: 8,
+            max_value_bytes: 512,
+        };
+        let branch =
+            SnapshotStorage::from_snapshot(&source, source.cartridge_id(), limits).unwrap();
+        let reference =
+            cartridge_runtime::BlobReference::new(retained.sha256.clone(), retained.bytes)
+                .unwrap()
+                .encode()
+                .unwrap();
+        cartridge_runtime::StorageBackend::put(
+            &branch,
+            source.cartridge_id(),
+            "blobs/retained",
+            &reference,
+            limits,
+        )
+        .unwrap();
+        let snapshot_path = directory.path().join("state.json");
+        branch
+            .export_snapshot()
+            .unwrap()
+            .write_new(&snapshot_path)
+            .unwrap();
+
+        run_blob_command(BlobCommand::Gc {
+            store: store_path,
+            keep: Vec::new(),
+            snapshot: vec![snapshot_path],
+            capsule: Vec::new(),
+            apply: true,
+            json: true,
+        })
+        .unwrap();
+
+        store.verify(&retained.sha256).unwrap();
+        assert!(store.verify(&removable.sha256).is_err());
     }
 }

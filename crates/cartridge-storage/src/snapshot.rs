@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES, MemoryStorage, Result,
-    StorageBackend, StorageLimits, StorageMutation, StorageTransactionResult, StorageUsage,
-    validate_key, validate_limits, validate_namespace,
+    BlobReference, Error, MAX_STORAGE_BYTES, MAX_STORAGE_KEYS, MAX_STORAGE_VALUE_BYTES,
+    MemoryStorage, Result, StorageBackend, StorageLimits, StorageMutation,
+    StorageTransactionResult, StorageUsage, validate_key, validate_limits, validate_namespace,
 };
 
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
@@ -397,6 +397,25 @@ impl StorageSnapshot {
         })
     }
 
+    pub fn blob_references(&self) -> Result<BTreeMap<String, u64>> {
+        let mut references = BTreeMap::new();
+        for value in self.decode_entries()?.values() {
+            let Some(reference) = BlobReference::decode(value)? else {
+                continue;
+            };
+            match references.insert(reference.sha256.clone(), reference.bytes) {
+                Some(bytes) if bytes != reference.bytes => {
+                    return Err(Error::Corrupt(format!(
+                        "snapshot has conflicting sizes for blob {}",
+                        reference.sha256
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(references)
+    }
+
     pub(crate) fn entries_for(
         &self,
         expected_cartridge_id: &str,
@@ -716,6 +735,48 @@ mod tests {
             exported.compare(&older).unwrap().difference,
             Some(SnapshotDifference::Revision { left: 7, right: 6 })
         );
+    }
+
+    #[test]
+    fn snapshots_extract_canonical_blob_references_and_reject_conflicts() {
+        let first = BlobReference::new("a".repeat(64), 42)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let second = BlobReference::new("b".repeat(64), 7)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let snapshot = StorageSnapshot::from_entries(
+            "dev.example.test",
+            0,
+            &BTreeMap::from([
+                ("blobs/first".into(), first),
+                ("blobs/second".into(), second),
+                ("settings/theme".into(), b"dark".to_vec()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.blob_references().unwrap(),
+            BTreeMap::from([("a".repeat(64), 42), ("b".repeat(64), 7)])
+        );
+
+        let left = BlobReference::new("c".repeat(64), 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let right = BlobReference::new("c".repeat(64), 2)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let conflicting = StorageSnapshot::from_entries(
+            "dev.example.test",
+            0,
+            &BTreeMap::from([("blobs/left".into(), left), ("blobs/right".into(), right)]),
+        )
+        .unwrap();
+        assert!(conflicting.blob_references().is_err());
     }
 
     #[test]

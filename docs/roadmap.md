@@ -138,8 +138,9 @@ Delivery slices:
    - [implemented] bounded streaming ingestion, verification, deduplication, and materialization
    - [implemented] finite-wait cross-process exclusion for reads, writes, and collection
    - [implemented] safe-by-default explicit-retain garbage collection
-   - derive reachability from snapshots and capsules
-   - add guest-visible blob references after reachability and quota semantics are fixed
+   - [implemented] canonical references and verified reachability from snapshots and capsules
+   - persist signed or checksummed multi-artifact reachability manifests for backup sets
+   - add guest-visible streaming blob resources after store quota and authorization semantics are fixed
 10. [implemented] ABA-safe namespace revisions, compare-exchange, and bounded atomic guest batches across memory, snapshot, and durable backends.
 
 The first eight slices, the host-side foundation of slice nine, and slice ten are implemented. Durable state is opt-in through `--state-dir`, which keeps host-directory policy explicit until the desktop runtime owns a standard application-data location. Snapshots are independently versioned and exclude internal journal metadata while preserving the monotonic revision clock. State schemas now follow data through memory, durable generations, and portable snapshots. Manifests declare unambiguous monotonic migration edges, and the CLI can either rehearse those plans or capture a rollback snapshot and commit a successful result as one generation. Conditional commit compares the locked namespace with its source so a concurrent writer cannot be lost. A flushed pre-commit receipt binds that source and isolated migration revision to the only generation and digest the migration can create, making the supervisor's final crash window recoverable without trusting console output.
@@ -771,9 +772,11 @@ The next concrete sequence is:
    - [implemented] apply validated replay writes to a disposable source branch and independently reproduce the result-state digest
    - minimize failing capsules while preserving the first divergence
 2. Finish content-addressed state integration:
-   - derive live blob reachability from snapshots and capsules
-   - make collection consume verified reachability manifests instead of hand-written retain lists
-   - define blob-reference quota, lifecycle, and replay rules before adding the guest ABI
+   - [implemented] define canonical digest-and-size references with fail-closed decoding
+   - [implemented] derive live reachability from checksum-validated snapshots and fully verified capsules
+   - [implemented] verify every artifact-derived retained object under the collection lock before deletion
+   - add a checksummed reachability manifest that can bind larger backup sets without rescanning every capsule
+   - define per-cartridge blob-store quotas and authorization before adding the streaming guest ABI
 3. [implemented] Generalize migration's conditional commit into guest-facing compare-exchange and bounded atomic batches, with trace events and ABA-safe portable revision tokens.
 4. [implemented] Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
 5. Create a minimal 2D window and input prototype behind new WIT packages.
@@ -796,7 +799,7 @@ Completed foundations:
 - portable execution capsule manifests with path confinement, raw artifact digests, and semantic cross-file verification
 - state-reproducing capsule replay on disposable snapshot branches
 - privacy-safe non-replayable trace summary and metadata exports
-- content-addressed blob storage with bounded streaming I/O and safe-by-default garbage collection
+- content-addressed blob storage with bounded streaming I/O, verified artifact reachability, and safe-by-default garbage collection
 - ABA-safe compare-exchange and bounded atomic state batches across all storage backends
 - Merkle-style package asset roots and selective payload verification
 - seeded archive, manifest, snapshot, trace, and atomic-transaction fuzz targets with scheduled bounded runs

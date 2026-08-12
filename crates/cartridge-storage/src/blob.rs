@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use crate::{Error, Result};
 
 pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_BLOB_GC_ROOTS: usize = 100_000;
+const BLOB_REFERENCE_PREFIX: &[u8] = b"cartridge-blob-v1\0";
+const BLOB_REFERENCE_BYTES: usize = BLOB_REFERENCE_PREFIX.len() + 64 + 8;
 
 static BLOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -33,6 +36,63 @@ pub struct BlobInfo {
     pub sha256: String,
     pub bytes: u64,
     pub existed: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BlobReference {
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+impl BlobReference {
+    pub fn new(sha256: impl Into<String>, bytes: u64) -> Result<Self> {
+        let reference = Self {
+            sha256: sha256.into(),
+            bytes,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut encoded = Vec::with_capacity(BLOB_REFERENCE_BYTES);
+        encoded.extend_from_slice(BLOB_REFERENCE_PREFIX);
+        encoded.extend_from_slice(self.sha256.as_bytes());
+        encoded.extend_from_slice(&self.bytes.to_be_bytes());
+        Ok(encoded)
+    }
+
+    pub fn decode(value: &[u8]) -> Result<Option<Self>> {
+        if !value.starts_with(BLOB_REFERENCE_PREFIX) {
+            return Ok(None);
+        }
+        if value.len() != BLOB_REFERENCE_BYTES {
+            return Err(Error::Corrupt(
+                "blob reference has an invalid length".into(),
+            ));
+        }
+        let digest_start = BLOB_REFERENCE_PREFIX.len();
+        let digest_end = digest_start + 64;
+        let sha256 = std::str::from_utf8(&value[digest_start..digest_end])
+            .map_err(|_| Error::Corrupt("blob reference digest is not text".into()))?;
+        let bytes = u64::from_be_bytes(
+            value[digest_end..]
+                .try_into()
+                .map_err(|_| Error::Corrupt("blob reference size is invalid".into()))?,
+        );
+        Self::new(sha256, bytes).map(Some)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_digest(&self.sha256)?;
+        if self.bytes > MAX_BLOB_BYTES {
+            return Err(Error::Corrupt(format!(
+                "blob reference exceeds the {MAX_BLOB_BYTES} byte limit"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -211,10 +271,41 @@ impl BlobStore {
     }
 
     pub fn gc(&self, retained: &BTreeSet<String>, dry_run: bool) -> Result<BlobGcReport> {
+        self.gc_with_references(retained, &BTreeMap::new(), dry_run)
+    }
+
+    pub fn gc_with_references(
+        &self,
+        retained: &BTreeSet<String>,
+        references: &BTreeMap<String, u64>,
+        dry_run: bool,
+    ) -> Result<BlobGcReport> {
         let lock = self.acquire_lock()?;
-        let result = self.gc_locked(retained, dry_run);
+        let result = self.gc_with_references_locked(retained, references, dry_run);
         drop(lock);
         result
+    }
+
+    fn gc_with_references_locked(
+        &self,
+        retained: &BTreeSet<String>,
+        references: &BTreeMap<String, u64>,
+        dry_run: bool,
+    ) -> Result<BlobGcReport> {
+        validate_gc_root_count(retained.len(), references.len())?;
+        let mut all_retained = retained.clone();
+        for (sha256, expected_bytes) in references {
+            let reference = BlobReference::new(sha256, *expected_bytes)?;
+            let actual = self.verify_locked(&reference.sha256)?;
+            if actual.bytes != reference.bytes {
+                return Err(Error::Corrupt(format!(
+                    "blob {} has {} bytes; reference declares {}",
+                    reference.sha256, actual.bytes, reference.bytes
+                )));
+            }
+            all_retained.insert(reference.sha256);
+        }
+        self.gc_locked(&all_retained, dry_run)
     }
 
     fn gc_locked(&self, retained: &BTreeSet<String>, dry_run: bool) -> Result<BlobGcReport> {
@@ -227,6 +318,7 @@ impl BlobStore {
             dry_run,
             ..BlobGcReport::default()
         };
+        let mut removals = Vec::new();
         for path in self.object_files()? {
             let digest = path
                 .file_name()
@@ -241,12 +333,15 @@ impl BlobStore {
                 .removable_bytes
                 .checked_add(info.bytes)
                 .ok_or_else(|| Error::Corrupt("blob garbage collection size overflowed".into()))?;
-            if !dry_run {
-                fs::remove_file(&path)?;
+            removals.push((path, info.bytes));
+        }
+        if !dry_run {
+            for (path, bytes) in removals {
+                fs::remove_file(path)?;
                 report.removed += 1;
                 report.removed_bytes = report
                     .removed_bytes
-                    .checked_add(info.bytes)
+                    .checked_add(bytes)
                     .ok_or_else(|| Error::Corrupt("blob removal size overflowed".into()))?;
             }
         }
@@ -425,6 +520,18 @@ fn validate_digest(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_gc_root_count(retained: usize, references: usize) -> Result<()> {
+    let root_count = retained
+        .checked_add(references)
+        .ok_or_else(|| Error::Corrupt("blob root count overflowed".into()))?;
+    if root_count > MAX_BLOB_GC_ROOTS {
+        return Err(Error::Corrupt(format!(
+            "blob garbage collection exceeds the {MAX_BLOB_GC_ROOTS}-root limit"
+        )));
+    }
+    Ok(())
+}
+
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
@@ -494,6 +601,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blob_references_have_one_canonical_bounded_encoding() {
+        let reference = BlobReference::new("a".repeat(64), 42).unwrap();
+        let encoded = reference.encode().unwrap();
+
+        assert_eq!(BlobReference::decode(&encoded).unwrap(), Some(reference));
+        assert_eq!(BlobReference::decode(b"ordinary state").unwrap(), None);
+        assert!(BlobReference::decode(BLOB_REFERENCE_PREFIX).is_err());
+        assert!(BlobReference::new("A".repeat(64), 42).is_err());
+        assert!(BlobReference::new("a".repeat(64), MAX_BLOB_BYTES + 1).is_err());
+        assert!(validate_gc_root_count(MAX_BLOB_GC_ROOTS, 0).is_ok());
+        assert!(validate_gc_root_count(MAX_BLOB_GC_ROOTS, 1).is_err());
+        assert!(validate_gc_root_count(usize::MAX, 1).is_err());
+    }
+
+    #[test]
     fn blobs_deduplicate_materialize_and_collect() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("input.bin");
@@ -513,6 +635,55 @@ mod tests {
         assert_eq!(dry_run.removable, 1);
         assert_eq!(removed.removed, 1);
         assert!(store.verify(&first.sha256).is_err());
+    }
+
+    #[test]
+    fn artifact_references_are_verified_before_garbage_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let retained_input = directory.path().join("retained.bin");
+        let removable_input = directory.path().join("removable.bin");
+        fs::write(&retained_input, b"retained").unwrap();
+        fs::write(&removable_input, b"remove me").unwrap();
+        let store = BlobStore::open(directory.path().join("store")).unwrap();
+        let retained = store.put(&retained_input).unwrap();
+        let removable = store.put(&removable_input).unwrap();
+
+        let wrong_size = BTreeMap::from([(retained.sha256.clone(), retained.bytes + 1)]);
+        assert!(
+            store
+                .gc_with_references(&BTreeSet::new(), &wrong_size, false)
+                .is_err()
+        );
+        store.verify(&retained.sha256).unwrap();
+        store.verify(&removable.sha256).unwrap();
+
+        let references = BTreeMap::from([(retained.sha256.clone(), retained.bytes)]);
+        let report = store
+            .gc_with_references(&BTreeSet::new(), &references, false)
+            .unwrap();
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.removed, 1);
+        store.verify(&retained.sha256).unwrap();
+        assert!(store.verify(&removable.sha256).is_err());
+    }
+
+    #[test]
+    fn collection_preflights_every_candidate_before_deleting() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_input = directory.path().join("first.bin");
+        let second_input = directory.path().join("second.bin");
+        fs::write(&first_input, b"first").unwrap();
+        fs::write(&second_input, b"second").unwrap();
+        let store = BlobStore::open(directory.path().join("store")).unwrap();
+        let mut objects = [
+            store.put(&first_input).unwrap(),
+            store.put(&second_input).unwrap(),
+        ];
+        objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        fs::write(store.object_path(&objects[1].sha256).unwrap(), b"corrupt").unwrap();
+
+        assert!(store.gc(&BTreeSet::new(), false).is_err());
+        store.verify(&objects[0].sha256).unwrap();
     }
 
     #[test]
