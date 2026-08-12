@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/cartridge-identity",
+    "crates/cartridge-network",
     "crates/cartridge-dev",
     "crates/cartridge-desktop",
     "crates/cartridge-media",
@@ -37,6 +39,11 @@ wasmtime-wasi = { version = "47.0.3", default-features = false, features = ["p2"
 wasmtime-wasi-io = "47.0.3"
 wat = "1.252.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = "3.0.0"
+url = { version = "2.5.8", features = ["serde"] }
+x25519-dalek = "3.0.0"
+zeroize = "1.8.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

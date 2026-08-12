@@ -237,6 +237,7 @@ mod tests {
                 description: String::new(),
             },
             permissions: Permissions::default(),
+            http: cartridge_network::HttpPolicy::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

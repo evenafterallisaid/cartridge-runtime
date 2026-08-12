@@ -1,4 +1,4 @@
-package cartridge:api@0.3.0;
+package cartridge:api@0.4.0;
 
 interface host {
     enum log-level {
@@ -46,6 +46,33 @@ interface host {
         peak: s16,
     }
 
+    enum http-method {
+        get,
+        head,
+        post,
+        put,
+        patch,
+        delete,
+    }
+
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    record http-request {
+        method: http-method,
+        url: string,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
     log: func(level: log-level, message: string);
     wall-clock-ms: func() -> result<u64, string>;
     random-bytes: func(length: u32) -> result<list<u8>, string>;
@@ -64,6 +91,7 @@ interface host {
     input-next: func() -> result<option<list<u8>>, string>;
     audio-render: func(document: list<u8>) -> result<audio-receipt, string>;
     midi-next: func() -> result<option<list<u8>>, string>;
+    http-fetch: func(request: http-request) -> result<http-response, string>;
 }
 world cartridge {
     import host;

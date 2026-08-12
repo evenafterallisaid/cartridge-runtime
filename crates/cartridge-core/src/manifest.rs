@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
+use cartridge_network::HttpPolicy;
 
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
 pub const MIGRATION_PLAN_FORMAT_VERSION: u32 = 1;
@@ -46,6 +47,8 @@ pub struct PackageManifest {
     pub cartridge: CartridgeMetadata,
     #[serde(default)]
     pub permissions: Permissions,
+    #[serde(default, skip_serializing_if = "http_policy_is_empty")]
+    pub http: HttpPolicy,
     #[serde(default)]
     pub runtime: RuntimeLimits,
     #[serde(default, skip_serializing_if = "StateConfig::is_empty")]
@@ -78,6 +81,13 @@ impl PackageManifest {
         )?;
         Version::parse(&self.cartridge.version)
             .map_err(|error| Error::Manifest(format!("version must be valid SemVer: {error}")))?;
+
+        self.http.validate().map_err(Error::Manifest)?;
+        if !self.permissions.http && !self.http.scopes.is_empty() {
+            return Err(Error::Manifest(
+                "HTTP scopes require permissions.http = true".into(),
+            ));
+        }
 
         if !(1..=MAX_FUEL).contains(&self.runtime.fuel) {
             return Err(Error::Manifest(format!(
@@ -214,6 +224,13 @@ impl PackageManifest {
     }
 }
 
+impl PackageManifest {
+    #[must_use]
+    pub fn http_policy(&self) -> &HttpPolicy {
+        &self.http
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CartridgeMetadata {
@@ -235,6 +252,11 @@ pub struct Permissions {
     pub graphics: bool,
     pub audio: bool,
     pub midi: bool,
+    pub http: bool,
+}
+
+fn http_policy_is_empty(value: &HttpPolicy) -> bool {
+    value.scopes.is_empty()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -667,6 +689,7 @@ mod tests {
                 description: String::new(),
             },
             permissions: Permissions::default(),
+            http: cartridge_network::HttpPolicy::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

@@ -8,7 +8,9 @@ The project now covers the path from a Rust component to a validated cartridge, 
 
 - WebAssembly Component Model guests built against a versioned WIT contract
 - Reproducible `.cartridge` packages with component hashes and Merkle-style asset roots
-- Manifest-declared clock, randomness, packaged-asset, scoped-storage, graphics, audio, and MIDI capabilities
+- Manifest-declared clock, randomness, packaged-asset, scoped-storage, graphics, audio, MIDI, and URL-scoped HTTP capabilities
+- Exact-byte Ed25519 package signing, trust rotation/revocation, and immutable content-addressed registry publishing
+- Encrypted peer sessions, convergent shared documents, verified asset transfer, rollback datagrams, and deterministic network simulation
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
 - Bounded archive inflation, Wasm tables, WASI waits, traces, and storage-lock acquisition
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
@@ -134,6 +136,8 @@ crates/cartridge-core/      package format, validation, and packing
 crates/cartridge-dev/       scaffolding, project checks, reload policy, and editor metadata
 crates/cartridge-desktop/   installed library, permission UX, recovery, and presenter policy
 crates/cartridge-media/     deterministic drawing, input, audio, and realtime buffers
+crates/cartridge-identity/  developer keys, signatures, trust, and immutable registry
+crates/cartridge-network/   scoped HTTP, encrypted peers, sync, and simulation
 crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
 crates/cartridge-storage/   isolated state backends, snapshots, and content-addressed blobs
 crates/cartridge-trace/     versioned trace model, validation, and comparison
@@ -146,7 +150,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [identity and registry](docs/identity-and-registry.md) for signed distribution, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 

@@ -21,6 +21,11 @@ use cartridge_dev::{
     Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
     source_fingerprint,
 };
+use cartridge_identity::{
+    DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
+    read_rotation, read_signature, write_revocation, write_rotation, write_signature,
+};
+use cartridge_network::HttpFixtures;
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
     DirectoryStorage, InputEvent, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
@@ -51,6 +56,7 @@ struct RunCommandOptions<'a> {
     input: Option<&'a Path>,
     midi: Option<&'a Path>,
     media_dir: Option<&'a Path>,
+    http_fixtures: Option<&'a Path>,
     args: &'a [String],
 }
 
@@ -172,6 +178,8 @@ enum Command {
         midi: Option<PathBuf>,
         #[arg(long)]
         media_dir: Option<PathBuf>,
+        #[arg(long)]
+        http_fixtures: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -201,6 +209,8 @@ enum Command {
         midi: Option<PathBuf>,
         #[arg(long)]
         media_dir: Option<PathBuf>,
+        #[arg(long)]
+        http_fixtures: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -255,6 +265,100 @@ enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// create keys, sign packages, and manage trust
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+    /// publish and resolve immutable signed packages
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    Keygen {
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    Sign {
+        package: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    Verify {
+        package: PathBuf,
+        signature: PathBuf,
+        #[arg(long)]
+        trust: Option<PathBuf>,
+    },
+    Trust {
+        signature: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        label: String,
+    },
+    RotateCreate {
+        #[arg(long)]
+        old_key: PathBuf,
+        #[arg(long)]
+        new_key: PathBuf,
+        #[arg(long)]
+        reason: String,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    RotateApply {
+        rotation: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+    },
+    RevokeCreate {
+        key_id: String,
+        #[arg(long)]
+        signer: PathBuf,
+        #[arg(long)]
+        reason: String,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    RevokeApply {
+        revocation: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RegistryCommand {
+    Init {
+        root: PathBuf,
+    },
+    Publish {
+        package: PathBuf,
+        signature: PathBuf,
+        #[arg(long)]
+        trust: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    Resolve {
+        cartridge: String,
+        requirement: String,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    Audit {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        trust: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -273,6 +377,7 @@ enum PermissionName {
     Graphics,
     Audio,
     Midi,
+    Http,
 }
 
 #[derive(Debug, Subcommand)]
@@ -711,6 +816,7 @@ fn run_cli() -> Result<()> {
             input,
             midi,
             media_dir,
+            http_fixtures,
             args,
         } => supervised_run_command(RunCommandOptions {
             package: &package,
@@ -721,6 +827,7 @@ fn run_cli() -> Result<()> {
             input: input.as_deref(),
             midi: midi.as_deref(),
             media_dir: media_dir.as_deref(),
+            http_fixtures: http_fixtures.as_deref(),
             args: &args,
         }),
         Command::Replay {
@@ -738,6 +845,7 @@ fn run_cli() -> Result<()> {
             input,
             midi,
             media_dir,
+            http_fixtures,
             args,
         } => {
             require_worker_context()?;
@@ -750,6 +858,7 @@ fn run_cli() -> Result<()> {
                 input: input.as_deref(),
                 midi: midi.as_deref(),
                 media_dir: media_dir.as_deref(),
+                http_fixtures: http_fixtures.as_deref(),
                 args: &args,
             })
         }
@@ -794,6 +903,8 @@ fn run_cli() -> Result<()> {
         Command::Trace { command } => run_trace_command(command),
         Command::Capsule { command } => run_capsule_command(command),
         Command::Storage { command } => run_storage_command(command),
+        Command::Identity { command } => run_identity_command(command),
+        Command::Registry { command } => run_registry_command(command),
     }
 }
 
@@ -879,6 +990,7 @@ fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()
         input: None,
         midi: None,
         media_dir: None,
+        http_fixtures: None,
         args,
     });
     let replay = run.and_then(|()| supervised_replay_command(package, &trace, None, args));
@@ -985,6 +1097,7 @@ fn run_dev_build(
         input: None,
         midi: None,
         media_dir: None,
+        http_fixtures: None,
         args: &[],
     });
     fs::remove_file(&package)
@@ -1199,6 +1312,7 @@ fn library_run_command(
         input: None,
         midi: None,
         media_dir: None,
+        http_fixtures: None,
         args,
     });
     let status = if result.is_ok() {
@@ -1227,6 +1341,7 @@ fn capability(value: PermissionName) -> Capability {
         PermissionName::Graphics => Capability::Graphics,
         PermissionName::Audio => Capability::Audio,
         PermissionName::Midi => Capability::Midi,
+        PermissionName::Http => Capability::Http,
     }
 }
 
@@ -1795,6 +1910,192 @@ fn run_storage_command(command: StorageCommand) -> Result<()> {
     }
 }
 
+fn load_or_create_trust(path: &Path) -> Result<TrustStore> {
+    if path.exists() {
+        TrustStore::read(path).map_err(anyhow::Error::msg)
+    } else {
+        Ok(TrustStore::new())
+    }
+}
+
+fn save_trust(path: &Path, trust: &TrustStore) -> Result<()> {
+    if path.exists() {
+        trust.write_replace(path)
+    } else {
+        trust.write_new(path)
+    }
+    .map_err(anyhow::Error::msg)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_identity_command(command: IdentityCommand) -> Result<()> {
+    match command {
+        IdentityCommand::Keygen { output } => {
+            let key = DeveloperKey::generate();
+            key.write_new(&output).map_err(anyhow::Error::msg)?;
+            println!(
+                "created developer key {} -> {}",
+                key.key_id(),
+                output.display()
+            );
+        }
+        IdentityCommand::Sign {
+            package,
+            key,
+            output,
+        } => {
+            let signature = DeveloperKey::read(&key)
+                .map_err(anyhow::Error::msg)?
+                .sign_package(&package)
+                .map_err(anyhow::Error::msg)?;
+            write_signature(&output, &signature).map_err(anyhow::Error::msg)?;
+            println!(
+                "signed {} as {}",
+                package.display(),
+                signature.identity.package_sha256
+            );
+        }
+        IdentityCommand::Verify {
+            package,
+            signature,
+            trust,
+        } => {
+            let signature = read_signature(&signature).map_err(anyhow::Error::msg)?;
+            let identity = match trust {
+                Some(path) => {
+                    TrustStore::read(&path).and_then(|store| store.verify(&package, &signature))
+                }
+                None => cartridge_identity::verify_package(&package, &signature),
+            }
+            .map_err(anyhow::Error::msg)?;
+            println!(
+                "verified {} {} ({})",
+                identity.cartridge_id, identity.version, identity.package_sha256
+            );
+        }
+        IdentityCommand::Trust {
+            signature,
+            store,
+            label,
+        } => {
+            let signature = read_signature(&signature).map_err(anyhow::Error::msg)?;
+            let mut trust = load_or_create_trust(&store)?;
+            trust
+                .trust(hex_array(&signature.public_key)?, &label, BTreeSet::new())
+                .map_err(anyhow::Error::msg)?;
+            save_trust(&store, &trust)?;
+            println!("trusted {}", signature.key_id);
+        }
+        IdentityCommand::RotateCreate {
+            old_key,
+            new_key,
+            reason,
+            output,
+        } => {
+            let value = KeyRotation::create(
+                &DeveloperKey::read(&old_key).map_err(anyhow::Error::msg)?,
+                &DeveloperKey::read(&new_key).map_err(anyhow::Error::msg)?,
+                &reason,
+            )
+            .map_err(anyhow::Error::msg)?;
+            write_rotation(&output, &value).map_err(anyhow::Error::msg)?;
+            println!("created key rotation -> {}", output.display());
+        }
+        IdentityCommand::RotateApply { rotation, store } => {
+            let mut trust = TrustStore::read(&store).map_err(anyhow::Error::msg)?;
+            trust
+                .apply_rotation(read_rotation(&rotation).map_err(anyhow::Error::msg)?)
+                .map_err(anyhow::Error::msg)?;
+            save_trust(&store, &trust)?;
+            println!("applied key rotation");
+        }
+        IdentityCommand::RevokeCreate {
+            key_id,
+            signer,
+            reason,
+            output,
+        } => {
+            let value = RevocationRecord::create(
+                key_id,
+                &DeveloperKey::read(&signer).map_err(anyhow::Error::msg)?,
+                &reason,
+            )
+            .map_err(anyhow::Error::msg)?;
+            write_revocation(&output, &value).map_err(anyhow::Error::msg)?;
+            println!("created revocation -> {}", output.display());
+        }
+        IdentityCommand::RevokeApply { revocation, store } => {
+            let mut trust = TrustStore::read(&store).map_err(anyhow::Error::msg)?;
+            trust
+                .apply_revocation(read_revocation(&revocation).map_err(anyhow::Error::msg)?)
+                .map_err(anyhow::Error::msg)?;
+            save_trust(&store, &trust)?;
+            println!("applied key revocation");
+        }
+    }
+    Ok(())
+}
+
+fn run_registry_command(command: RegistryCommand) -> Result<()> {
+    match command {
+        RegistryCommand::Init { root } => {
+            Registry::open(&root).map_err(anyhow::Error::msg)?;
+            println!("initialized registry -> {}", root.display());
+        }
+        RegistryCommand::Publish {
+            package,
+            signature,
+            trust,
+            root,
+        } => {
+            let trust = TrustStore::read(&trust).map_err(anyhow::Error::msg)?;
+            let signature = read_signature(&signature).map_err(anyhow::Error::msg)?;
+            let mut registry = Registry::open(root).map_err(anyhow::Error::msg)?;
+            let version = registry
+                .publish(&package, &signature, &trust)
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "published {} {} ({})",
+                version.identity.cartridge_id,
+                version.identity.version,
+                version.identity.package_sha256
+            );
+        }
+        RegistryCommand::Resolve {
+            cartridge,
+            requirement,
+            root,
+        } => {
+            let registry = Registry::open(root).map_err(anyhow::Error::msg)?;
+            let version = registry
+                .resolve(&cartridge, &requirement)
+                .map_err(anyhow::Error::msg)?
+                .context("no matching signed package")?;
+            println!(
+                "{} {} {}",
+                version.identity.cartridge_id,
+                version.identity.version,
+                version.identity.package_sha256
+            );
+        }
+        RegistryCommand::Audit { root, trust } => {
+            let registry = Registry::open(root).map_err(anyhow::Error::msg)?;
+            let trust = TrustStore::read(&trust).map_err(anyhow::Error::msg)?;
+            println!(
+                "verified {} signed registry version(s)",
+                registry.audit(&trust).map_err(anyhow::Error::msg)?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn hex_array(value: &str) -> Result<[u8; 32]> {
+    hex::decode(value)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("public key has the wrong length"))
+}
+
 fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
     let mut worker_args = vec![
         OsString::from("__worker-run"),
@@ -1811,6 +2112,7 @@ fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
     push_path_option(&mut worker_args, "--input", options.input);
     push_path_option(&mut worker_args, "--midi", options.midi);
     push_path_option(&mut worker_args, "--media-dir", options.media_dir);
+    push_path_option(&mut worker_args, "--http-fixtures", options.http_fixtures);
     push_worker_arguments(&mut worker_args, options.args);
     supervise_worker(options.package, &worker_args, None)
 }
@@ -2105,8 +2407,11 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
             &archive.manifest.cartridge.id,
             storage_limits(&archive.manifest),
         )?);
-        let runtime = Runtime::with_storage(storage.clone())?
-            .with_media_input(input.clone(), midi.clone())?;
+        let runtime = configure_http(
+            Runtime::with_storage(storage.clone())?
+                .with_media_input(input.clone(), midi.clone())?,
+            options.http_fixtures,
+        )?;
         branch = Some(storage);
         runtime.run(archive, options.args)?
     } else {
@@ -2115,6 +2420,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
             None => Runtime::new()?,
         }
         .with_media_input(input, midi)?;
+        let runtime = configure_http(runtime, options.http_fixtures)?;
         runtime.run_file(options.package, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
@@ -2149,6 +2455,15 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn configure_http(runtime: Runtime, fixtures: Option<&Path>) -> Result<Runtime> {
+    let Some(path) = fixtures else {
+        return Ok(runtime);
+    };
+    Ok(runtime.with_http_transport(Arc::new(
+        HttpFixtures::read(path).map_err(anyhow::Error::msg)?,
+    )))
 }
 
 fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Result<()> {

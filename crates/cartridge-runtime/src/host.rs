@@ -12,6 +12,9 @@ use cartridge_media::{
     InputEvent, InputQueue, MediaError, MidiEvent, RenderedFrame,
     WindowConfig as MediaWindowConfig, render_audio_document,
 };
+use cartridge_network::{
+    HttpMethod as NetworkHttpMethod, HttpPolicy, HttpRequest, HttpResponse, HttpTransport,
+};
 use cartridge_storage::{StorageBackend, StorageLimits};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -62,6 +65,8 @@ pub(crate) struct HostState {
     audio_renders: Vec<AudioRender>,
     audio_limits: AudioLimits,
     media_bytes: usize,
+    http_policy: HttpPolicy,
+    http_transport: Option<Arc<dyn HttpTransport>>,
 }
 
 impl HostState {
@@ -135,7 +140,14 @@ impl HostState {
                 max_work_units: cartridge_media::MAX_AUDIO_WORK_UNITS,
             },
             media_bytes: 0,
+            http_policy: manifest.http.clone(),
+            http_transport: None,
         }
+    }
+
+    pub(crate) fn with_http_transport(mut self, transport: Option<Arc<dyn HttpTransport>>) -> Self {
+        self.http_transport = transport;
+        self
     }
 
     pub(crate) fn with_media_input(
@@ -555,6 +567,115 @@ impl cartridge::api::host::Host for HostState {
         Ok(bytes)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn http_fetch(
+        &mut self,
+        request: cartridge::api::host::HttpRequest,
+    ) -> Result<cartridge::api::host::HttpResponse, String> {
+        let method = match request.method {
+            cartridge::api::host::HttpMethod::Get => NetworkHttpMethod::Get,
+            cartridge::api::host::HttpMethod::Head => NetworkHttpMethod::Head,
+            cartridge::api::host::HttpMethod::Post => NetworkHttpMethod::Post,
+            cartridge::api::host::HttpMethod::Put => NetworkHttpMethod::Put,
+            cartridge::api::host::HttpMethod::Patch => NetworkHttpMethod::Patch,
+            cartridge::api::host::HttpMethod::Delete => NetworkHttpMethod::Delete,
+        };
+        let mut headers = BTreeMap::new();
+        let mut normalized_headers = std::collections::BTreeSet::new();
+        for header in request.headers {
+            if !normalized_headers.insert(header.name.to_ascii_lowercase()) {
+                return Err("duplicate HTTP header names are not allowed".into());
+            }
+            if headers.insert(header.name, header.value).is_some() {
+                return Err("duplicate HTTP header names are not allowed".into());
+            }
+        }
+        let request = HttpRequest {
+            method,
+            url: request.url,
+            headers,
+            body: request.body,
+        };
+        let fingerprint = request.fingerprint()?;
+        if !self.permissions.http {
+            let error = "HTTP capability was not granted".to_owned();
+            self.record(
+                "http",
+                "fetch",
+                json!({ "request": fingerprint, "denied": error }),
+            );
+            return Err(error);
+        }
+        if let Err(error) = self.http_policy.authorize(&request) {
+            self.record(
+                "http",
+                "fetch",
+                json!({ "request": fingerprint, "denied": error }),
+            );
+            return Err(error);
+        }
+        let response = if let Some(outcome) = self.replay_outcome("http", "fetch") {
+            let outcome = outcome?;
+            if outcome.get("request").and_then(Value::as_str) != Some(&fingerprint) {
+                let error = "recorded HTTP request does not match the guest request".to_owned();
+                self.set_divergence(error.clone());
+                return Err(error);
+            }
+            let response_value = outcome
+                .get("response")
+                .ok_or_else(|| "recorded HTTP response is missing".to_owned())?;
+            let status = response_value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| "recorded HTTP status is invalid".to_owned())?;
+            let headers = serde_json::from_value(
+                response_value
+                    .get("headers")
+                    .cloned()
+                    .ok_or_else(|| "recorded HTTP headers are missing".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let body = hex::decode(
+                response_value
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "recorded HTTP body is missing".to_owned())?,
+            )
+            .map_err(|_| "recorded HTTP body is invalid".to_owned())?;
+            let response = HttpResponse {
+                status,
+                headers,
+                body,
+            };
+            self.http_policy.validate_response(&response)?;
+            self.record("http", "fetch", outcome);
+            response
+        } else {
+            let transport = self
+                .http_transport
+                .as_ref()
+                .ok_or_else(|| "no host HTTP transport is configured".to_owned())?;
+            let response = transport.send(&request)?;
+            self.http_policy.validate_response(&response)?;
+            self.record(
+                "http",
+                "fetch",
+                json!({ "request": fingerprint, "response": { "status": response.status, "headers": response.headers, "body": hex::encode(&response.body) } }),
+            );
+            response
+        };
+        Ok(cartridge::api::host::HttpResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(name, value)| cartridge::api::host::HttpHeader { name, value })
+                .collect(),
+            body: response.body,
+        })
+    }
+
     fn storage_get(&mut self, key: String) -> Result<Option<Vec<u8>>, String> {
         self.get_storage(&key)
     }
@@ -940,6 +1061,20 @@ mod tests {
     use super::*;
     use cartridge_core::{CartridgeMetadata, Integrity, RuntimeLimits, Services, StateConfig};
     use cartridge_storage::MemoryStorage;
+    use std::collections::BTreeSet;
+
+    #[derive(Debug)]
+    struct FixedHttp;
+
+    impl HttpTransport for FixedHttp {
+        fn send(&self, _: &HttpRequest) -> Result<HttpResponse, String> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: b"ok".to_vec(),
+            })
+        }
+    }
 
     #[test]
     fn asset_paths_cannot_escape_the_package() {
@@ -1033,6 +1168,61 @@ mod tests {
         assert_eq!(result.unwrap_err(), "random capability was not granted");
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].capability, "random");
+    }
+
+    #[test]
+    fn http_is_scoped_and_replays_without_transport() {
+        use cartridge_network::{HttpMethod, HttpScope};
+        let permissions = Permissions {
+            http: true,
+            ..Permissions::default()
+        };
+        let mut manifest = manifest(permissions);
+        manifest.http.scopes.push(HttpScope {
+            scheme: "https".into(),
+            host: "api.example.com".into(),
+            port: None,
+            path_prefix: "/v1".into(),
+            methods: BTreeSet::from([HttpMethod::Get]),
+        });
+        let request = cartridge::api::host::HttpRequest {
+            method: cartridge::api::host::HttpMethod::Get,
+            url: "https://api.example.com/v1/items".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut recorded = HostState::new(
+            &manifest,
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        )
+        .with_http_transport(Some(Arc::new(FixedHttp)));
+        let response =
+            cartridge::api::host::Host::http_fetch(&mut recorded, request.clone()).unwrap();
+        assert_eq!(response.body, b"ok");
+        let events = recorded.events.clone();
+        let mut replayed = HostState::new(
+            &manifest,
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            Some(events),
+        );
+        let replay = cartridge::api::host::Host::http_fetch(&mut replayed, request).unwrap();
+        assert_eq!(replay.body, b"ok");
+        replayed.finish_replay().unwrap();
+
+        let denied = cartridge::api::host::HttpRequest {
+            method: cartridge::api::host::HttpMethod::Get,
+            url: "https://other.example/v1/items".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(
+            cartridge::api::host::Host::http_fetch(&mut recorded, denied)
+                .unwrap_err()
+                .contains("outside")
+        );
     }
 
     #[test]
@@ -1499,6 +1689,7 @@ mod tests {
                 description: String::new(),
             },
             permissions,
+            http: cartridge_network::HttpPolicy::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

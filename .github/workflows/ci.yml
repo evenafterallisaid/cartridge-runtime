@@ -69,6 +69,14 @@ jobs:
           cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --assets examples/hello-cartridge/assets --output hello.cartridge
           cargo run -p cartridge-cli -- inspect hello.cartridge
           cargo run -p cartridge-cli -- verify hello.cartridge
+          cargo run -p cartridge-cli -- identity keygen --output developer.key.json
+          cargo run -p cartridge-cli -- identity sign hello.cartridge --key developer.key.json --output hello.signature.json
+          cargo run -p cartridge-cli -- identity trust hello.signature.json --store trust.json --label "ci developer"
+          cargo run -p cartridge-cli -- identity verify hello.cartridge hello.signature.json --trust trust.json
+          cargo run -p cartridge-cli -- registry init registry
+          cargo run -p cartridge-cli -- registry publish hello.cartridge hello.signature.json --trust trust.json --root registry
+          cargo run -p cartridge-cli -- registry resolve dev.cartridge.hello "^0.1" --root registry
+          cargo run -p cartridge-cli -- registry audit --root registry --trust trust.json
           cargo run -p cartridge-cli -- asset verify hello.cartridge message.txt
           cargo run -p cartridge-cli -- deps hello.cartridge
           cargo run -p cartridge-cli -- resolve hello.cartridge

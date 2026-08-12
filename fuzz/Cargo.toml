@@ -11,6 +11,7 @@ cargo-fuzz = true
 cartridge-core = { path = "../crates/cartridge-core" }
 cartridge-desktop = { path = "../crates/cartridge-desktop" }
 cartridge-media = { path = "../crates/cartridge-media" }
+cartridge-network = { path = "../crates/cartridge-network" }
 cartridge-storage = { path = "../crates/cartridge-storage" }
 cartridge-trace = { path = "../crates/cartridge-trace" }
 libfuzzer-sys = "0.4.10"
@@ -77,6 +78,13 @@ bench = false
 [[bin]]
 name = "gpu-stream"
 path = "fuzz_targets/gpu_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network"
+path = "fuzz_targets/network.rs"
 test = false
 doc = false
 bench = false

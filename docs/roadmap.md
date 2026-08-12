@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: milestones 0.1 through 0.7 are implemented. The runtime now includes its portable media boundary, developer workflow, and cross-platform desktop-library core. Work is moving into 0.8 identity and signing. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.9 are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, and transport-independent encrypted device-mesh primitives. Work is moving into the 1.0 stabilization gates. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -357,6 +357,8 @@ Exit criteria:
 - registry compromise cannot silently replace an existing signed version
 - unsigned local development remains possible and clearly labelled
 
+Status: implemented. The local registry is the protocol reference; production remote federation and third-party operational hardening remain post-reference deployment work.
+
 ### 0.9 — networking and device mesh
 
 Purpose: support multiplayer, collaboration, and local-first sync without granting raw sockets by default.
@@ -382,6 +384,8 @@ Exit criteria:
 - peer identity is independent from an IP address
 - sync converges after devices reconnect
 - network simulation can reproduce a reported multiplayer failure
+
+Status: implemented at the portable boundary. Live discovery/NAT adapters remain host-owned integrations so cartridges never receive raw socket authority.
 
 ### 1.0 — stable platform boundary
 
@@ -409,6 +413,14 @@ Exit criteria:
 - every supported platform passes the same cartridge corpus
 - runtime upgrades can be rolled back without losing cartridge state
 - the project can reproduce a crash from a self-contained report
+
+Current stabilization gates:
+
+- freeze WIT `0.4` only after a compatibility corpus passes on Windows, macOS, and Linux
+- commission an independent security review and publish its remediation record
+- add platform-native helper sandboxes, signing/notarization, and rollback-tested installers
+- run soak and performance baselines on release builds rather than debug test processes
+- define support windows for package, signature, registry, trace, snapshot, and capsule formats
 
 ## Beyond 1.0
 

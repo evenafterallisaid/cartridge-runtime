@@ -30,3 +30,4 @@ jobs:
       - run: cargo +nightly fuzz run graphics -- -max_total_time=30 -rss_limit_mb=2048
       - run: cargo +nightly fuzz run audio -- -max_total_time=30 -rss_limit_mb=2048
       - run: cargo +nightly fuzz run gpu-stream -- -max_total_time=30 -rss_limit_mb=2048
+      - run: cargo +nightly fuzz run network -- -max_total_time=30 -rss_limit_mb=2048

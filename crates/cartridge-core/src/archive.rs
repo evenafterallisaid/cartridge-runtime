@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::Read,
+    io::{Cursor, Read, Seek},
     path::Path,
 };
 
@@ -61,7 +61,15 @@ impl CartridgeArchive {
 
     pub fn open_with_limits(path: impl AsRef<Path>, limits: PackageLimits) -> Result<Self> {
         let file = File::open(path)?;
-        let mut zip = ZipArchive::new(file)?;
+        Self::open_reader(file, limits)
+    }
+
+    pub fn open_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::open_reader(Cursor::new(bytes), PackageLimits::default())
+    }
+
+    fn open_reader(reader: impl Read + Seek, limits: PackageLimits) -> Result<Self> {
+        let mut zip = ZipArchive::new(reader)?;
         if zip.len() > limits.entries {
             return Err(Error::Archive(format!(
                 "archive contains {} entries; maximum is {}",
@@ -371,6 +379,7 @@ mod tests {
                 description: String::new(),
             },
             permissions: Permissions::default(),
+            http: cartridge_network::HttpPolicy::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),
@@ -401,6 +410,7 @@ mod tests {
                 assets: true,
                 ..Permissions::default()
             },
+            http: cartridge_network::HttpPolicy::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

@@ -10,6 +10,7 @@ pub use cartridge_media::{
     GraphicsLimits, InputEvent, MidiEvent, ParameterEvent, RealtimeBuffer, RenderedFrame,
     SAMPLE_RATE, Waveform, WindowConfig,
 };
+use cartridge_network::HttpTransport;
 pub use cartridge_storage::{
     BLOB_REACHABILITY_FORMAT_VERSION, BlobAuditIssue, BlobAuditReport, BlobGcReport, BlobInfo,
     BlobInventory, BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind,
@@ -49,6 +50,7 @@ pub struct Runtime {
     storage: Arc<dyn StorageBackend>,
     input_events: Vec<InputEvent>,
     midi_events: Vec<MidiEvent>,
+    http_transport: Option<Arc<dyn HttpTransport>>,
 }
 
 impl Runtime {
@@ -83,6 +85,7 @@ impl Runtime {
             storage,
             input_events: Vec::new(),
             midi_events: Vec::new(),
+            http_transport: None,
         })
     }
 
@@ -103,6 +106,12 @@ impl Runtime {
         self.input_events = input_events;
         self.midi_events = midi_events;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_http_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
+        self.http_transport = Some(transport);
+        self
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>, args: &[String]) -> Result<RunReport> {
@@ -174,6 +183,7 @@ impl Runtime {
             storage: branch.clone(),
             input_events: self.input_events.clone(),
             midi_events: self.midi_events.clone(),
+            http_transport: self.http_transport.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -207,6 +217,7 @@ impl Runtime {
             self.storage.clone(),
             expected_events,
         )
+        .with_http_transport(self.http_transport.clone())
         .with_media_input(&self.input_events, &self.midi_events)
         .map_err(|error| anyhow!(error))?;
         if apply_replay_storage {
@@ -515,6 +526,7 @@ mod tests {
                 storage: true,
                 ..Default::default()
             },
+            http: cartridge_network::HttpPolicy::default(),
             runtime: cartridge_core::RuntimeLimits {
                 timeout_ms,
                 ..Default::default()
