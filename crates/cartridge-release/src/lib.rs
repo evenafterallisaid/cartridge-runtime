@@ -461,13 +461,13 @@ fn validate_digest(value: &str) -> Result<(), String> {
 
 fn reject_symlink(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    let mut link_like = metadata.file_type().is_symlink();
+    let link_like = metadata.file_type().is_symlink();
     #[cfg(windows)]
-    {
+    let link_like = {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        link_like |= metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    }
+        link_like || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
     if link_like {
         return Err(format!(
             "links and reparse points are forbidden in the updater: {}",
