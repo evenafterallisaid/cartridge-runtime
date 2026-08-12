@@ -203,6 +203,7 @@ dependencies = [
  "cartridge-dev",
  "cartridge-identity",
  "cartridge-network",
+ "cartridge-release",
  "cartridge-runtime",
  "cartridge-trace",
  "clap",
@@ -298,6 +299,20 @@ dependencies = [
  "url",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "cartridge-release"
+version = "0.1.0"
+dependencies = [
+ "cartridge-identity",
+ "fs4",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]

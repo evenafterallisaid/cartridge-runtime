@@ -69,10 +69,32 @@ jobs:
           cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --assets examples/hello-cartridge/assets --output hello.cartridge
           cargo run -p cartridge-cli -- inspect hello.cartridge
           cargo run -p cartridge-cli -- verify hello.cartridge
+          cargo run -p cartridge-cli -- platform hello.cartridge --json
           cargo run -p cartridge-cli -- identity keygen --output developer.key.json
           cargo run -p cartridge-cli -- identity sign hello.cartridge --key developer.key.json --output hello.signature.json
           cargo run -p cartridge-cli -- identity trust hello.signature.json --store trust.json --label "ci developer"
           cargo run -p cartridge-cli -- identity verify hello.cartridge hello.signature.json --trust trust.json
+          binary=target/debug/cartridge
+          if [ -x target/debug/cartridge.exe ]; then binary=target/debug/cartridge.exe; fi
+          set +e
+          "$binary" run hello.cartridge --state-dir unauthenticated-state
+          unauthenticated_state_status=$?
+          set -e
+          if [ "$unauthenticated_state_status" -eq 0 ] || [ -e unauthenticated-state ]; then
+            echo "unsigned package opened durable state"
+            exit 1
+          fi
+          cargo run -p cartridge-cli -- release create "$binary" --target ci-host --version 1.0.0 --key developer.key.json --output runtime-1.0.0.json
+          cargo run -p cartridge-cli -- release verify runtime-1.0.0.json --trust trust.json
+          cargo run -p cartridge-cli -- release install runtime-1.0.0.json "$binary" --target ci-host --trust trust.json --root runtime-install
+          cargo run -p cartridge-cli -- release create "$binary" --target ci-host --version 1.1.0 --key developer.key.json --output runtime-1.1.0.json
+          cargo run -p cartridge-cli -- release install runtime-1.1.0.json "$binary" --target ci-host --trust trust.json --root runtime-install
+          cargo run -p cartridge-cli -- release status --root runtime-install --json | grep '"version": "1.1.0"'
+          cargo run -p cartridge-cli -- release rollback --root runtime-install
+          cargo run -p cartridge-cli -- release status --root runtime-install --json | grep '"version": "1.0.0"'
+          cargo run -p cartridge-cli -- stability benchmark hello.cartridge --iterations 2 --output benchmark.json -- CI
+          cargo run -p cartridge-cli -- stability soak hello.cartridge --iterations 5 --output soak.json -- CI
+          grep '"local_only": true' benchmark.json soak.json
           cargo run -p cartridge-cli -- registry init registry
           cargo run -p cartridge-cli -- registry publish hello.cartridge hello.signature.json --trust trust.json --root registry
           cargo run -p cartridge-cli -- registry resolve dev.cartridge.hello "^0.1" --root registry
@@ -81,11 +103,11 @@ jobs:
           cargo run -p cartridge-cli -- deps hello.cartridge
           cargo run -p cartridge-cli -- resolve hello.cartridge
           cargo run -p cartridge-cli -- run hello.cartridge --trace hello.trace.json -- CI
-          cargo run -p cartridge-cli -- run hello.cartridge --state-dir state -- First
-          cargo run -p cartridge-cli -- storage export hello.cartridge --state-dir state --output first.cartridge-state.json
-          cargo run -p cartridge-cli -- run hello.cartridge --state-dir state -- Second
-          cargo run -p cartridge-cli -- storage export hello.cartridge --state-dir state --output second.cartridge-state.json
-          cargo run -p cartridge-cli -- storage status hello.cartridge --state-dir state
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json run hello.cartridge --state-dir state -- First
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage export hello.cartridge --state-dir state --output first.cartridge-state.json
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json run hello.cartridge --state-dir state -- Second
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage export hello.cartridge --state-dir state --output second.cartridge-state.json
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage status hello.cartridge --state-dir state
           cargo run -p cartridge-cli -- storage inspect first.cartridge-state.json
           cargo run -p cartridge-cli -- storage migration-plan hello.cartridge --from-schema 0
           cargo run -p cartridge-cli -- storage diff first.cartridge-state.json second.cartridge-state.json
@@ -97,9 +119,9 @@ jobs:
           cargo run -p cartridge-cli -- capsule verify run.cartridge-capsule.json
           cargo run -p cartridge-cli -- capsule diff run.cartridge-capsule.json run.cartridge-capsule.json
           cargo run -p cartridge-cli -- capsule replay run.cartridge-capsule.json
-          cargo run -p cartridge-cli -- storage restore hello.cartridge first.cartridge-state.json --state-dir state --dry-run
-          cargo run -p cartridge-cli -- storage restore hello.cartridge first.cartridge-state.json --state-dir state
-          cargo run -p cartridge-cli -- storage export hello.cartridge --state-dir state --output restored.cartridge-state.json
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage restore hello.cartridge first.cartridge-state.json --state-dir state --dry-run
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage restore hello.cartridge first.cartridge-state.json --state-dir state
+          cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage export hello.cartridge --state-dir state --output restored.cartridge-state.json
           cargo run -p cartridge-cli -- storage diff first.cartridge-state.json restored.cartridge-state.json
           cargo run -p cartridge-cli -- trace inspect hello.trace.json
           cargo run -p cartridge-cli -- trace diff hello.trace.json hello.trace.json
@@ -136,21 +158,21 @@ jobs:
           cargo run -p cartridge-cli -- run effect.cartridge --media-dir effect-media
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/Cartridge.toml --component tests/fixtures/migration-cartridge/target/wasm32-wasip2/release/migration_cartridge.wasm --output migration.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/legacy.Cartridge.toml --component tests/fixtures/migration-cartridge/target/wasm32-wasip2/release/migration_cartridge.wasm --output legacy-migration.cartridge
+          cargo run -p cartridge-cli -- identity sign migration.cartridge --key developer.key.json --output migration.signature.json
+          cargo run -p cartridge-cli -- identity sign legacy-migration.cartridge --key developer.key.json --output legacy-migration.signature.json
           cargo run -p cartridge-cli -- storage migrate migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --output migrated.cartridge-state.json
           cargo run -p cartridge-cli -- storage inspect migrated.cartridge-state.json
           cargo run -p cartridge-cli -- run migration.cartridge --from-snapshot migrated.cartridge-state.json
-          cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir migration-state
-          cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir uncommitted-migration-state
-          cargo run -p cartridge-cli -- storage migrate-commit migration.cartridge --state-dir migration-state --rollback-output rollback.cartridge-state.json --receipt-output migration-receipt.json
+          cargo run -p cartridge-cli -- --storage-signature legacy-migration.signature.json --storage-trust trust.json storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir migration-state
+          cargo run -p cartridge-cli -- --storage-signature legacy-migration.signature.json --storage-trust trust.json storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --state-dir uncommitted-migration-state
+          cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json storage migrate-commit migration.cartridge --state-dir migration-state --rollback-output rollback.cartridge-state.json --receipt-output migration-receipt.json
           cargo run -p cartridge-cli -- storage inspect rollback.cartridge-state.json
           cargo run -p cartridge-cli -- storage migration-receipt migration-receipt.json
-          cargo run -p cartridge-cli -- storage migration-recover migration.cartridge migration-receipt.json --state-dir migration-state --json | grep '"status": "committed"'
-          cargo run -p cartridge-cli -- storage migration-recover migration.cartridge migration-receipt.json --state-dir uncommitted-migration-state --json | grep '"status": "not_committed"'
-          cargo run -p cartridge-cli -- run migration.cartridge --state-dir migration-state
+          cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json storage migration-recover migration.cartridge migration-receipt.json --state-dir migration-state --json | grep '"status": "committed"'
+          cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json storage migration-recover migration.cartridge migration-receipt.json --state-dir uncommitted-migration-state --json | grep '"status": "not_committed"'
+          cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json run migration.cartridge --state-dir migration-state
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/missing-export.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output missing-migration-export.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
-          binary=target/debug/cartridge
-          if [ -x target/debug/cartridge.exe ]; then binary=target/debug/cartridge.exe; fi
           printf ' ' >> capsule-result.cartridge-state.json
           set +e
           "$binary" capsule verify run.cartridge-capsule.json
@@ -176,16 +198,16 @@ jobs:
             echo "failed migration produced an output snapshot"
             exit 1
           fi
-          cargo run -p cartridge-cli -- storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/failing.cartridge-state.json --state-dir failed-migration-state
+          cargo run -p cartridge-cli -- --storage-signature legacy-migration.signature.json --storage-trust trust.json storage restore legacy-migration.cartridge tests/fixtures/migration-cartridge/failing.cartridge-state.json --state-dir failed-migration-state
           set +e
-          "$binary" storage migrate-commit migration.cartridge --state-dir failed-migration-state --rollback-output failed-rollback.cartridge-state.json --receipt-output failed-migration-receipt.json
+          "$binary" --storage-signature migration.signature.json --storage-trust trust.json storage migrate-commit migration.cartridge --state-dir failed-migration-state --rollback-output failed-rollback.cartridge-state.json --receipt-output failed-migration-receipt.json
           migration_commit_status=$?
           set -e
           if [ "$migration_commit_status" -eq 0 ] || [ ! -e failed-rollback.cartridge-state.json ] || [ -e failed-migration-receipt.json ]; then
             echo "failed durable migration produced incorrect recovery artifacts"
             exit 1
           fi
-          "$binary" storage status legacy-migration.cartridge --state-dir failed-migration-state --json | grep '"state_schema": 0'
+          "$binary" --storage-signature legacy-migration.signature.json --storage-trust trust.json storage status legacy-migration.cartridge --state-dir failed-migration-state --json | grep '"state_schema": 0'
           set +e
           "$binary" storage migrate missing-migration-export.cartridge tests/fixtures/migration-cartridge/source.cartridge-state.json --output missing-export.cartridge-state.json
           missing_export_status=$?

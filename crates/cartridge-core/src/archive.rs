@@ -380,6 +380,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             http: cartridge_network::HttpPolicy::default(),
+            compatibility: crate::Compatibility::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),
@@ -411,6 +412,7 @@ mod tests {
                 ..Permissions::default()
             },
             http: cartridge_network::HttpPolicy::default(),
+            compatibility: crate::Compatibility::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

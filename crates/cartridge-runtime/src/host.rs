@@ -65,6 +65,7 @@ pub(crate) struct HostState {
     audio_renders: Vec<AudioRender>,
     audio_limits: AudioLimits,
     media_bytes: usize,
+    media_metrics: crate::MediaMetrics,
     http_policy: HttpPolicy,
     http_transport: Option<Arc<dyn HttpTransport>>,
 }
@@ -140,6 +141,7 @@ impl HostState {
                 max_work_units: cartridge_media::MAX_AUDIO_WORK_UNITS,
             },
             media_bytes: 0,
+            media_metrics: crate::MediaMetrics::default(),
             http_policy: manifest.http.clone(),
             http_transport: None,
         }
@@ -167,10 +169,13 @@ impl HostState {
         Ok(self)
     }
 
-    pub(crate) fn take_media(&mut self) -> (Vec<RenderedFrame>, Vec<AudioRender>) {
+    pub(crate) fn take_media(
+        &mut self,
+    ) -> (Vec<RenderedFrame>, Vec<AudioRender>, crate::MediaMetrics) {
         (
             self.display.take_frames(),
             std::mem::take(&mut self.audio_renders),
+            std::mem::take(&mut self.media_metrics),
         )
     }
 
@@ -835,9 +840,17 @@ impl cartridge::api::host::Host for HostState {
         }
         let document_sha256 = hex::encode(Sha256::digest(&document));
         let assets = self.assets.clone();
-        match self.display.present(window, &document, |path| {
+        let started = StdInstant::now();
+        let result = self.display.present(window, &document, |path| {
             assets.get(path).map(Vec::as_slice)
-        }) {
+        });
+        self.media_metrics.graphics_present_calls =
+            self.media_metrics.graphics_present_calls.saturating_add(1);
+        self.media_metrics.graphics_present_micros = self
+            .media_metrics
+            .graphics_present_micros
+            .saturating_add(started.elapsed().as_micros());
+        match result {
             Ok(receipt) => {
                 self.record(
                     "graphics",
@@ -916,7 +929,15 @@ impl cartridge::api::host::Host for HostState {
             return Err(error);
         }
         let document_sha256 = hex::encode(Sha256::digest(&document));
-        match render_audio_document(&document, self.audio_limits) {
+        let started = StdInstant::now();
+        let result = render_audio_document(&document, self.audio_limits);
+        self.media_metrics.audio_render_calls =
+            self.media_metrics.audio_render_calls.saturating_add(1);
+        self.media_metrics.audio_render_micros = self
+            .media_metrics
+            .audio_render_micros
+            .saturating_add(started.elapsed().as_micros());
+        match result {
             Ok(render) => {
                 let bytes = render
                     .pcm
@@ -1690,6 +1711,7 @@ mod tests {
             },
             permissions,
             http: cartridge_network::HttpPolicy::default(),
+            compatibility: cartridge_core::Compatibility::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),

@@ -137,6 +137,11 @@ impl DeveloperKey {
         let payload = framed_payload(domain, bytes);
         hex::encode(self.signing.sign(&payload).to_bytes())
     }
+
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.public_key())
+    }
 }
 
 pub fn verify_package(
@@ -261,6 +266,31 @@ impl TrustStore {
         let identity = package_identity(bytes)?;
         verify_package_bytes(bytes, &identity, signature)?;
         Ok(identity)
+    }
+
+    pub fn verify_trusted_bytes(
+        &self,
+        key_id_value: &str,
+        public_key: &str,
+        domain: &[u8],
+        bytes: &[u8],
+        signature: &str,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if self.revoked.contains_key(key_id_value) {
+            return Err("signing key is revoked".into());
+        }
+        let trusted = self
+            .trusted
+            .get(key_id_value)
+            .ok_or_else(|| "signing key is not trusted".to_string())?;
+        if trusted.public_key != public_key {
+            return Err("trusted public key does not match the signature".into());
+        }
+        if key_id(&decode_array::<32>(public_key, "public key")?) != key_id_value {
+            return Err("signature key id is invalid".into());
+        }
+        verify_detached(public_key, domain, bytes, signature)
     }
 
     pub fn apply_rotation(&mut self, rotation: KeyRotation) -> Result<(), String> {

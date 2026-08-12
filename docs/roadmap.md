@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: milestones 0.1 through 0.9 are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, and transport-independent encrypted device-mesh primitives. Work is moving into the 1.0 stabilization gates. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.9 and the portable 1.0 candidate boundary are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, transport-independent encrypted device-mesh primitives, capability negotiation, authenticated durable-storage principals, signed runtime updates, rollback, and supervised stability tooling. Work is now on the external 1.0 release gates. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -393,18 +393,18 @@ Purpose: make the formats and core APIs dependable enough for outside projects.
 
 Work:
 
-- external security review
-- fuzzing for package, manifest, trace, and WIT boundaries
-- long-running resource leak tests
-- stable package and trace compatibility policy
-- capability version negotiation
-- signed runtime releases
-- macOS notarization and Windows signing
-- rollback-capable updater
-- complete threat model
-- backup and recovery documentation
-- telemetry kept local unless explicitly exported
-- performance baselines for startup, memory, frame time, and audio latency
+- [external gate] independent security review
+- [implemented] fuzzing for package, manifest, release, trace, and WIT boundaries
+- [implemented] deterministic, deadline-supervised release-build soak harness
+- [implemented] stable package and trace compatibility policy
+- [implemented] capability version negotiation before component compilation
+- [implemented] signed runtime release metadata and artifact verification
+- [external gate] certificate-backed macOS notarization and Windows signing
+- [implemented] rollback-capable, crash-recoverable local updater
+- [implemented] complete threat model for the portable runtime boundary
+- [implemented] backup and recovery documentation
+- [implemented] telemetry kept local unless explicitly exported
+- [implemented] release-build startup, execution, headless graphics/audio render, fuel, and trace baselines
 
 Exit criteria:
 
@@ -419,8 +419,11 @@ Current stabilization gates:
 - freeze WIT `0.4` only after a compatibility corpus passes on Windows, macOS, and Linux
 - commission an independent security review and publish its remediation record
 - add platform-native helper sandboxes, signing/notarization, and rollback-tested installers
-- run soak and performance baselines on release builds rather than debug test processes
-- define support windows for package, signature, registry, trace, snapshot, and capsule formats
+- collect and publish platform baselines from the release-build stability workflow
+- add native worker RSS and real-device audio-latency sampling once platform adapters exist
+- grow the compatibility corpus with artifacts produced by every public SDK release
+
+Status: the portable 1.0 candidate boundary is implemented and under stabilization. Capability negotiation, signed release metadata, verified installation, crash recovery, rollback, local-only measurements, compatibility guarantees, and recovery guidance now have executable paths. A 1.0 release remains blocked on the explicitly external gates above; the project does not describe those gates as complete until their platform credentials, independent review record, and native sandbox evidence exist.
 
 ## Beyond 1.0
 
@@ -903,7 +906,7 @@ Completed foundations:
 
 Security work immediately ahead:
 
-1. Bind package identity to developer signatures before treating cartridge ids as storage principals.
+1. [implemented] Bind package identity to a trusted developer signature before the public CLI treats a cartridge id as a durable-storage principal.
 2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
 3. [partially implemented] Trace redaction profiles are available; encrypted support bundles remain.
 4. [partially implemented] Keep expanding the seeded archive, manifest, snapshot, and trace fuzz suite; capsule and receipt parsers still need library boundaries before they can join it cleanly.

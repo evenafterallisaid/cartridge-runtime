@@ -2,6 +2,7 @@
 members = [
     "crates/cartridge-identity",
     "crates/cartridge-network",
+    "crates/cartridge-release",
     "crates/cartridge-dev",
     "crates/cartridge-desktop",
     "crates/cartridge-media",

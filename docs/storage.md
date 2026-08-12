@@ -48,27 +48,27 @@ Traces may contain private storage values and should be treated as sensitive fil
 
 `MemoryStorage` is shared by runs made through the same `Runtime` instance. It is deterministic, thread-safe, and useful for tests and embedders that provide their own lifecycle. CLI runs without `--state-dir` intentionally remain ephemeral.
 
-`DirectoryStorage` persists the same contract beneath a caller-selected root. Namespace directory names are SHA-256 digests of cartridge ids. Each operation takes an exclusive operating-system file lock, so separate runtime processes cannot interleave read-modify-write commits.
+`DirectoryStorage` persists the same contract beneath a caller-selected root. Namespace directory names are SHA-256 digests of cartridge ids. Each operation takes an exclusive operating-system file lock, so separate runtime processes cannot interleave read-modify-write commits. The public CLI verifies a trusted package signature before letting an id select one of these namespaces; direct embedders must enforce the same identity policy.
 
 `SnapshotStorage` creates a private in-memory branch from a portable snapshot. The input snapshot is immutable, and no durable namespace is opened. A branch can be discarded after execution or exported as a new snapshot, which makes it suitable for migration rehearsals, test matrices, and debugging with edited inputs.
 
 ```sh
-cartridge run app.cartridge --state-dir ./state -- first-run
-cartridge storage status app.cartridge --state-dir ./state
-cartridge storage recover app.cartridge --state-dir ./state
-cartridge storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
+cartridge --storage-signature app.signature.json --storage-trust trust.json run app.cartridge --state-dir ./state -- first-run
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage status app.cartridge --state-dir ./state
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage recover app.cartridge --state-dir ./state
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage export app.cartridge --state-dir ./state --output backup.cartridge-state.json
 cartridge storage inspect backup.cartridge-state.json
 cartridge storage migration-plan app.cartridge --from-schema 0
 cartridge storage migrate app.cartridge old.cartridge-state.json \
   --output migrated.cartridge-state.json
-cartridge storage migrate-commit app.cartridge --state-dir ./state \
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage migrate-commit app.cartridge --state-dir ./state \
   --rollback-output rollback.cartridge-state.json \
   --receipt-output migration-receipt.json
-cartridge storage migration-recover app.cartridge migration-receipt.json \
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage migration-recover app.cartridge migration-receipt.json \
   --state-dir ./state
 cartridge run app.cartridge --from-snapshot backup.cartridge-state.json \
   --snapshot-output branch.cartridge-state.json -- experiment
-cartridge storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage restore app.cartridge backup.cartridge-state.json --state-dir ./state --dry-run
 ```
 
 State commits are immutable generations, and the durable generation is also the namespace revision. The backend flushes a new temporary snapshot, renames it to a previously unused generation, and retains the prior valid generation. Incomplete temporary files are ignored and removed by the next write. Every generation contains a digest over its canonical payload; corrupt committed generations block normal access until explicit recovery quarantines them.

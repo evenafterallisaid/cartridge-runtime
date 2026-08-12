@@ -11,6 +11,8 @@ The project now covers the path from a Rust component to a validated cartridge, 
 - Manifest-declared clock, randomness, packaged-asset, scoped-storage, graphics, audio, MIDI, and URL-scoped HTTP capabilities
 - Exact-byte Ed25519 package signing, trust rotation/revocation, and immutable content-addressed registry publishing
 - Encrypted peer sessions, convergent shared documents, verified asset transfer, rollback datagrams, and deterministic network simulation
+- Host API/capability version negotiation and signed rollback-safe runtime updates
+- Local-only cold-start benchmarks and deterministic long-running replay soak reports
 - Fuel, linear-memory, and wall-time limits set by each cartridge manifest
 - Bounded archive inflation, Wasm tables, WASI waits, traces, and storage-lock acquisition
 - `pack`, `inspect`, `verify`, `deps`, `resolve`, `run`, `replay`, and `trace` commands
@@ -59,24 +61,28 @@ cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml \
 
 cargo run -p cartridge-cli -- inspect dist/hello.cartridge
 cargo run -p cartridge-cli -- verify dist/hello.cartridge
+cargo run -p cartridge-cli -- platform dist/hello.cartridge
 cargo run -p cartridge-cli -- asset verify dist/hello.cartridge message.txt
 cargo run -p cartridge-cli -- deps dist/hello.cartridge
 cargo run -p cartridge-cli -- resolve dist/hello.cartridge
 cargo run -p cartridge-cli -- run dist/hello.cartridge --trace dist/hello.trace.json -- Clyde
-cargo run -p cartridge-cli -- run dist/hello.cartridge --state-dir dist/state -- Ada
-cargo run -p cartridge-cli -- storage status dist/hello.cartridge --state-dir dist/state
-cargo run -p cartridge-cli -- storage export dist/hello.cartridge --state-dir dist/state --output backup.cartridge-state.json
+cargo run -p cartridge-cli -- identity keygen --output developer.key.json
+cargo run -p cartridge-cli -- identity sign dist/hello.cartridge --key developer.key.json --output hello.signature.json
+cargo run -p cartridge-cli -- identity trust hello.signature.json --store trust.json --label "local developer"
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json run dist/hello.cartridge --state-dir dist/state -- Ada
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage status dist/hello.cartridge --state-dir dist/state
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage export dist/hello.cartridge --state-dir dist/state --output backup.cartridge-state.json
 cargo run -p cartridge-cli -- storage inspect backup.cartridge-state.json
 cargo run -p cartridge-cli -- storage migration-plan dist/hello.cartridge --from-schema 0
 cargo run -p cartridge-cli -- storage migrate app.cartridge old.cartridge-state.json --output migrated.cartridge-state.json
-cargo run -p cartridge-cli -- storage migrate-commit app.cartridge --state-dir dist/state --rollback-output rollback.cartridge-state.json --receipt-output migration-receipt.json
-cargo run -p cartridge-cli -- storage migration-recover app.cartridge migration-receipt.json --state-dir dist/state
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage migrate-commit dist/hello.cartridge --state-dir dist/state --rollback-output rollback.cartridge-state.json --receipt-output migration-receipt.json
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage migration-recover dist/hello.cartridge migration-receipt.json --state-dir dist/state
 cargo run -p cartridge-cli -- capsule create dist/hello.cartridge --source before.cartridge-state.json --trace run.trace.json --result after.cartridge-state.json --output run.cartridge-capsule.json
 cargo run -p cartridge-cli -- capsule verify run.cartridge-capsule.json
 cargo run -p cartridge-cli -- capsule diff run.cartridge-capsule.json other.cartridge-capsule.json
 cargo run -p cartridge-cli -- capsule replay run.cartridge-capsule.json
 cargo run -p cartridge-cli -- run dist/hello.cartridge --from-snapshot backup.cartridge-state.json --snapshot-output branch.cartridge-state.json -- Test
-cargo run -p cartridge-cli -- storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
+cargo run -p cartridge-cli -- --storage-signature hello.signature.json --storage-trust trust.json storage restore dist/hello.cartridge backup.cartridge-state.json --state-dir dist/state --dry-run
 cargo run -p cartridge-cli -- trace inspect dist/hello.trace.json
 cargo run -p cartridge-cli -- trace diff dist/hello.trace.json dist/hello.trace.json
 cargo run -p cartridge-cli -- trace redact dist/hello.trace.json --output dist/hello.trace-summary.json
@@ -89,6 +95,8 @@ cargo run -p cartridge-cli -- blob gc --store dist/blobs --snapshot backup.cartr
 cargo run -p cartridge-cli -- replay dist/hello.cartridge dist/hello.trace.json -- Clyde
 cargo run -p cartridge-cli -- conformance dist/hello.cartridge -- Clyde
 cargo run -p cartridge-cli -- trace export dist/hello.trace.json --output dist/timeline.json
+cargo run -p cartridge-cli -- stability benchmark dist/hello.cartridge --iterations 10 --output dist/benchmark.json -- Clyde
+cargo run -p cartridge-cli -- stability soak dist/hello.cartridge --iterations 100 --output dist/soak.json -- Clyde
 ```
 
 Create a project and use the developer loop:
@@ -138,6 +146,7 @@ crates/cartridge-desktop/   installed library, permission UX, recovery, and pres
 crates/cartridge-media/     deterministic drawing, input, audio, and realtime buffers
 crates/cartridge-identity/  developer keys, signatures, trust, and immutable registry
 crates/cartridge-network/   scoped HTTP, encrypted peers, sync, and simulation
+crates/cartridge-release/   signed runtime metadata, installation, and rollback
 crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
 crates/cartridge-storage/   isolated state backends, snapshots, and content-addressed blobs
 crates/cartridge-trace/     versioned trace model, validation, and comparison
@@ -150,7 +159,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [identity and registry](docs/identity-and-registry.md) for signed distribution, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md) and [1.0 candidate review](docs/security-audit-1.0-rc.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
 
 ## Status
 

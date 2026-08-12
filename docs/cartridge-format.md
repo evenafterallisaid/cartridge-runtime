@@ -32,6 +32,14 @@ graphics = false
 audio = false
 midi = false
 
+[compatibility]
+host_api = "^0.4"
+
+[compatibility.capabilities]
+clock = "^1"
+assets = "^1"
+storage = "^1"
+
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864
@@ -55,6 +63,8 @@ to = 1
 ```
 
 The packer supplies the integrity block. Cartridge IDs use reverse-domain notation and versions follow Semantic Versioning. Runtime limits include an instruction budget, a linear-memory ceiling, a wall-time deadline between 1 millisecond and 5 minutes, three independent storage ceilings, graphics pixel/command ceilings, and audio node/event/frame ceilings. Storage values cannot be larger than the total storage quota. Graphics, audio, and MIDI are independent deny-by-default permissions; granting audio does not grant MIDI.
+
+The optional compatibility section lets a package state the host API and capability versions it understands. Requirements use Semantic Versioning syntax. A capability requirement is valid only when the matching permission is enabled. The runtime negotiates these requirements before compiling or executing the component and rejects an unsupported combination instead of guessing. Packages without this section retain the format-v1 defaults.
 
 The optional state section declares the schema expected by the current component and the monotonic upgrade paths it supports. Packages without the section use schema `0`. See [state migrations](migrations.md) for validation and planning rules.
 
@@ -84,4 +94,4 @@ These declarations are requests and advertisements, not grants. Runtime policy c
 
 ## Compatibility
 
-Readers must reject unknown `format_version` values. Additive manifest fields within a version should have safe defaults. ABI compatibility is handled separately by the version in the WIT package name.
+Readers must reject unknown `format_version` values. Additive manifest fields within a version should have safe defaults. ABI compatibility is handled separately by the version in the WIT package name. The exact support windows and change rules are defined in [the compatibility policy](compatibility-policy.md).

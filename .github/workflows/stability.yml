@@ -1,0 +1,43 @@
+name: Stability
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  release-soak:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      - name: Build release runtime and corpus
+        run: |
+          cargo build -p cartridge-cli --release
+          cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
+
+      - name: Run release stability corpus
+        shell: bash
+        run: |
+          binary=target/release/cartridge
+          if [ -x target/release/cartridge.exe ]; then binary=target/release/cartridge.exe; fi
+          "$binary" pack examples/hello-cartridge/Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --assets examples/hello-cartridge/assets --output hello.cartridge
+          "$binary" verify hello.cartridge
+          "$binary" platform hello.cartridge --json
+          "$binary" stability benchmark hello.cartridge --iterations 10 --output benchmark.json -- release-corpus
+          "$binary" stability soak hello.cartridge --iterations 1000 --output soak.json -- release-corpus
+          grep '"local_only": true' benchmark.json soak.json
+          cat benchmark.json
+          cat soak.json

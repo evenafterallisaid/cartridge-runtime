@@ -16,6 +16,7 @@ cartridge-desktop = { path = "../cartridge-desktop" }
 cartridge-dev = { path = "../cartridge-dev" }
 cartridge-identity = { path = "../cartridge-identity" }
 cartridge-network = { path = "../cartridge-network" }
+cartridge-release = { path = "../cartridge-release" }
 cartridge-runtime = { path = "../cartridge-runtime" }
 cartridge-trace = { path = "../cartridge-trace" }
 clap.workspace = true

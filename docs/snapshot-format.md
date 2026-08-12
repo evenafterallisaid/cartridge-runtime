@@ -45,7 +45,7 @@ Inspection reports identity, state schema, state revision, entry count, byte cou
 Restore requires a package so the runtime can derive the expected cartridge id and current storage limits:
 
 ```sh
-cartridge storage restore app.cartridge backup.cartridge-state.json \
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage restore app.cartridge backup.cartridge-state.json \
   --state-dir ./state --dry-run
 ```
 

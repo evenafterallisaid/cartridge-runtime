@@ -39,6 +39,8 @@ Fuel provides a deterministic instruction budget. A separate runtime epoch ticke
 
 The public CLI treats component compilation and execution as untrusted work. It validates the bounded archive, launches a helper process with a cleared, minimal environment and no stdin, and kills that helper if startup plus the manifest deadline is exceeded. This contains compiler crashes and gives the CLI a deadline independent of guest and WASI control flow. The helper is a process boundary, not yet a platform-native sandbox: kernel memory and CPU quotas, restricted Windows tokens, macOS sandbox profiles, and Linux namespace/seccomp policies remain future work. Direct users of the runtime library stay in process by design.
 
+Durable state also requires authenticated identity. CLI runs and storage administration using `--state-dir` require `--storage-signature` and `--storage-trust`; the signature binds the exact package bytes, id, version, component, and asset root to a trusted developer key before the id can select a durable namespace. Embedders that construct a shared persistent backend directly must enforce an equivalent package-authentication policy.
+
 The first release is not a complete sandbox. Wasmtime provides the component isolation boundary, the host controls which imports are linked, and the CLI adds a killable process boundary. Signed packages, cache isolation, kernel resource limits, and operating-system sandbox profiles are required before cartridges should be treated as safe to exchange publicly.
 
 ## Portability boundary

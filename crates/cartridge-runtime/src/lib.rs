@@ -3,7 +3,9 @@ mod host;
 use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
-use cartridge_core::{CartridgeArchive, MigrationPlan, PackageManifest, StateMigration};
+use cartridge_core::{
+    CartridgeArchive, MigrationPlan, PackageManifest, StateMigration, negotiate_platform,
+};
 pub use cartridge_media::{
     AudioDevice, AudioDeviceCatalog, AudioDocument, AudioLimits, AudioNode, AudioParameter,
     AudioReceipt, AudioRender, AudioTelemetry, Color, DrawCommand, FrameDocument, FrameReceipt,
@@ -121,6 +123,7 @@ impl Runtime {
 
     pub fn validate_file(&self, path: impl AsRef<Path>) -> Result<PackageManifest> {
         let archive = open_archive(path)?;
+        negotiate_platform(&archive.manifest).map_err(|error| anyhow!(error))?;
         let component = Component::new(&self.engine, &archive.component)
             .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
         self.linker()?
@@ -197,6 +200,7 @@ impl Runtime {
         replay: Option<ExecutionTrace>,
         apply_replay_storage: bool,
     ) -> Result<RunReport> {
+        negotiate_platform(&archive.manifest).map_err(|error| anyhow!(error))?;
         if replay.is_none() && archive.manifest.permissions.storage {
             self.storage.prepare(
                 &archive.manifest.cartridge.id,
@@ -234,7 +238,7 @@ impl Runtime {
         let fuel_remaining = store.get_fuel()?;
         let mut state = store.into_data();
         state.finish_replay()?;
-        let (frames, audio) = state.take_media();
+        let (frames, audio, media_metrics) = state.take_media();
 
         let result =
             call_result.map_err(|error| anyhow!("the component trapped while running: {error}"))?;
@@ -276,6 +280,8 @@ impl Runtime {
             fuel_consumed,
             trace,
             media: MediaArtifacts { frames, audio },
+            media_metrics,
+            declared_memory_limit_bytes: manifest.runtime.memory_bytes,
         })
     }
 
@@ -479,12 +485,22 @@ pub struct RunReport {
     pub fuel_consumed: u64,
     pub trace: ExecutionTrace,
     pub media: MediaArtifacts,
+    pub media_metrics: MediaMetrics,
+    pub declared_memory_limit_bytes: usize,
 }
 
 #[derive(Debug, Default)]
 pub struct MediaArtifacts {
     pub frames: Vec<RenderedFrame>,
     pub audio: Vec<AudioRender>,
+}
+
+#[derive(Debug, Default)]
+pub struct MediaMetrics {
+    pub graphics_present_calls: u64,
+    pub graphics_present_micros: u128,
+    pub audio_render_calls: u64,
+    pub audio_render_micros: u128,
 }
 
 #[derive(Debug)]
@@ -527,6 +543,7 @@ mod tests {
                 ..Default::default()
             },
             http: cartridge_network::HttpPolicy::default(),
+            compatibility: cartridge_core::Compatibility::default(),
             runtime: cartridge_core::RuntimeLimits {
                 timeout_ms,
                 ..Default::default()

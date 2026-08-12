@@ -12,12 +12,14 @@ cartridge-core = { path = "../crates/cartridge-core" }
 cartridge-desktop = { path = "../crates/cartridge-desktop" }
 cartridge-media = { path = "../crates/cartridge-media" }
 cartridge-network = { path = "../crates/cartridge-network" }
+cartridge-release = { path = "../crates/cartridge-release" }
 cartridge-storage = { path = "../crates/cartridge-storage" }
 cartridge-trace = { path = "../crates/cartridge-trace" }
 libfuzzer-sys = "0.4.10"
 serde_json = "1.0.145"
 tempfile = "3.27.0"
 toml = "1.0.3"
+wit-parser = "0.252.0"
 
 [[bin]]
 name = "archive"
@@ -85,6 +87,20 @@ bench = false
 [[bin]]
 name = "network"
 path = "fuzz_targets/network.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release"
+path = "fuzz_targets/release.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wit"
+path = "fuzz_targets/wit.rs"
 test = false
 doc = false
 bench = false

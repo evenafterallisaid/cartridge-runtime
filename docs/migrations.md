@@ -60,7 +60,7 @@ Migration execution uses the package's normal capability policy and storage quot
 This command deliberately does not touch durable state. To migrate a live namespace and commit the result explicitly:
 
 ```sh
-cartridge storage migrate-commit app.cartridge --state-dir ./state \
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage migrate-commit app.cartridge --state-dir ./state \
   --rollback-output before-migration.cartridge-state.json \
   --receipt-output migration-receipt.json
 ```
@@ -71,7 +71,7 @@ Inspect the receipt or compare it with durable state after an interrupted comman
 
 ```sh
 cartridge storage migration-receipt migration-receipt.json
-cartridge storage migration-recover app.cartridge migration-receipt.json \
+cartridge --storage-signature app.signature.json --storage-trust trust.json storage migration-recover app.cartridge migration-receipt.json \
   --state-dir ./state
 ```
 
@@ -80,9 +80,9 @@ Recovery reports `committed`, `not_committed`, `committed_then_changed`, or `ind
 If recovery is needed, use the package version whose manifest expects the rollback snapshot's schema:
 
 ```sh
-cartridge storage restore old-app.cartridge before-migration.cartridge-state.json \
+cartridge --storage-signature old-app.signature.json --storage-trust trust.json storage restore old-app.cartridge before-migration.cartridge-state.json \
   --state-dir ./state --dry-run
-cartridge storage restore old-app.cartridge before-migration.cartridge-state.json \
+cartridge --storage-signature old-app.signature.json --storage-trust trust.json storage restore old-app.cartridge before-migration.cartridge-state.json \
   --state-dir ./state
 ```
 

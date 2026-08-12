@@ -12,6 +12,14 @@ random = false
 assets = true
 storage = true
 
+[compatibility]
+host_api = "^0.4"
+
+[compatibility.capabilities]
+clock = "^1"
+assets = "^1"
+storage = "^1"
+
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864

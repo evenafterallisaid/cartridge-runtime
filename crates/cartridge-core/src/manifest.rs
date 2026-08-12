@@ -39,6 +39,9 @@ const MAX_MIGRATIONS: usize = 256;
 const MAX_DEPENDENCIES: usize = 128;
 const MAX_SERVICES: usize = 128;
 const MAX_INTERFACES_PER_DEPENDENCY: usize = 64;
+const MAX_CAPABILITY_REQUIREMENTS: usize = 64;
+
+pub const HOST_API_VERSION: &str = "0.4.0";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +52,8 @@ pub struct PackageManifest {
     pub permissions: Permissions,
     #[serde(default, skip_serializing_if = "http_policy_is_empty")]
     pub http: HttpPolicy,
+    #[serde(default, skip_serializing_if = "Compatibility::is_empty")]
+    pub compatibility: Compatibility,
     #[serde(default)]
     pub runtime: RuntimeLimits,
     #[serde(default, skip_serializing_if = "StateConfig::is_empty")]
@@ -88,6 +93,7 @@ impl PackageManifest {
                 "HTTP scopes require permissions.http = true".into(),
             ));
         }
+        self.compatibility.validate(self)?;
 
         if !(1..=MAX_FUEL).contains(&self.runtime.fuel) {
             return Err(Error::Manifest(format!(
@@ -253,6 +259,132 @@ pub struct Permissions {
     pub audio: bool,
     pub midi: bool,
     pub http: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Compatibility {
+    pub host_api: String,
+    pub capabilities: BTreeMap<String, String>,
+}
+
+impl Compatibility {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.host_api.is_empty() && self.capabilities.is_empty()
+    }
+
+    fn validate(&self, manifest: &PackageManifest) -> Result<()> {
+        if self.capabilities.len() > MAX_CAPABILITY_REQUIREMENTS {
+            return Err(Error::Manifest(
+                "too many capability version requirements".into(),
+            ));
+        }
+        if !self.host_api.is_empty() {
+            VersionReq::parse(&self.host_api).map_err(|error| {
+                Error::Manifest(format!("compatibility.host_api is invalid: {error}"))
+            })?;
+        }
+        let requested = permission_map(&manifest.permissions);
+        for (name, requirement) in &self.capabilities {
+            validate_capability_name(name)?;
+            VersionReq::parse(requirement).map_err(|error| {
+                Error::Manifest(format!(
+                    "capability requirement {name:?} is invalid: {error}"
+                ))
+            })?;
+            if !requested.get(name.as_str()).copied().unwrap_or(false) {
+                return Err(Error::Manifest(format!(
+                    "capability version requirement {name:?} needs its permission enabled"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NegotiatedPlatform {
+    pub host_api: String,
+    pub capabilities: BTreeMap<String, String>,
+}
+
+pub fn negotiate_platform(manifest: &PackageManifest) -> Result<NegotiatedPlatform> {
+    manifest.validate()?;
+    let host_api = Version::parse(HOST_API_VERSION).expect("built-in host API version is valid");
+    if !manifest.compatibility.host_api.is_empty()
+        && !VersionReq::parse(&manifest.compatibility.host_api)
+            .expect("validated host API requirement")
+            .matches(&host_api)
+    {
+        return Err(Error::Manifest(format!(
+            "host API {} does not satisfy {}",
+            HOST_API_VERSION, manifest.compatibility.host_api
+        )));
+    }
+    let available = host_capabilities();
+    let mut negotiated = BTreeMap::new();
+    for (name, enabled) in permission_map(&manifest.permissions) {
+        if !enabled {
+            continue;
+        }
+        let version = available.get(name).ok_or_else(|| {
+            Error::Manifest(format!(
+                "host does not implement requested capability {name:?}"
+            ))
+        })?;
+        if let Some(requirement) = manifest.compatibility.capabilities.get(name) {
+            if !VersionReq::parse(requirement)
+                .expect("validated capability requirement")
+                .matches(version)
+            {
+                return Err(Error::Manifest(format!(
+                    "capability {name} version {version} does not satisfy {requirement}"
+                )));
+            }
+        }
+        negotiated.insert(name.into(), version.to_string());
+    }
+    Ok(NegotiatedPlatform {
+        host_api: host_api.to_string(),
+        capabilities: negotiated,
+    })
+}
+
+fn host_capabilities() -> BTreeMap<&'static str, Version> {
+    [
+        "assets", "audio", "clock", "graphics", "http", "midi", "random", "storage",
+    ]
+    .into_iter()
+    .map(|name| (name, Version::new(1, 0, 0)))
+    .collect()
+}
+
+fn permission_map(value: &Permissions) -> BTreeMap<&'static str, bool> {
+    BTreeMap::from([
+        ("clock", value.clock),
+        ("random", value.random),
+        ("assets", value.assets),
+        ("storage", value.storage),
+        ("graphics", value.graphics),
+        ("audio", value.audio),
+        ("midi", value.midi),
+        ("http", value.http),
+    ])
+}
+
+fn validate_capability_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(Error::Manifest(
+            "capability names must be lowercase identifiers".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn http_policy_is_empty(value: &HttpPolicy) -> bool {
@@ -690,6 +822,7 @@ mod tests {
             },
             permissions: Permissions::default(),
             http: cartridge_network::HttpPolicy::default(),
+            compatibility: Compatibility::default(),
             runtime: RuntimeLimits::default(),
             state: StateConfig::default(),
             dependencies: Vec::new(),
@@ -701,6 +834,36 @@ mod tests {
     #[test]
     fn accepts_valid_manifest() {
         manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn negotiates_host_and_capability_versions() {
+        let mut value = manifest();
+        value.permissions.storage = true;
+        value.compatibility.host_api = "^0.4".into();
+        value
+            .compatibility
+            .capabilities
+            .insert("storage".into(), "^1".into());
+        let negotiated = negotiate_platform(&value).unwrap();
+        assert_eq!(negotiated.host_api, "0.4.0");
+        assert_eq!(
+            negotiated.capabilities.get("storage").map(String::as_str),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_or_undeclared_capability_versions() {
+        let mut value = manifest();
+        value.compatibility.host_api = ">=1".into();
+        assert!(negotiate_platform(&value).is_err());
+        value.compatibility.host_api.clear();
+        value
+            .compatibility
+            .capabilities
+            .insert("storage".into(), "^1".into());
+        assert!(value.validate().is_err());
     }
 
     #[test]

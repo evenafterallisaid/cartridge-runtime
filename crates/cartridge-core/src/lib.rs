@@ -5,9 +5,10 @@ mod resolver;
 
 pub use archive::{AssetVerification, CartridgeArchive, PackageLimits};
 pub use manifest::{
-    CURRENT_FORMAT_VERSION, CartridgeDependency, CartridgeMetadata, Integrity,
-    MIGRATION_PLAN_FORMAT_VERSION, MigrationPlan, PackageManifest, Permissions, ProvidedService,
-    RuntimeLimits, ServiceVisibility, Services, StateConfig, StateMigration,
+    CURRENT_FORMAT_VERSION, CartridgeDependency, CartridgeMetadata, Compatibility,
+    HOST_API_VERSION, Integrity, MIGRATION_PLAN_FORMAT_VERSION, MigrationPlan, NegotiatedPlatform,
+    PackageManifest, Permissions, ProvidedService, RuntimeLimits, ServiceVisibility, Services,
+    StateConfig, StateMigration, negotiate_platform,
 };
 pub use pack::{PackOptions, pack};
 pub use resolver::{

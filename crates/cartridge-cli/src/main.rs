@@ -11,11 +11,13 @@ use std::{
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
-use cartridge_core::{CartridgeArchive, PackOptions, ResolutionPlan, pack, resolve_dependencies};
+use cartridge_core::{
+    CartridgeArchive, PackOptions, ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
+};
 use cartridge_desktop::{Capability, LaunchStatus, Library};
 use cartridge_dev::{
     Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
@@ -26,6 +28,7 @@ use cartridge_identity::{
     read_rotation, read_signature, write_revocation, write_rotation, write_signature,
 };
 use cartridge_network::HttpFixtures;
+use cartridge_release::{ReleaseArtifact, ReleasePayload, SignedRelease, Updater};
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
     DirectoryStorage, InputEvent, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
@@ -38,6 +41,7 @@ use cartridge_trace::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use migration_receipt::{MigrationReceipt, MigrationReceiptPayload};
+use sha2::{Digest, Sha256};
 
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WORKER_STARTUP_BUDGET: Duration = Duration::from_secs(10);
@@ -45,6 +49,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BLOB_GC_ROOT_ARTIFACTS: usize = 256;
 const MAX_BLOB_GC_REFERENCES: usize = 100_000;
 const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
+const MAX_STABILITY_WALL_TIME: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
@@ -57,6 +62,9 @@ struct RunCommandOptions<'a> {
     midi: Option<&'a Path>,
     media_dir: Option<&'a Path>,
     http_fixtures: Option<&'a Path>,
+    storage_signature: Option<&'a Path>,
+    storage_trust: Option<&'a Path>,
+    local_storage_authority: bool,
     args: &'a [String],
 }
 
@@ -67,8 +75,38 @@ struct RunCommandOptions<'a> {
     about = "pack and run portable wasm cartridges"
 )]
 struct Cli {
+    /// trusted signature required for durable cartridge state
+    #[arg(long = "storage-signature", global = true, requires = "storage_trust")]
+    storage_signature: Option<PathBuf>,
+    /// trust store used to authenticate durable cartridge identity
+    #[arg(long = "storage-trust", global = true, requires = "storage_signature")]
+    storage_trust: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+struct DurableAuth {
+    signature: Option<PathBuf>,
+    trust: Option<PathBuf>,
+}
+
+impl DurableAuth {
+    fn verify(&self, package: &Path) -> Result<()> {
+        let signature_path = self
+            .signature
+            .as_deref()
+            .context("durable state requires --storage-signature and --storage-trust")?;
+        let trust_path = self
+            .trust
+            .as_deref()
+            .context("durable state requires --storage-signature and --storage-trust")?;
+        let signature = read_signature(signature_path).map_err(anyhow::Error::msg)?;
+        let trust = TrustStore::read(trust_path).map_err(anyhow::Error::msg)?;
+        trust
+            .verify(package, &signature)
+            .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -211,6 +249,8 @@ enum Command {
         media_dir: Option<PathBuf>,
         #[arg(long)]
         http_fixtures: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        local_storage_authority: bool,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -274,6 +314,27 @@ enum Command {
     Registry {
         #[command(subcommand)]
         command: RegistryCommand,
+    },
+    /// inspect host API and capability compatibility
+    Platform {
+        package: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// create, verify, install, and roll back signed runtime releases
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+    /// run deterministic soak and performance measurements
+    Stability {
+        #[command(subcommand)]
+        command: StabilityCommand,
+    },
+    #[command(name = "__worker-stability", hide = true)]
+    WorkerStability {
+        #[command(subcommand)]
+        command: StabilityCommand,
     },
 }
 
@@ -358,6 +419,78 @@ enum RegistryCommand {
         root: PathBuf,
         #[arg(long)]
         trust: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    Create {
+        artifact: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    Verify {
+        release: PathBuf,
+        #[arg(long)]
+        trust: PathBuf,
+    },
+    Install {
+        release: PathBuf,
+        artifact: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        trust: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
+    Status {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Rollback {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StabilityCommand {
+    Benchmark {
+        package: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        iterations: u32,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Soak {
+        package: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        iterations: u32,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -775,7 +908,12 @@ fn main() -> ExitCode {
 
 #[allow(clippy::too_many_lines)]
 fn run_cli() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let durable_auth = DurableAuth {
+        signature: cli.storage_signature,
+        trust: cli.storage_trust,
+    };
+    match cli.command {
         Command::New { path, language } => new_command(&path, language),
         Command::Check { project, json } => check_command(&project, json),
         Command::Dev {
@@ -818,18 +956,26 @@ fn run_cli() -> Result<()> {
             media_dir,
             http_fixtures,
             args,
-        } => supervised_run_command(RunCommandOptions {
-            package: &package,
-            trace: trace.as_deref(),
-            state_dir: state_dir.as_deref(),
-            from_snapshot: from_snapshot.as_deref(),
-            snapshot_output: snapshot_output.as_deref(),
-            input: input.as_deref(),
-            midi: midi.as_deref(),
-            media_dir: media_dir.as_deref(),
-            http_fixtures: http_fixtures.as_deref(),
-            args: &args,
-        }),
+        } => {
+            if state_dir.is_some() {
+                durable_auth.verify(&package)?;
+            }
+            supervised_run_command(RunCommandOptions {
+                package: &package,
+                trace: trace.as_deref(),
+                state_dir: state_dir.as_deref(),
+                from_snapshot: from_snapshot.as_deref(),
+                snapshot_output: snapshot_output.as_deref(),
+                input: input.as_deref(),
+                midi: midi.as_deref(),
+                media_dir: media_dir.as_deref(),
+                http_fixtures: http_fixtures.as_deref(),
+                storage_signature: durable_auth.signature.as_deref(),
+                storage_trust: durable_auth.trust.as_deref(),
+                local_storage_authority: false,
+                args: &args,
+            })
+        }
         Command::Replay {
             package,
             trace,
@@ -846,9 +992,13 @@ fn run_cli() -> Result<()> {
             midi,
             media_dir,
             http_fixtures,
+            local_storage_authority,
             args,
         } => {
             require_worker_context()?;
+            if state_dir.is_some() && !local_storage_authority {
+                durable_auth.verify(&package)?;
+            }
             run_command(RunCommandOptions {
                 package: &package,
                 trace: trace.as_deref(),
@@ -859,6 +1009,9 @@ fn run_cli() -> Result<()> {
                 midi: midi.as_deref(),
                 media_dir: media_dir.as_deref(),
                 http_fixtures: http_fixtures.as_deref(),
+                storage_signature: None,
+                storage_trust: None,
+                local_storage_authority,
                 args: &args,
             })
         }
@@ -892,6 +1045,7 @@ fn run_cli() -> Result<()> {
             json,
         } => {
             require_worker_context()?;
+            durable_auth.verify(&package)?;
             storage_migrate_commit_command(
                 &package,
                 &state_dir,
@@ -902,9 +1056,16 @@ fn run_cli() -> Result<()> {
         }
         Command::Trace { command } => run_trace_command(command),
         Command::Capsule { command } => run_capsule_command(command),
-        Command::Storage { command } => run_storage_command(command),
+        Command::Storage { command } => run_storage_command(command, &durable_auth),
         Command::Identity { command } => run_identity_command(command),
         Command::Registry { command } => run_registry_command(command),
+        Command::Platform { package, json } => platform_command(&package, json),
+        Command::Release { command } => run_release_command(command),
+        Command::Stability { command } => supervised_stability_command(&command),
+        Command::WorkerStability { command } => {
+            require_worker_context()?;
+            run_stability_command(command)
+        }
     }
 }
 
@@ -991,6 +1152,9 @@ fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()
         midi: None,
         media_dir: None,
         http_fixtures: None,
+        storage_signature: None,
+        storage_trust: None,
+        local_storage_authority: false,
         args,
     });
     let replay = run.and_then(|()| supervised_replay_command(package, &trace, None, args));
@@ -1098,6 +1262,9 @@ fn run_dev_build(
         midi: None,
         media_dir: None,
         http_fixtures: None,
+        storage_signature: None,
+        storage_trust: None,
+        local_storage_authority: true,
         args: &[],
     });
     fs::remove_file(&package)
@@ -1313,6 +1480,9 @@ fn library_run_command(
         midi: None,
         media_dir: None,
         http_fixtures: None,
+        storage_signature: None,
+        storage_trust: None,
+        local_storage_authority: true,
         args,
     });
     let status = if result.is_ok() {
@@ -1848,7 +2018,23 @@ fn print_capsule_summary(summary: &capsule::CapsuleSummary) {
     println!("capsule sha256: {}", summary.capsule_sha256);
 }
 
-fn run_storage_command(command: StorageCommand) -> Result<()> {
+fn run_storage_command(command: StorageCommand, durable_auth: &DurableAuth) -> Result<()> {
+    let durable_package = match &command {
+        StorageCommand::Status { package, .. }
+        | StorageCommand::Recover { package, .. }
+        | StorageCommand::Export { package, .. }
+        | StorageCommand::Restore { package, .. }
+        | StorageCommand::MigrateCommit { package, .. }
+        | StorageCommand::MigrationRecover { package, .. } => Some(package.as_path()),
+        StorageCommand::Inspect { .. }
+        | StorageCommand::Diff { .. }
+        | StorageCommand::MigrationPlan { .. }
+        | StorageCommand::Migrate { .. }
+        | StorageCommand::MigrationReceipt { .. } => None,
+    };
+    if let Some(package) = durable_package {
+        durable_auth.verify(package)?;
+    }
     match command {
         StorageCommand::Status {
             package,
@@ -1897,6 +2083,7 @@ fn run_storage_command(command: StorageCommand) -> Result<()> {
             &rollback_output,
             &receipt_output,
             json,
+            durable_auth,
         ),
         StorageCommand::MigrationReceipt { receipt, json } => {
             storage_migration_receipt_command(&receipt, json)
@@ -2090,6 +2277,358 @@ fn run_registry_command(command: RegistryCommand) -> Result<()> {
     Ok(())
 }
 
+fn platform_command(package: &Path, json_output: bool) -> Result<()> {
+    let archive = CartridgeArchive::open(package)?;
+    let negotiated = negotiate_platform(&archive.manifest)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&negotiated)?);
+    } else {
+        println!("host API: {}", negotiated.host_api);
+        for (name, version) in negotiated.capabilities {
+            println!("{name}: {version}");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_release_command(command: ReleaseCommand) -> Result<()> {
+    match command {
+        ReleaseCommand::Create {
+            artifact,
+            target,
+            version,
+            channel,
+            key,
+            output,
+        } => {
+            let (bytes, sha256) =
+                hash_bounded_file(&artifact, cartridge_release::MAX_RUNTIME_ARTIFACT_BYTES)?;
+            let filename = artifact
+                .file_name()
+                .and_then(|value| value.to_str())
+                .context("runtime artifact filename must be UTF-8")?
+                .to_owned();
+            let payload = ReleasePayload::new(
+                channel,
+                version,
+                current_time_ms()?,
+                env!("CARGO_PKG_VERSION").into(),
+                vec![ReleaseArtifact {
+                    target,
+                    filename,
+                    bytes,
+                    sha256,
+                }],
+            )
+            .map_err(anyhow::Error::msg)?;
+            let release = SignedRelease::create(
+                &DeveloperKey::read(&key).map_err(anyhow::Error::msg)?,
+                payload,
+            )
+            .map_err(anyhow::Error::msg)?;
+            release.write_new(&output).map_err(anyhow::Error::msg)?;
+            println!(
+                "signed runtime release {} -> {}",
+                release.payload.version,
+                output.display()
+            );
+        }
+        ReleaseCommand::Verify { release, trust } => {
+            let release = SignedRelease::read(&release).map_err(anyhow::Error::msg)?;
+            let trust = TrustStore::read(&trust).map_err(anyhow::Error::msg)?;
+            release
+                .verify(&trust, env!("CARGO_PKG_VERSION"))
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "verified runtime release {} ({})",
+                release.payload.version, release.payload.channel
+            );
+        }
+        ReleaseCommand::Install {
+            release,
+            artifact,
+            target,
+            trust,
+            root,
+            channel,
+            allow_downgrade,
+        } => {
+            let release = SignedRelease::read(&release).map_err(anyhow::Error::msg)?;
+            let trust = TrustStore::read(&trust).map_err(anyhow::Error::msg)?;
+            let installed = Updater::open(root, &channel)
+                .and_then(|mut updater| {
+                    updater.install(
+                        &release,
+                        &trust,
+                        &artifact,
+                        &target,
+                        env!("CARGO_PKG_VERSION"),
+                        allow_downgrade,
+                    )
+                })
+                .map_err(anyhow::Error::msg)?;
+            println!(
+                "activated runtime {} -> {}",
+                installed.version, installed.relative_path
+            );
+        }
+        ReleaseCommand::Status {
+            root,
+            channel,
+            json,
+        } => {
+            let active = Updater::open(root, &channel)
+                .and_then(|updater| updater.active())
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&active)?);
+            } else if let Some(active) = active {
+                println!(
+                    "active runtime: {} ({})",
+                    active.version, active.relative_path
+                );
+            } else {
+                println!("no active runtime release");
+            }
+        }
+        ReleaseCommand::Rollback { root, channel } => {
+            let release = Updater::open(root, &channel)
+                .and_then(|mut updater| updater.rollback())
+                .map_err(anyhow::Error::msg)?;
+            println!("rolled back to runtime {}", release.version);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct StabilityReport {
+    format_version: u32,
+    kind: &'static str,
+    local_only: bool,
+    operating_system: &'static str,
+    architecture: &'static str,
+    cartridge_id: String,
+    cartridge_version: String,
+    iterations: u32,
+    total_ms: u128,
+    minimum_us: u128,
+    median_us: u128,
+    p95_us: u128,
+    maximum_us: u128,
+    declared_memory_limit_bytes: usize,
+    fuel_consumed: u64,
+    trace_events: usize,
+    output_sha256: String,
+    frames: usize,
+    audio_renders: usize,
+    graphics_present_calls: u64,
+    graphics_present_micros: u128,
+    audio_render_calls: u64,
+    audio_render_micros: u128,
+}
+
+fn supervised_stability_command(command: &StabilityCommand) -> Result<()> {
+    let (kind, package, iterations, output, args) = match &command {
+        StabilityCommand::Benchmark {
+            package,
+            iterations,
+            output,
+            args,
+        } => ("benchmark", package, *iterations, output, args),
+        StabilityCommand::Soak {
+            package,
+            iterations,
+            output,
+            args,
+        } => ("soak", package, *iterations, output, args),
+    };
+    validate_iterations(iterations)?;
+    if output
+        .try_exists()
+        .with_context(|| format!("could not inspect stability output {}", output.display()))?
+    {
+        bail!("stability output already exists: {}", output.display());
+    }
+    let archive = CartridgeArchive::open(package).with_context(|| {
+        format!(
+            "could not validate {} before stability run",
+            package.display()
+        )
+    })?;
+    let runs = iterations.saturating_add(1);
+    let requested = Duration::from_millis(archive.manifest.runtime.timeout_ms)
+        .checked_mul(runs)
+        .unwrap_or(MAX_STABILITY_WALL_TIME);
+    let budget = requested.min(MAX_STABILITY_WALL_TIME);
+    drop(archive);
+
+    let mut worker_args = vec![
+        OsString::from("__worker-stability"),
+        OsString::from(kind),
+        package.as_os_str().to_owned(),
+        OsString::from("--iterations"),
+        OsString::from(iterations.to_string()),
+        OsString::from("--output"),
+        output.as_os_str().to_owned(),
+    ];
+    push_worker_arguments(&mut worker_args, args);
+    supervise_worker(package, &worker_args, Some(budget))
+}
+
+fn run_stability_command(command: StabilityCommand) -> Result<()> {
+    match command {
+        StabilityCommand::Benchmark {
+            package,
+            iterations,
+            output,
+            args,
+        } => stability_benchmark(&package, iterations, &output, &args),
+        StabilityCommand::Soak {
+            package,
+            iterations,
+            output,
+            args,
+        } => stability_soak(&package, iterations, &output, &args),
+    }
+}
+
+fn stability_benchmark(
+    package: &Path,
+    iterations: u32,
+    output: &Path,
+    args: &[String],
+) -> Result<()> {
+    validate_iterations(iterations)?;
+    let started = Instant::now();
+    let mut timings = Vec::with_capacity(iterations as usize);
+    let mut last = None;
+    for _ in 0..iterations {
+        let iteration = Instant::now();
+        let report = Runtime::new()?.run_file(package, args)?;
+        timings.push(iteration.elapsed().as_micros());
+        last = Some(report);
+    }
+    write_stability_report(
+        output,
+        "cold-start-benchmark",
+        iterations,
+        started.elapsed(),
+        timings,
+        last.context("benchmark produced no run")?,
+    )
+}
+
+fn stability_soak(package: &Path, iterations: u32, output: &Path, args: &[String]) -> Result<()> {
+    validate_iterations(iterations)?;
+    let runtime = Runtime::new()?;
+    let baseline = runtime.run_file(package, args)?;
+    let trace = baseline.trace.clone();
+    let started = Instant::now();
+    let mut timings = Vec::with_capacity(iterations as usize);
+    let mut last = None;
+    for _ in 0..iterations {
+        let iteration = Instant::now();
+        let report = runtime.replay_file(package, args, trace.clone())?;
+        timings.push(iteration.elapsed().as_micros());
+        last = Some(report);
+    }
+    write_stability_report(
+        output,
+        "deterministic-soak",
+        iterations,
+        started.elapsed(),
+        timings,
+        last.context("soak produced no replay")?,
+    )
+}
+
+fn validate_iterations(iterations: u32) -> Result<()> {
+    if !(1..=10_000).contains(&iterations) {
+        bail!("iterations must be between 1 and 10000");
+    }
+    Ok(())
+}
+
+fn write_stability_report(
+    output: &Path,
+    kind: &'static str,
+    iterations: u32,
+    elapsed: Duration,
+    mut timings: Vec<u128>,
+    run: cartridge_runtime::RunReport,
+) -> Result<()> {
+    timings.sort_unstable();
+    let percentile =
+        |numerator: usize| timings[(timings.len().saturating_sub(1) * numerator) / 100];
+    let report = StabilityReport {
+        format_version: 1,
+        kind,
+        local_only: true,
+        operating_system: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        cartridge_id: run.cartridge.id,
+        cartridge_version: run.cartridge.version,
+        iterations,
+        total_ms: elapsed.as_millis(),
+        minimum_us: timings[0],
+        median_us: percentile(50),
+        p95_us: percentile(95),
+        maximum_us: *timings.last().context("missing timing")?,
+        declared_memory_limit_bytes: run.declared_memory_limit_bytes,
+        fuel_consumed: run.fuel_consumed,
+        trace_events: run.trace.events.len(),
+        output_sha256: hex::encode(Sha256::digest(run.output.as_bytes())),
+        frames: run.media.frames.len(),
+        audio_renders: run.media.audio.len(),
+        graphics_present_calls: run.media_metrics.graphics_present_calls,
+        graphics_present_micros: run.media_metrics.graphics_present_micros,
+        audio_render_calls: run.media_metrics.audio_render_calls,
+        audio_render_micros: run.media_metrics.audio_render_micros,
+    };
+    write_private(output, &serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "{kind}: {iterations} iteration(s), p95 {} us -> {}",
+        report.p95_us,
+        output.display()
+    );
+    Ok(())
+}
+
+fn current_time_ms() -> Result<u64> {
+    u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+        .context("timestamp overflow")
+}
+
+fn hash_bounded_file(path: &Path, limit: u64) -> Result<(u64, String)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("runtime artifact must be a regular file");
+    }
+    if metadata.len() > limit {
+        bail!("file exceeds the {limit}-byte limit");
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut bytes = 0_u64;
+    let mut digest = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("runtime artifact byte length overflowed")?;
+        if bytes > limit {
+            bail!("file exceeded the {limit}-byte limit while reading");
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok((bytes, hex::encode(digest.finalize())))
+}
+
 fn hex_array(value: &str) -> Result<[u8; 32]> {
     hex::decode(value)?
         .try_into()
@@ -2113,6 +2652,15 @@ fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
     push_path_option(&mut worker_args, "--midi", options.midi);
     push_path_option(&mut worker_args, "--media-dir", options.media_dir);
     push_path_option(&mut worker_args, "--http-fixtures", options.http_fixtures);
+    push_path_option(
+        &mut worker_args,
+        "--storage-signature",
+        options.storage_signature,
+    );
+    push_path_option(&mut worker_args, "--storage-trust", options.storage_trust);
+    if options.local_storage_authority {
+        worker_args.push(OsString::from("--local-storage-authority"));
+    }
     push_worker_arguments(&mut worker_args, options.args);
     supervise_worker(options.package, &worker_args, None)
 }
@@ -2169,6 +2717,7 @@ fn supervised_migrate_commit_command(
     rollback_output: &Path,
     receipt_output: &Path,
     json: bool,
+    durable_auth: &DurableAuth,
 ) -> Result<()> {
     if rollback_output == receipt_output {
         bail!("rollback and receipt outputs must use different paths");
@@ -2209,6 +2758,16 @@ fn supervised_migrate_commit_command(
     if json {
         worker_args.push(OsString::from("--json"));
     }
+    push_path_option(
+        &mut worker_args,
+        "--storage-signature",
+        durable_auth.signature.as_deref(),
+    );
+    push_path_option(
+        &mut worker_args,
+        "--storage-trust",
+        durable_auth.trust.as_deref(),
+    );
     supervise_worker(
         package,
         &worker_args,
