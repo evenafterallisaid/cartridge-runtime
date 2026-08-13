@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: milestones 0.1 through 0.9 and the portable 1.0 candidate boundary are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, transport-independent encrypted device-mesh primitives, capability negotiation, authenticated durable-storage principals, signed runtime updates, rollback, and supervised stability tooling. Work is now on the external 1.0 release gates. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.9 and the portable 1.0 candidate boundary are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, transport-independent encrypted device-mesh primitives, capability negotiation, authenticated durable-storage principals, signed runtime updates, rollback, and supervised stability tooling. External 1.0 release gates remain, while implementation has started on the 1.1 composition graph. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -429,13 +429,41 @@ Status: the portable 1.0 candidate boundary is implemented and under stabilizati
 
 The 1.0 boundary establishes a safe local platform. Later releases can build larger systems on top without weakening it.
 
+### The Docker-sized target
+
+Cartridge should grow from a runtime into a complete component engine: one tool that can build, package, sign, publish, install, compose, run, inspect, update, and recover portable applications. The credible comparison is not "Docker, but every container is Wasm." It is a different platform for workloads that benefit from capability security, typed interfaces, deterministic replay, fast startup, and host-independent packaging.
+
+The product loop should eventually feel this small:
+
+```sh
+cartridge build
+cartridge push registry.example/dev/photo-stack:1.4.0
+cartridge stack plan Cartridge.stack.toml
+cartridge stack apply Cartridge.stack.toml
+cartridge ps
+cartridge logs photo-stack
+cartridge trace replay photo-stack/last-failure
+```
+
+The engine has five planes:
+
+1. **Artifact plane** — reproducible components, immutable package identities, signatures, provenance, SBOMs, registries, and content-addressed caches.
+2. **Composition plane** — typed dependency graphs, exact locks, relationship grants, service routing, secrets, state, blobs, and declared ingress.
+3. **Execution plane** — rootless supervised workers, OS sandboxes, quotas, health checks, restart policy, upgrades, and rollback.
+4. **Operations plane** — desired-state reconciliation, logs, metrics, traces, snapshots, events, policy, garbage collection, and support capsules.
+5. **Fleet plane** — signed workload plans, authenticated agents, placement, rollout, device policy, encrypted transport, and failure recovery.
+
+This target deliberately excludes compatibility traps that would erase Cartridge's advantages. There is no ambient shell, bind-mount-anything flag, inherited environment, host networking mode, privileged cartridge, or raw device escape hatch. Typed services replace private virtual networks; named state and blob resources replace arbitrary host volumes; secret handles replace plaintext environment variables; explicit host adapters replace device passthrough.
+
+Success would mean Cartridge is a serious alternative for component applications, automation workers, extension systems, local-first services, creative pipelines, CI jobs, and managed edge workloads. General Linux distributions, kernel-dependent software, and existing OCI images remain better served by container engines.
+
 ### 1.1 — cartridge composition
 
 Purpose: let independently developed cartridges form applications and workflows through typed contracts.
 
 Work:
 
-- installed-cartridge catalog with immutable package identities
+- [implemented for direct graphs] installed-cartridge catalog with immutable package identities
 - transitive semantic-version resolver
 - [implemented] bounded exact-byte direct launch-plan lockfiles and verification
 - service discovery separated from permission
@@ -454,7 +482,7 @@ Work:
 Build order:
 
 1. [implemented] persist the direct resolver result as a create-new lock that binds package bytes, component/assets, versions, aliases, and interfaces
-2. resolve from the installed catalog and verify that every selected package still matches its library record
+2. [implemented for direct graphs] resolve from the installed catalog and verify that every selected package still matches its library record
 3. expand the lock into a transitive graph with side-by-side major versions and minimal unsatisfied-constraint diagnostics
 4. separate graph compatibility, user approval, and activation into independently inspectable documents
 5. supervise provider instances with deadlines, restart budgets, cancellation, and bounded queues before exposing calls
@@ -470,7 +498,75 @@ Exit criteria:
 - required, optional, cyclic, missing, and incompatible relationships have useful diagnostics
 - the same locked composition plan launches on each supported operating system
 
-### 1.2 — time-travel workbench
+### 1.2 — local engine and declarative stacks
+
+Purpose: turn the individual runtime subsystems into one rootless, inspectable application engine.
+
+Work:
+
+- a versioned `Cartridge.stack.toml` format for applications, providers, exact locks, state, blobs, secrets, ingress, schedules, budgets, and update policy
+- `stack validate`, `plan`, `apply`, `status`, `stop`, `remove`, `export`, and `import`
+- a per-user engine daemon over an authenticated local transport
+- one desired-state reconciler and append-only event journal
+- atomic plan application with preflight, staged activation, health gates, and rollback
+- instance identities separated from package identities
+- restart policies, exponential backoff, circuit breaking, graceful shutdown, and kill deadlines
+- named state and blob resources with ownership, retention, snapshot, restore, and clone policies
+- secret slots exposed as opaque operation handles rather than files or environment variables
+- typed service routing and declared HTTP ingress without ambient private networks
+- bounded structured logs, metrics, traces, and engine events with redaction policies
+- resource accounting and quotas per instance, stack, publisher, and user
+- orphan detection, content/store garbage collection, and disk-pressure behavior
+- development mode that can replace one component while preserving the rest of the graph
+- offline application bundles containing packages, signatures, lock, policy, and optional state
+
+Security order:
+
+1. specify the stack document, canonical digest, limits, and trust semantics
+2. implement an in-process planner with no mutation
+3. add a crash-recoverable journal and atomic local apply
+4. move lifecycle ownership into a per-user daemon with authenticated clients
+5. add platform-native worker sandboxes before remote or unattended workloads
+6. add secrets and ingress only after audit events, revocation, and redaction exist
+
+Exit criteria:
+
+- applying the same locked stack on Windows, macOS, and Linux selects identical portable artifacts
+- a failed or interrupted apply converges to either the previous healthy plan or the new healthy plan
+- every live process, grant, resource, route, and byte of durable state has an inspectable owner
+- stack removal cannot delete retained state, shared blobs, or another stack's resources
+- the engine daemon and its workers run without administrator privileges
+- no stack option grants ambient host filesystem, environment, process, network, or device authority
+
+### 1.3 — reproducible build graph and registry federation
+
+Purpose: make source-to-running-stack reproducible, cacheable, attestable, and usable by teams.
+
+Work:
+
+- a bounded build graph with explicit source, toolchain, dependency, component, asset, package, signature, and test nodes
+- hermetic builders with no network by default and declared fetch inputs
+- local and remote content-addressed caches keyed by canonical build inputs
+- multi-language SDK/toolchain lockfiles and compatibility matrices
+- reproducible package comparison with explanations for differing bytes
+- source, builder, dependency, and test provenance attestations
+- CycloneDX/SPDX SBOM export and vulnerability-policy gates
+- registry namespace policy, retention, mirrors, replication, and transparency proofs
+- resumable chunked push/pull with verified deltas
+- channels, immutable releases, staged promotion, deprecation, and emergency revocation
+- CI identities that can sign only approved namespaces and channels
+- public conformance records and benchmark artifacts tied to exact package identities
+- air-gapped cache and registry bundles
+
+Exit criteria:
+
+- a clean build can reproduce the same package identity from a complete source declaration
+- cache hits never bypass signature, provenance, policy, or compatibility verification
+- registries cannot silently replace an existing identity or version
+- a release can be traced from source revision through builder and tests to every deployed stack
+- offline builds and installs fail with an exact list of missing immutable inputs
+
+### 1.4 — time-travel workbench
 
 Purpose: make replay a complete debugger rather than only a host-call verifier.
 
@@ -498,7 +594,7 @@ Exit criteria:
 - checkpoint storage remains bounded for long sessions
 - debugger results are stable across supported platforms
 
-### 1.3 — programmable workspaces
+### 1.5 — programmable workspaces
 
 Purpose: let cartridges become building blocks for serious personal tools rather than isolated launchable apps.
 
@@ -528,7 +624,7 @@ Exit criteria:
 - secrets are never serialized into manifests or traces by default
 - a workspace can be inspected and validated without running it
 
-### 1.4 — trusted device mesh
+### 1.6 — trusted device mesh
 
 Purpose: let a user's cartridges and data move between their own devices without requiring a central service.
 
@@ -555,7 +651,7 @@ Exit criteria:
 - remote execution is always distinguishable from local execution
 - no registry account is required for direct device-to-device use
 
-### 1.5 — portable GPU and 3D
+### 1.7 — portable GPU and 3D
 
 Purpose: support modern interactive graphics without handing native device authority to a cartridge or pretending that every driver produces identical pixels.
 
@@ -583,7 +679,7 @@ Exit criteria:
 - the same cartridge runs through all supported backends with equivalent observable behavior
 - replay distinguishes command divergence from permitted driver-level pixel variation
 
-### 2.0 — multiple execution environments
+### 2.0 — fleet engine and multiple execution environments
 
 Purpose: keep the cartridge contract useful beyond one desktop process without pretending every host has identical capabilities.
 
@@ -611,6 +707,24 @@ Work:
 - fleet policy for managed installations
 - signed workload plans for servers
 - consistent trace exchange between host types
+- mutually authenticated per-host agents with short-lived enrollment credentials
+- signed desired-state plans and monotonic rollout generations
+- placement constraints, resource-fit scoring, affinities, anti-affinities, and maintenance drains
+- replicated stateless services and explicitly constrained stateful placement
+- rolling, canary, blue/green, and pause-on-regression deployment strategies
+- lease-based ownership so a network partition cannot create duplicate singleton jobs
+- encrypted service routing with local/remote identity visible in policy and traces
+- fleet-wide inventory, audit events, policy evaluation, and revocation
+- backup-aware rescheduling and disaster-recovery rehearsals
+
+Exit criteria:
+
+- a compromised worker cannot forge scheduler plans, publisher signatures, or another workload's identity
+- loss of the control plane does not grant new authority or erase healthy local workloads
+- partitions have documented fail-open or fail-closed behavior for every workload class
+- rollouts stop automatically when health, resource, replay, or policy gates regress
+- stateful workloads move only through an explicit snapshot/restore or replicated-state protocol
+- one command can explain why every instance is on its current host and artifact version
 
 ## Ambitious platform services
 
@@ -868,26 +982,37 @@ A capability is not complete when its host function works once. It is complete w
 
 The next concrete sequence is:
 
-1. Build reproducible state-and-trace capsules:
-   - [implemented] bind package/component identity, arguments, source snapshot, trace, result snapshot, and runtime version in one canonical manifest
-   - [implemented] add bounded create, inspect, and verify commands without embedding private state values by default
-   - [implemented] add capsule-to-capsule first-divergence reporting across identity, invocation, source, trace, and result state
-   - [implemented] replay a fully reverified capsule in a deadline-supervised worker and compare runtime, invocation, ordered events, output, and fuel
-   - [implemented] apply validated replay writes to a disposable source branch and independently reproduce the result-state digest
-   - minimize failing capsules while preserving the first divergence
-2. Finish content-addressed state integration:
-   - [implemented] define canonical digest-and-size references with fail-closed decoding
-   - [implemented] derive live reachability from checksum-validated snapshots and fully verified capsules
-   - [implemented] verify every artifact-derived retained object under the collection lock before deletion
-   - [implemented] add a checksummed reachability manifest that binds larger backup sets without rescanning every capsule
-   - [implemented] add deterministic verified inventory and bounded full-store integrity auditing
-   - sign root manifests once developer identities and trust-store policy exist
-   - define per-cartridge blob-store quotas and authorization before adding the streaming guest ABI
-3. [implemented] Generalize migration's conditional commit into guest-facing compare-exchange and bounded atomic batches, with trace events and ABA-safe portable revision tokens.
-4. [implemented] Add package-wide Merkle-style asset integrity and selective verification for streamed assets.
-5. Create a minimal 2D window and input prototype behind new WIT packages.
-6. Build a small trace and capsule viewer after there is enough real trace data to design around.
-7. Prototype crash-consistent composition activation only after package signing establishes trustworthy principals.
+1. Finish the 1.1 graph model:
+   - [implemented] exact-byte direct locks from explicit package paths
+   - [implemented] integrity-checked direct resolution from the installed catalog
+   - recursively expand manifests into a bounded graph without activating code
+   - support side-by-side incompatible major versions through instance-qualified nodes
+   - return a minimal unsatisfied constraint/interface explanation
+   - detect dependency and constructor-time activation cycles separately
+2. Specify relationship authority:
+   - define a canonical approved-graph document separate from the compatibility lock
+   - bind every grant to caller, provider identity, interface set, scope, expiry, and approval generation
+   - model session, persistent, policy-provided, and revoked edges
+   - prove that provider host authority never becomes caller authority
+3. Build the local composition supervisor:
+   - activate providers before wiring edges
+   - enforce per-call deadlines, cancellation trees, queue limits, and backpressure
+   - add restart budgets, circuit breaking, idle suspension, and crash isolation
+   - record activation, calls, failures, and revocation in deterministic traces
+4. Specify and implement `Cartridge.stack.toml` as a read-only planner first:
+   - instances and exact package locks
+   - named state/blob resources and retention
+   - service edges, grants, budgets, health, update, and restart policy
+   - canonical plan digest and human-readable diff
+5. Add crash-consistent local stack apply only after the planner and supervisor are independently tested:
+   - prepare/activate/commit journal
+   - health-gated rollback
+   - restart recovery and idempotent reconciliation
+6. Complete the external 1.0 security gates in parallel:
+   - platform-native worker sandboxes and kernel resource limits
+   - independent review and remediation record
+   - signed/notarized installers and rollback-tested release channels
+7. Move lifecycle ownership into a per-user engine daemon only after standalone stack apply is stable. A daemon magnifies state-machine and authorization mistakes, so it is not the first implementation of those semantics.
 
 Completed foundations:
 
@@ -908,7 +1033,7 @@ Completed foundations:
 - content-addressed blob storage with bounded streaming I/O, checksummed reachability manifests, deterministic inventory, full-store audits, and safe-by-default garbage collection
 - ABA-safe compare-exchange and bounded atomic state batches across all storage backends
 - Merkle-style package asset roots and selective payload verification
-- seeded archive, package-manifest, snapshot, trace, atomic-transaction, and blob-reachability fuzz targets with scheduled bounded runs
+- seeded archive, package-manifest, composition-lock, snapshot, trace, transaction, blob-reachability, media, network, release, GPU-stream, and WIT fuzz targets with scheduled bounded runs
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals
@@ -920,6 +1045,6 @@ Security work immediately ahead:
 1. [implemented] Bind package identity to a trusted developer signature before the public CLI treats a cartridge id as a durable-storage principal.
 2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
 3. [partially implemented] Trace redaction profiles are available; encrypted support bundles remain.
-4. [partially implemented] Keep expanding the seeded archive, manifest, snapshot, and trace fuzz suite; capsule and receipt parsers still need library boundaries before they can join it cleanly.
+4. [partially implemented] Keep expanding the seeded parser and protocol fuzz suite; capsule and receipt parsers still need library boundaries before they can join it cleanly.
 
-The project should not start a registry or marketplace before signing, capability UX, and the security model exist. Distribution magnifies every earlier design mistake.
+The local registry reference is useful protocol evidence, but public hosting or a marketplace must wait for independent review, operational abuse controls, provenance policy, and incident response. Distribution magnifies every earlier design mistake.

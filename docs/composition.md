@@ -143,6 +143,8 @@ An installed provider update must not silently alter the selected service contra
 ```sh
 cartridge resolve app.cartridge provider.cartridge --lock app.cartridge-lock.json
 cartridge resolve app.cartridge provider.cartridge --locked app.cartridge-lock.json
+cartridge library resolve dev.example.app --root library --lock app.cartridge-lock.json
+cartridge library resolve dev.example.app --root library --locked app.cartridge-lock.json
 ```
 
 Lock files are bounded, create-new JSON. Verification rebuilds the plan from fully validated packages and compares every recorded byte identity and edge. Duplicate candidate id/version pairs are rejected rather than allowing filesystem order to choose one.
@@ -200,7 +202,7 @@ Remote execution is a post-local-composition feature, not a shortcut around impl
 
 1. Manifest declarations and validation.
 2. Direct dependency resolver and CLI inspection.
-3. [partially implemented] Exact-byte direct lock plans are implemented; installed-catalog lookup remains.
+3. [implemented for direct graphs] Exact-byte lock plans and integrity-checked installed-catalog lookup.
 4. Persistent user grants.
 5. In-process broker for synchronous typed services.
 6. Async calls, cancellation, and activation supervision.

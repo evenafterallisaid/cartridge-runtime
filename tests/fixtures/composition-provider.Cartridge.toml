@@ -1,0 +1,13 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.composition-provider"
+name = "Composition Provider"
+version = "1.2.0"
+description = "library-backed composition test provider"
+
+[[services.provides]]
+name = "codec"
+interface = "cartridge:test/codec@1.0.0"
+visibility = "dependency"
+description = "test-only typed service"

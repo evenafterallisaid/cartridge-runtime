@@ -767,7 +767,7 @@ fn validate_human_text(value: &str, field: &str, max: usize, allow_empty: bool) 
     Ok(())
 }
 
-fn validate_interface(value: &str) -> Result<()> {
+pub(crate) fn validate_interface(value: &str) -> Result<()> {
     let Some((path, version)) = value.rsplit_once('@') else {
         return Err(Error::Manifest(format!(
             "interface must include a semantic version: {value:?}"

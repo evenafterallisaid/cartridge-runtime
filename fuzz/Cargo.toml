@@ -99,6 +99,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "composition-lock"
+path = "fuzz_targets/composition_lock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wit"
 path = "fuzz_targets/wit.rs"
 test = false

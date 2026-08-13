@@ -66,7 +66,7 @@ Isolation is the default, not a ban on cooperation. A cartridge may declare a de
 
 Calls will pass through a runtime broker. The caller receives the declared service interface, not the provider's memory, storage, or other capabilities. Any delegated resource is restricted to the intersection of provider authority, interface contract, caller grant, and resource scope.
 
-The manifest and direct resolver are implemented. Live multi-instance wiring and persistent user grants are not yet implemented. The full design is in [composition.md](composition.md).
+The manifest, direct resolver, exact-byte lock, and installed-library catalog resolution are implemented. Live multi-instance wiring and persistent relationship grants are not yet implemented. The full design is in [composition.md](composition.md).
 
 ## Tracing and replay
 

@@ -1,0 +1,15 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.composition-root"
+name = "Composition Root"
+version = "1.0.0"
+description = "library-backed composition test root"
+
+[[dependencies]]
+alias = "codec"
+cartridge = "dev.cartridge.composition-provider"
+version = "^1"
+interfaces = ["cartridge:test/codec@1.0.0"]
+optional = false
+reason = "exercises installed service resolution"

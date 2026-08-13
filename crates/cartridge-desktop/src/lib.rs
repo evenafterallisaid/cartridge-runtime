@@ -25,6 +25,8 @@ pub const MAX_LIBRARY_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_INSTALLED_PACKAGES: usize = 10_000;
 pub const MAX_LAUNCH_HISTORY: usize = 4096;
 pub const MAX_RESOURCE_SAMPLES_PER_LAUNCH: usize = 2048;
+pub const MAX_PROFILES: usize = 1024;
+pub const MAX_PROFILE_CARTRIDGES: usize = 256;
 pub const SAFE_MODE_CRASH_THRESHOLD: u32 = 3;
 pub const MAX_PACKAGE_FILE_BYTES: u64 = 160 * 1024 * 1024;
 const LIBRARY_LOCK_ATTEMPTS: usize = 200;
@@ -152,6 +154,15 @@ pub struct LibraryEntry {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct CatalogPackage {
+    pub cartridge_id: String,
+    pub version: String,
+    pub package_sha256: String,
+    pub package_bytes: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct PermissionPreflight {
     pub cartridge_id: String,
     pub version: String,
@@ -186,14 +197,19 @@ pub struct Library {
 impl Library {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
-        fs::create_dir_all(root.join("packages")).map_err(|error| error.to_string())?;
-        fs::create_dir_all(root.join("recovery")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        ensure_directory(&root.join("packages"))?;
+        ensure_directory(&root.join("recovery"))?;
+        let lock_path = root.join("library.lock");
+        if lock_path.exists() && !is_regular_file(&lock_path) {
+            return Err("library lock path is not a regular file".into());
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.join("library.lock"))
+            .open(lock_path)
             .map_err(|error| error.to_string())?;
         acquire_library_lock(&lock)?;
         let document_path = root.join("library.json");
@@ -222,7 +238,7 @@ impl Library {
 
     pub fn install(&mut self, package: &Path) -> Result<InstalledVersion, String> {
         let incoming = self.root.join("packages/.incoming");
-        fs::create_dir_all(&incoming).map_err(|error| error.to_string())?;
+        ensure_directory(&incoming)?;
         let sequence = INSTALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let staged = incoming.join(format!("{}-{sequence}.cartridge", std::process::id()));
         let (bytes, digest) = copy_bounded_and_hash(package, &staged, MAX_PACKAGE_FILE_BYTES)?;
@@ -233,6 +249,10 @@ impl Library {
                 return Err(error.to_string());
             }
         };
+        if archive.package_bytes != bytes || archive.package_sha256 != digest {
+            let _ = fs::remove_file(&staged);
+            return Err("incoming package changed while it was being installed".into());
+        }
         let id = archive.manifest.cartridge.id.clone();
         let version = archive.manifest.cartridge.version.clone();
         if self.total_versions() >= MAX_INSTALLED_PACKAGES
@@ -259,18 +279,21 @@ impl Library {
                 return Err("an installed version is immutable; use a new version number".into());
             }
             let existing_path = self.root.join(&existing.relative_path);
-            if !existing_path.is_file() || hash_file(&existing_path)? != digest {
+            if !is_regular_file(&existing_path)
+                || hash_file(&existing_path, MAX_PACKAGE_FILE_BYTES)? != digest
+            {
                 return Err("the installed package failed integrity verification".into());
             }
             return Ok(existing.clone());
         }
         let relative_path = format!("packages/{id}/{version}/{digest}.cartridge");
         let destination = self.root.join(&relative_path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
+        ensure_directory(&self.root.join("packages").join(&id))?;
+        ensure_directory(&self.root.join("packages").join(&id).join(&version))?;
         if destination.exists() {
-            if hash_file(&destination)? != digest {
+            if !is_regular_file(&destination)
+                || hash_file(&destination, MAX_PACKAGE_FILE_BYTES)? != digest
+            {
                 let _ = fs::remove_file(&staged);
                 return Err("installed package path has unexpected contents".into());
             }
@@ -580,8 +603,18 @@ impl Library {
     }
 
     pub fn set_profile(&mut self, name: &str, cartridges: BTreeSet<String>) -> Result<(), String> {
-        if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+        if !valid_text(name, 64, false) {
             return Err("profile name is invalid".into());
+        }
+        if cartridges.len() > MAX_PROFILE_CARTRIDGES {
+            return Err(format!(
+                "profile exceeds the {MAX_PROFILE_CARTRIDGES}-cartridge limit"
+            ));
+        }
+        if self.document.profiles.len() >= MAX_PROFILES
+            && !self.document.profiles.contains_key(name)
+        {
+            return Err(format!("library reached the {MAX_PROFILES}-profile limit"));
         }
         if cartridges
             .iter()
@@ -605,12 +638,37 @@ impl Library {
     }
 
     pub fn package_path(&self, id: &str, version: Option<&str>) -> Result<PathBuf, String> {
-        let (_, installed) = self.installed_version(id, version)?;
-        let path = self.root.join(&installed.relative_path);
-        if !path.is_file() || hash_file(&path)? != installed.package_sha256 {
-            return Err("installed package is missing or failed integrity verification".into());
+        Ok(self.catalog_package(id, version)?.path)
+    }
+
+    pub fn catalog_package(
+        &self,
+        id: &str,
+        version: Option<&str>,
+    ) -> Result<CatalogPackage, String> {
+        let (version, installed) = self.installed_version(id, version)?;
+        self.catalog_record(id, &version, installed)
+    }
+
+    pub fn catalog_versions(
+        &self,
+        id: &str,
+        maximum: usize,
+    ) -> Result<Vec<CatalogPackage>, String> {
+        let Some(versions) = self.document.installed.get(id) else {
+            return Ok(Vec::new());
+        };
+        if versions.len() > maximum {
+            return Err(format!(
+                "installed versions for {id} exceed the {maximum}-candidate resolution limit"
+            ));
         }
-        Ok(path)
+        let mut records = versions
+            .iter()
+            .map(|(version, installed)| self.catalog_record(id, version, installed))
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by(|left, right| compare_versions(&right.version, &left.version));
+        Ok(records)
     }
 
     #[must_use]
@@ -642,6 +700,30 @@ impl Library {
 
     fn total_versions(&self) -> usize {
         self.document.installed.values().map(BTreeMap::len).sum()
+    }
+
+    fn catalog_record(
+        &self,
+        id: &str,
+        version: &str,
+        installed: &InstalledVersion,
+    ) -> Result<CatalogPackage, String> {
+        let path = self.root.join(&installed.relative_path);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != installed.package_bytes
+            || hash_file(&path, MAX_PACKAGE_FILE_BYTES)? != installed.package_sha256
+        {
+            return Err("installed package is missing or failed integrity verification".into());
+        }
+        Ok(CatalogPackage {
+            cartridge_id: id.into(),
+            version: version.into(),
+            package_sha256: installed.package_sha256.clone(),
+            package_bytes: installed.package_bytes,
+            path,
+        })
     }
 
     fn recover_interrupted_launches(&mut self) -> Result<(), String> {
@@ -756,7 +838,11 @@ fn capability_request_digest(value: &BTreeSet<Capability>) -> String {
 }
 
 fn validate_document(value: &LibraryDocument) -> Result<(), String> {
-    if value.format_version != LIBRARY_FORMAT_VERSION {
+    if value.format_version != LIBRARY_FORMAT_VERSION
+        || !valid_text(&value.runtime_channel, 64, false)
+        || !valid_text(&value.runtime_version, 64, false)
+        || Version::parse(&value.runtime_version).is_err()
+    {
         return Err("unsupported library format".into());
     }
     if value.installed.values().map(BTreeMap::len).sum::<usize>() > MAX_INSTALLED_PACKAGES {
@@ -764,6 +850,9 @@ fn validate_document(value: &LibraryDocument) -> Result<(), String> {
     }
     if value.history.len() > MAX_LAUNCH_HISTORY {
         return Err("library history limit exceeded".into());
+    }
+    if value.profiles.len() > MAX_PROFILES {
+        return Err("library profile limit exceeded".into());
     }
     if value.history.iter().any(|record| {
         record.resource_samples.len() > MAX_RESOURCE_SAMPLES_PER_LAUNCH
@@ -782,13 +871,21 @@ fn validate_document(value: &LibraryDocument) -> Result<(), String> {
         return Err("launch record ids must be strictly increasing".into());
     }
     for (id, versions) in &value.installed {
+        if versions.is_empty() {
+            return Err("installed cartridge has no versions".into());
+        }
         for (version, installed) in versions {
-            Version::parse(version).map_err(|_| "invalid installed version".to_string())?;
+            if !valid_text(version, 64, false) || Version::parse(version).is_err() {
+                return Err("invalid installed version".into());
+            }
             let expected_prefix = format!("packages/{id}/{version}/");
-            if !installed.relative_path.starts_with(&expected_prefix)
-                || !installed.relative_path.ends_with(".cartridge")
-                || installed.relative_path.contains("..")
-                || installed.relative_path.contains('\\')
+            let expected_path = format!("{expected_prefix}{}.cartridge", installed.package_sha256);
+            if !valid_cartridge_id(id)
+                || installed.relative_path != expected_path
+                || installed.package_bytes == 0
+                || installed.package_bytes > MAX_PACKAGE_FILE_BYTES
+                || !valid_text(&installed.name, 128, false)
+                || !valid_text(&installed.description, 2048, true)
             {
                 return Err("unsafe installed package path".into());
             }
@@ -796,22 +893,49 @@ fn validate_document(value: &LibraryDocument) -> Result<(), String> {
                 || !installed
                     .package_sha256
                     .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
                 return Err("invalid installed package digest".into());
             }
         }
     }
     for (id, grant) in &value.grants {
-        if grant.cartridge_id != *id
+        if !valid_cartridge_id(id)
+            || grant.cartridge_id != *id
             || grant.approved_request_sha256.len() != 64
             || !grant
                 .approved_request_sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err("invalid persistent grant".into());
         }
+    }
+    for (name, profile) in &value.profiles {
+        if profile.name != *name
+            || !valid_text(name, 64, false)
+            || profile.cartridges.len() > MAX_PROFILE_CARTRIDGES
+            || profile
+                .cartridges
+                .iter()
+                .any(|id| !valid_cartridge_id(id) || !value.installed.contains_key(id))
+        {
+            return Err("invalid library profile".into());
+        }
+    }
+    if value.history.iter().any(|record| {
+        !valid_cartridge_id(&record.cartridge_id)
+            || !valid_text(&record.version, 64, false)
+            || Version::parse(&record.version).is_err()
+            || record
+                .trace_path
+                .as_deref()
+                .is_some_and(|path| sanitize_trace_path(path).is_err())
+    }) {
+        return Err("invalid library history".into());
+    }
+    if value.health.keys().any(|id| !valid_cartridge_id(id)) {
+        return Err("invalid library health record".into());
     }
     Ok(())
 }
@@ -828,9 +952,12 @@ fn acquire_library_lock(file: &File) -> Result<(), String> {
 }
 
 fn read_document(path: &Path) -> Result<LibraryDocument, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    if metadata.len() > MAX_LIBRARY_DOCUMENT_BYTES {
-        return Err("library document exceeds its size limit".into());
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_LIBRARY_DOCUMENT_BYTES
+    {
+        return Err("library document must be a bounded regular file".into());
     }
     let mut bytes = Vec::new();
     File::open(path)
@@ -923,9 +1050,14 @@ fn copy_bounded_and_hash(
         return Err(format!("package exceeds the {limit}-byte file limit"));
     }
     let mut input = File::open(source).map_err(|error| error.to_string())?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
         .open(destination)
         .map_err(|error| error.to_string())?;
     let result = (|| {
@@ -960,18 +1092,62 @@ fn copy_bounded_and_hash(
     result
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
+fn hash_file(path: &Path, limit: u64) -> Result<String, String> {
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
+    let mut total = 0_u64;
     loop {
         let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
         if read == 0 {
             break;
         }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| "package size overflow".to_string())?;
+        if total > limit {
+            return Err(format!(
+                "package exceeded the {limit}-byte limit while reading"
+            ));
+        }
         digest.update(&buffer[..read]);
     }
     Ok(hex::encode(digest.finalize()))
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+fn ensure_directory(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        fs::create_dir(path).map_err(|error| error.to_string())?;
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("library layout contains an unsafe directory".into());
+    }
+    Ok(())
+}
+
+fn valid_cartridge_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.split('.').count() >= 3
+        && value.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !segment.starts_with('-')
+                && !segment.ends_with('-')
+        })
+}
+
+fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.trim().is_empty())
+        && value.chars().count() <= maximum
+        && !value.chars().any(char::is_control)
 }
 
 fn newest_version(versions: &BTreeMap<String, InstalledVersion>) -> Option<&InstalledVersion> {
@@ -1055,6 +1231,31 @@ mod tests {
                 .missing
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn catalog_records_bind_the_installed_package_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        let installed = library.install(&package).unwrap();
+        let record = library.catalog_package("dev.test.demo", None).unwrap();
+
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.package_sha256, installed.package_sha256);
+        assert_eq!(
+            library.catalog_versions("dev.test.demo", 1).unwrap().len(),
+            1
+        );
+        assert!(library.catalog_versions("dev.test.demo", 0).is_err());
+
+        OpenOptions::new()
+            .append(true)
+            .open(&record.path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(library.catalog_package("dev.test.demo", None).is_err());
     }
 
     #[test]

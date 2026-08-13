@@ -16,10 +16,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use cartridge_core::{
-    CartridgeArchive, CompositionLock, LockedPackage, PackOptions, ResolutionPlan,
-    negotiate_platform, pack, resolve_dependencies,
+    CartridgeArchive, CompositionLock, LockedPackage, MAX_RESOLUTION_CANDIDATES, PackOptions,
+    ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
 };
-use cartridge_desktop::{Capability, LaunchStatus, Library};
+use cartridge_desktop::{Capability, CatalogPackage, LaunchStatus, Library};
 use cartridge_dev::{
     Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
     source_fingerprint,
@@ -534,6 +534,20 @@ enum LibraryCommand {
         root: PathBuf,
         #[arg(long)]
         query: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// resolve an installed cartridge against the verified library catalog
+    Resolve {
+        cartridge: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long, conflicts_with = "locked")]
+        lock: Option<PathBuf>,
+        #[arg(long, conflicts_with = "lock")]
+        locked: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -1320,6 +1334,21 @@ fn run_library_command(command: LibraryCommand) -> Result<()> {
             }
             Ok(())
         }
+        LibraryCommand::Resolve {
+            cartridge,
+            root,
+            version,
+            lock,
+            locked,
+            json,
+        } => library_resolve_command(
+            &root,
+            &cartridge,
+            version.as_deref(),
+            lock.as_deref(),
+            locked.as_deref(),
+            json,
+        ),
         LibraryCommand::Preflight {
             cartridge,
             root,
@@ -2950,14 +2979,26 @@ fn resolve_command(
 ) -> Result<()> {
     let root = CartridgeArchive::open(root_path)
         .with_context(|| format!("could not inspect {}", root_path.display()))?;
-    let mut manifests = Vec::with_capacity(candidates.len());
-    let mut packages = Vec::with_capacity(candidates.len());
-    for path in candidates {
-        let candidate = CartridgeArchive::open(path)
-            .with_context(|| format!("could not inspect {}", path.display()))?;
-        packages.push(locked_package(&candidate));
-        manifests.push(candidate.manifest);
-    }
+    let candidates = candidates
+        .iter()
+        .map(|path| {
+            CartridgeArchive::open(path)
+                .with_context(|| format!("could not inspect {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lock = composition_lock(&root, &candidates)?;
+    finish_resolution(&lock, json, lock_output, locked)
+}
+
+fn composition_lock(
+    root: &CartridgeArchive,
+    candidates: &[CartridgeArchive],
+) -> Result<CompositionLock> {
+    let manifests = candidates
+        .iter()
+        .map(|candidate| candidate.manifest.clone())
+        .collect::<Vec<_>>();
+    let packages = candidates.iter().map(locked_package).collect::<Vec<_>>();
     let plan = resolve_dependencies(&root.manifest, &manifests)?;
     let mut selected = Vec::with_capacity(plan.resolved.len());
     for dependency in &plan.resolved {
@@ -2974,12 +3015,19 @@ fn resolve_command(
             selected.push(package.clone());
         }
     }
-    let lock = CompositionLock::new(locked_package(&root), selected, plan.clone())
-        .map_err(anyhow::Error::msg)?;
+    CompositionLock::new(locked_package(root), selected, plan).map_err(anyhow::Error::msg)
+}
+
+fn finish_resolution(
+    lock: &CompositionLock,
+    json: bool,
+    lock_output: Option<&Path>,
+    locked: Option<&Path>,
+) -> Result<()> {
     if let Some(path) = locked {
         let expected: CompositionLock = serde_json::from_slice(&read_bounded_json(path)?)?;
         expected.validate().map_err(anyhow::Error::msg)?;
-        if expected != lock {
+        if &expected != lock {
             bail!("composition lock does not match the current package set");
         }
         println!("verified composition lock {}", path.display());
@@ -2990,11 +3038,57 @@ fn resolve_command(
         println!("locked composition plan -> {}", path.display());
     }
     if json {
-        println!("{}", serde_json::to_string_pretty(&plan)?);
+        println!("{}", serde_json::to_string_pretty(&lock.plan)?);
     } else {
         print_resolution(&lock.plan);
     }
     Ok(())
+}
+
+fn library_resolve_command(
+    root: &Path,
+    cartridge: &str,
+    version: Option<&str>,
+    lock_output: Option<&Path>,
+    locked: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let library = Library::open(root).map_err(anyhow::Error::msg)?;
+    let root_record = library
+        .catalog_package(cartridge, version)
+        .map_err(anyhow::Error::msg)?;
+    let root_archive = open_catalog_archive(&root_record)?;
+    let dependency_ids = root_archive
+        .manifest
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.cartridge.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for dependency in dependency_ids {
+        let remaining = MAX_RESOLUTION_CANDIDATES.saturating_sub(candidates.len());
+        for record in library
+            .catalog_versions(dependency, remaining)
+            .map_err(anyhow::Error::msg)?
+        {
+            candidates.push(open_catalog_archive(&record)?);
+        }
+    }
+    let lock = composition_lock(&root_archive, &candidates)?;
+    finish_resolution(&lock, json, lock_output, locked)
+}
+
+fn open_catalog_archive(record: &CatalogPackage) -> Result<CartridgeArchive> {
+    let archive = CartridgeArchive::open(&record.path)
+        .with_context(|| format!("could not inspect {}", record.path.display()))?;
+    if archive.manifest.cartridge.id != record.cartridge_id
+        || archive.manifest.cartridge.version != record.version
+        || archive.package_sha256 != record.package_sha256
+        || archive.package_bytes != record.package_bytes
+    {
+        bail!("installed package changed after catalog verification");
+    }
+    Ok(archive)
 }
 
 fn locked_package(archive: &CartridgeArchive) -> LockedPackage {

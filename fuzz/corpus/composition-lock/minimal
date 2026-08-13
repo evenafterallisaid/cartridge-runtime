@@ -1,0 +1,1 @@
+{"format_version":1,"root":{"cartridge_id":"dev.example.root","version":"1.0.0","package_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","package_bytes":1,"component_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","assets_root_sha256":""},"providers":[],"plan":{"resolved":[],"unavailable_optional":[]}}

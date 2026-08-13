@@ -12,8 +12,8 @@ pub use manifest::{
 };
 pub use pack::{PackOptions, pack};
 pub use resolver::{
-    COMPOSITION_LOCK_FORMAT_VERSION, CompositionLock, LockedPackage, ResolutionPlan, ResolveError,
-    ResolvedDependency, UnavailableDependency, resolve_dependencies,
+    COMPOSITION_LOCK_FORMAT_VERSION, CompositionLock, LockedPackage, MAX_RESOLUTION_CANDIDATES,
+    ResolutionPlan, ResolveError, ResolvedDependency, UnavailableDependency, resolve_dependencies,
 };
 
 use thiserror::Error;

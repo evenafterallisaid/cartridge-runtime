@@ -4,9 +4,10 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{PackageManifest, ServiceVisibility};
+use crate::{PackageManifest, ServiceVisibility, manifest::validate_interface};
 
 pub const COMPOSITION_LOCK_FORMAT_VERSION: u32 = 1;
+pub const MAX_RESOLUTION_CANDIDATES: usize = 4096;
 const MAX_LOCKED_PACKAGES: usize = 128;
 const MAX_LOCKED_PACKAGE_BYTES: u64 = 160 * 1024 * 1024;
 
@@ -40,6 +41,8 @@ pub enum ResolveError {
     InvalidManifest(String),
     #[error("candidate set contains duplicate package {cartridge} {version}")]
     DuplicateCandidate { cartridge: String, version: String },
+    #[error("candidate set exceeds the {maximum}-package limit")]
+    CandidateLimit { maximum: usize },
     #[error("required dependency {alias} ({cartridge} {version}) could not be resolved: {reason}")]
     RequiredUnavailable {
         alias: String,
@@ -118,10 +121,10 @@ impl CompositionLock {
                 || !aliases.insert(dependency.alias.as_str())
                 || dependency.interfaces.is_empty()
                 || dependency.interfaces.len() > 64
-                || dependency
-                    .interfaces
-                    .iter()
-                    .any(|interface| !is_bounded_text(interface, 256, false))
+                || dependency.interfaces.iter().any(|interface| {
+                    !is_bounded_text(interface, 256, false)
+                        || validate_interface(interface).is_err()
+                })
                 || !indexed
                     .contains_key(&(dependency.cartridge.as_str(), dependency.version.as_str()))
             {
@@ -149,6 +152,11 @@ pub fn resolve_dependencies(
     root: &PackageManifest,
     candidates: &[PackageManifest],
 ) -> Result<ResolutionPlan, ResolveError> {
+    if candidates.len() > MAX_RESOLUTION_CANDIDATES {
+        return Err(ResolveError::CandidateLimit {
+            maximum: MAX_RESOLUTION_CANDIDATES,
+        });
+    }
     root.validate()
         .map_err(|error| ResolveError::InvalidManifest(error.to_string()))?;
     for candidate in candidates {
@@ -385,6 +393,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_candidate_sets_are_rejected_before_validation() {
+        let root = manifest("dev.example.root", "1.0.0");
+        let candidates =
+            vec![provider("1.5.0", ServiceVisibility::Dependency); MAX_RESOLUTION_CANDIDATES + 1];
+
+        assert!(matches!(
+            resolve_dependencies(&root, &candidates),
+            Err(ResolveError::CandidateLimit { .. })
+        ));
+    }
+
+    #[test]
     fn composition_locks_bind_exact_packages_and_edges() {
         let provider = LockedPackage {
             cartridge_id: "dev.example.codec".into(),
@@ -422,8 +442,12 @@ mod tests {
         changed.providers[0].package_sha256 = "f".repeat(63);
         assert!(changed.validate().is_err());
 
-        let mut changed = lock;
+        let mut changed = lock.clone();
         changed.plan.resolved[0].alias = "invalid alias".into();
+        assert!(changed.validate().is_err());
+
+        let mut changed = lock;
+        changed.plan.resolved[0].interfaces[0] = "not-an-interface".into();
         assert!(changed.validate().is_err());
     }
 

@@ -141,6 +141,12 @@ jobs:
           cargo run -p cartridge-cli -- trace export hello.trace.json --output hello.timeline.json
           cargo run -p cartridge-cli -- conformance hello.cartridge -- CI
           cargo run -p cartridge-cli -- library install hello.cartridge --root library
+          cargo run -p cartridge-cli -- pack tests/fixtures/composition-root.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-root.cartridge
+          cargo run -p cartridge-cli -- pack tests/fixtures/composition-provider.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-provider.cartridge
+          cargo run -p cartridge-cli -- library install composition-root.cartridge --root library
+          cargo run -p cartridge-cli -- library install composition-provider.cartridge --root library
+          cargo run -p cartridge-cli -- library resolve dev.cartridge.composition-root --root library --lock composition.cartridge-lock.json
+          cargo run -p cartridge-cli -- library resolve dev.cartridge.composition-root --root library --locked composition.cartridge-lock.json
           cargo run -p cartridge-cli -- library preflight dev.cartridge.hello --root library
           cargo run -p cartridge-cli -- library grant dev.cartridge.hello clock assets storage --root library
           cargo run -p cartridge-cli -- library run dev.cartridge.hello --root library -- CI

@@ -28,7 +28,7 @@ The project now covers the path from a Rust component to a validated cartridge, 
 - State-reproducing capsule replay on disposable snapshot branches
 - Streaming content-addressed blobs with verified snapshot/capsule reachability and safe GC dry runs
 - Checksummed blob root manifests plus deterministic inventory and full-store integrity audits
-- Typed inter-cartridge service declarations and direct dependency resolution
+- Typed inter-cartridge service declarations, direct dependency resolution, exact locks, and verified installed-catalog resolution
 - Deterministic virtual windows, resolution-independent drawing, image/font assets, input queues, and PNG capture
 - Fixed-format audio graphs, sample-accurate events, bounded delay/effect nodes, deterministic WAV rendering, and callback telemetry
 - Visual, synthesizer, and effect reference cartridges
@@ -113,6 +113,8 @@ Install and launch through permission preflight:
 
 ```sh
 cargo run -p cartridge-cli -- library install dist/hello.cartridge --root dist/library
+cargo run -p cartridge-cli -- library resolve dev.example.app --root dist/library --lock app.cartridge-lock.json
+cargo run -p cartridge-cli -- library resolve dev.example.app --root dist/library --locked app.cartridge-lock.json
 cargo run -p cartridge-cli -- library preflight dev.cartridge.hello --root dist/library
 cargo run -p cartridge-cli -- library grant dev.cartridge.hello clock assets storage --root dist/library
 cargo run -p cartridge-cli -- library run dev.cartridge.hello --root dist/library -- Clyde
@@ -161,7 +163,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md) and [1.0 candidate review](docs/security-audit-1.0-rc.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete desktop platform.
+Read [the platform status](docs/platform-status.md) for an exact implemented-versus-missing breakdown, [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md) and [1.0 candidate review](docs/security-audit-1.0-rc.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete component platform.
 
 ## Status
 

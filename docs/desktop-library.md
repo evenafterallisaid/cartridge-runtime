@@ -6,6 +6,8 @@
 
 Installation first copies a package into a bounded staging file while hashing it, verifies that exact staged archive, then links it into a content-addressed location. A cartridge id and semantic version are immutable once installed. Search covers ids, names, descriptions, and installed versions. Profiles are validated sets of installed cartridge ids.
 
+The catalog can also act as the source for a direct composition lock. `cartridge library resolve <id> --root <library> --lock <file>` selects compatible installed providers without accepting caller-supplied package paths. Every selected record is checked for a regular content-addressed path, exact byte length and digest, then compared again with the bounded archive snapshot used by the resolver. `--locked` fails if any selected package or service edge changes.
+
 `.cartridge` file handling is recognized independently from OS registration. Platform installers can register the extension without changing the package-opening path. Runtime channel/version state is stored separately from cartridge versions so a shell updater can stage or roll back the runtime without rewriting installed packages.
 
 ## Permissions
