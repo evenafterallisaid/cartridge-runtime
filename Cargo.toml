@@ -13,7 +13,7 @@ members = [
     "crates/cartridge-storage",
     "crates/cartridge-trace",
 ]
-exclude = ["examples/hello-cartridge"]
+exclude = ["examples/hello-cartridge", "apps/cartridge-desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

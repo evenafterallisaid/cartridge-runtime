@@ -20,6 +20,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Network | Replayable scoped HTTP, encrypted peer-session primitives, verified asset transfer, CRDT document primitives, and deterministic simulation |
 | Compose | Typed dependency/provider declarations, direct semantic-version resolution, exact-byte lockfiles, and verified resolution from the installed library catalog |
 | Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, and a checksum-chained desired-state journal |
+| Desktop | Native Tauri shell with overview, library, stack, journal, and settings views; exact plan and permission review; package re-verification; apply/stop/remove controls; persistent light/dark themes, density, motion, and safe new-stack defaults |
 | Quality | Cross-platform CI, parser fuzz targets, deterministic soak/benchmark tooling, compatibility policy, threat model, and RustSec dependency audit |
 
 ## What does not exist yet
@@ -38,7 +39,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Hermetic build engine | Developer builds work, but source/toolchain lockfiles, sandboxed build graphs, remote cache, provenance, and SBOM gates do not |
 | Hosted/federated registry | The local registry proves protocol behavior; production storage, federation, transparency operations, mirrors, and account policy do not exist |
 | Fleet scheduler | Peer primitives are not a cluster: there is no control plane, agent enrollment, placement, leases, rollout, drain, or stateful failover |
-| Native desktop shell | Library and presenter policy are implemented as reference libraries/CLI flows; a polished permission UI and native adapters remain |
+| Complete desktop workflow | The first native control-plane shell works; package import, logs, traces, settings, secret prompts, updates, accessibility polish, signed installers, and native adapters remain |
 | Independent assurance | The project has internal audits and regression PoCs, but not an independent security assessment or stable release support record |
 
 ## The honest Docker comparison

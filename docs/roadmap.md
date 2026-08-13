@@ -1015,10 +1015,12 @@ The next concrete sequence is:
    - independent review and remediation record
    - signed/notarized installers and rollback-tested release channels
 7. Move lifecycle ownership into a per-user engine daemon only after standalone stack apply is stable. A daemon magnifies state-machine and authorization mistakes, so it is not the first implementation of those semantics.
-8. Build the desktop shell over the same authenticated local API:
-   - library, stack, process, resource, permission, and event views
-   - plan diff and permission confirmation before apply
-   - live logs, health, resource charts, trace inspection, and rollback controls
+8. [partially implemented] Build the desktop shell over the same control-plane types:
+   - [implemented] native Tauri shell with library, stack, security posture, and event views
+   - [implemented] exact plan and permission review with server-retained digest and package re-verification before apply
+   - [implemented] private native-backed appearance and new-stack preferences with light/dark/system themes, density, and reduced-motion control
+   - add process/resource views, semantic plan diff, package import, and secret prompts
+   - add live logs, health, resource charts, trace inspection, and rollback controls
    - no privileged background service by default; explicit elevation only for optional adapters
 9. Grow from one machine toward an authority-minimal fleet:
    - signed node enrollment, short-lived leases, placement constraints, and drain

@@ -6,3 +6,7 @@ target/
 Thumbs.db
 .idea/
 .vscode/
+apps/cartridge-desktop/node_modules/
+apps/cartridge-desktop/dist/
+apps/cartridge-desktop/src-tauri/target/
+apps/cartridge-desktop/src-tauri/gen/schemas/

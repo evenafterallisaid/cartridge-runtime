@@ -475,6 +475,22 @@ impl StackPlan {
         Ok(value)
     }
 
+    pub fn verify_installed(&self, library: &Library) -> Result<(), String> {
+        self.validate()?;
+        let mut checked = BTreeSet::new();
+        for instance in &self.instances {
+            for package in std::iter::once(&instance.composition.root)
+                .chain(instance.composition.providers.iter())
+            {
+                let key = (package.cartridge_id.as_str(), package.version.as_str());
+                if checked.insert(key) {
+                    verify_locked_package_installed(package, library)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn computed_sha256(&self) -> Result<String, String> {
         let mut value = self.clone();
         value.plan_sha256.clear();
@@ -1037,6 +1053,18 @@ fn open_catalog_archive(record: &CatalogPackage) -> Result<CartridgeArchive, Str
     Ok(archive)
 }
 
+fn verify_locked_package_installed(
+    package: &LockedPackage,
+    library: &Library,
+) -> Result<(), String> {
+    let record = library.catalog_package(&package.cartridge_id, Some(&package.version))?;
+    let archive = open_catalog_archive(&record)?;
+    if locked_package(&archive) != *package {
+        return Err("installed package no longer matches the reviewed plan".into());
+    }
+    Ok(())
+}
+
 fn locked_package(archive: &CartridgeArchive) -> LockedPackage {
     LockedPackage {
         cartridge_id: archive.manifest.cartridge.id.clone(),
@@ -1417,6 +1445,22 @@ mod tests {
         detached.instances[0].package_sha256 = "0".repeat(64);
         detached.plan_sha256 = detached.computed_sha256().unwrap();
         assert!(detached.validate().is_err());
+    }
+
+    #[test]
+    fn reviewed_plans_recheck_every_installed_package_before_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let plan = StackPlan::build(&manifest(SandboxPolicy::Required), &library).unwrap();
+        assert!(plan.verify_installed(&library).is_ok());
+
+        let record = library
+            .catalog_package("dev.test.engine", Some("1.0.0"))
+            .unwrap();
+        fs::write(record.path, b"changed after review").unwrap();
+        assert!(plan.verify_installed(&library).is_err());
     }
 
     #[test]

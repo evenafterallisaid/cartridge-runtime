@@ -1,4 +1,12 @@
-# Cartridge Runtime
+<p align="center">
+  <img src="apps/cartridge-desktop/app-icon.svg" width="112" height="112" alt="Cartridge logo">
+</p>
+
+<h1 align="center">Cartridge Runtime</h1>
+
+<p align="center"><strong>Portable WebAssembly applications with explicit capabilities, reproducible state, and a local-first control plane.</strong></p>
+
+<p align="center">Component Model · Capability security · Deterministic replay · Native desktop</p>
 
 Cartridge Runtime is an experimental, capability-based host for portable WebAssembly applications. An application and its assets are packed into one `.cartridge` file, then run through the same versioned interface on Windows, macOS, and Linux.
 
@@ -132,6 +140,16 @@ cargo run -p cartridge-cli -- stack events hello-stack --root dist/engine
 
 Stack planning resolves installed versions to exact package and composition hashes. Apply records the desired state in a private, checksum-chained journal and is idempotent. It does not launch or reconcile instances yet; the supervisor and per-user engine process are the next control-plane layers.
 
+Run the native desktop shell:
+
+```sh
+cd apps/cartridge-desktop
+npm ci
+npm run tauri dev
+```
+
+The first shell shows the local library, stacks, security posture, event history, and native-backed settings. It can load a stack manifest, review its exact hashes and effective permissions, apply the reviewed digest, stop it, and tombstone it. The backend retains the reviewed plan outside the webview and re-verifies every installed package before apply. Light, dark, density, motion, and new-stack defaults persist in the private app-data directory.
+
 Build and run the visual reference with a replayable screenshot sidecar:
 
 ```sh
@@ -168,6 +186,7 @@ crates/cartridge-runtime/   Wasmtime host, permissions, and execution limits
 crates/cartridge-storage/   isolated state backends, snapshots, and content-addressed blobs
 crates/cartridge-trace/     versioned trace model, validation, and comparison
 crates/cartridge-cli/       pack, inspect, and run commands
+apps/cartridge-desktop/     Tauri desktop control-plane shell
 examples/hello-cartridge/   minimal Rust component and packaged asset
 examples/visual-cartridge/  deterministic 2D and input reference
 examples/synth-cartridge/   sample-accurate synth reference
@@ -176,7 +195,7 @@ wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
 
-Read [the platform status](docs/platform-status.md) for an exact implemented-versus-missing breakdown, [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md), [1.0 candidate review](docs/security-audit-1.0-rc.md), and [engine review](docs/security-audit-engine-0.1.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete component platform.
+Read [the platform status](docs/platform-status.md) for an exact implemented-versus-missing breakdown, [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md), [1.0 candidate review](docs/security-audit-1.0-rc.md), [engine review](docs/security-audit-engine-0.1.md), and [desktop review](docs/security-audit-desktop-0.1.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete component platform.
 
 ## Status
 
