@@ -1272,13 +1272,15 @@ fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
-fn private_options(_options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        _options.mode(0o600);
-    }
+#[cfg(unix)]
+fn private_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.mode(0o600);
 }
+
+#[cfg(not(unix))]
+fn private_options(_: &mut OpenOptions) {}
 
 fn valid_name(value: &str) -> bool {
     !value.is_empty()
