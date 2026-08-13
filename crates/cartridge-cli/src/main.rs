@@ -24,6 +24,7 @@ use cartridge_dev::{
     Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
     source_fingerprint,
 };
+use cartridge_engine::{EngineStore, StackManifest, StackPlan};
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
     read_rotation, read_signature, write_revocation, write_rotation, write_signature,
@@ -158,6 +159,11 @@ enum Command {
     Library {
         #[command(subcommand)]
         command: LibraryCommand,
+    },
+    /// plan and manage declarative cartridge stacks
+    Stack {
+        #[command(subcommand)]
+        command: StackCommand,
     },
     /// build a cartridge archive from a manifest and component
     Pack {
@@ -618,6 +624,77 @@ enum LibraryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// validate a stack manifest without consulting installed packages
+    Validate {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// resolve a stack into an exact, side-effect-free plan
+    Plan {
+        file: PathBuf,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// append an exact plan to the crash-consistent desired-state journal
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        allow_insecure: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// list known stacks and their desired state
+    List {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// inspect one stack's latest desired state
+    Status {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// set every instance in a stack to stopped
+    Stop {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// tombstone a stack while retaining its audit journal
+    Remove {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// show the checksum-chained control-plane event history
+    Events {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum LibraryProfileCommand {
     /// create or replace a profile
     Set {
@@ -948,6 +1025,7 @@ fn run_cli() -> Result<()> {
             args,
         } => conformance_command(&package, json, &args),
         Command::Library { command } => run_library_command(command),
+        Command::Stack { command } => run_stack_command(command),
         Command::Pack {
             manifest,
             component,
@@ -1484,6 +1562,190 @@ fn run_library_command(command: LibraryCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_stack_command(command: StackCommand) -> Result<()> {
+    match command {
+        StackCommand::Validate { file, json } => {
+            let manifest = StackManifest::read(&file).map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            } else {
+                println!(
+                    "validated stack {} with {} instance(s)",
+                    manifest.name,
+                    manifest.instances.len()
+                );
+            }
+            Ok(())
+        }
+        StackCommand::Plan {
+            file,
+            library,
+            output,
+            json,
+        } => {
+            let plan = build_stack_plan(&file, &library)?;
+            if let Some(path) = output {
+                write_private(&path, &serde_json::to_vec_pretty(&plan)?)?;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_stack_plan(&plan);
+            }
+            Ok(())
+        }
+        StackCommand::Apply {
+            file,
+            library,
+            root,
+            allow_insecure,
+            json,
+        } => {
+            let plan = build_stack_plan(&file, &library)?;
+            let report = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .apply(&plan, allow_insecure)
+                .map_err(anyhow::Error::msg)?;
+            print_stack_report(&report, json)
+        }
+        StackCommand::List { root, json } => {
+            let statuses = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .list()
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else {
+                for status in statuses {
+                    println!(
+                        "{} {:?} revision={} instances={} replicas={}",
+                        status.stack,
+                        status.state,
+                        status.revision,
+                        status.instance_count,
+                        status.desired_replicas
+                    );
+                }
+            }
+            Ok(())
+        }
+        StackCommand::Status { stack, root, json } => {
+            let status = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .status(&stack)
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "{} {:?} revision={}",
+                    status.stack, status.state, status.revision
+                );
+                println!("instances: {}", status.instance_count);
+                println!("desired replicas: {}", status.desired_replicas);
+                println!(
+                    "plan: {}",
+                    status.plan_sha256.as_deref().unwrap_or("removed")
+                );
+            }
+            Ok(())
+        }
+        StackCommand::Stop { stack, root, json } => {
+            let report = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .stop(&stack)
+                .map_err(anyhow::Error::msg)?;
+            print_stack_report(&report, json)
+        }
+        StackCommand::Remove { stack, root, json } => {
+            let report = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .remove(&stack)
+                .map_err(anyhow::Error::msg)?;
+            print_stack_report(&report, json)
+        }
+        StackCommand::Events { stack, root, json } => {
+            let events = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .events(&stack)
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                for event in events {
+                    println!(
+                        "{} {:?} {} {}",
+                        event.revision, event.kind, event.created_at_ms, event.event_sha256
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn build_stack_plan(file: &Path, library: &Path) -> Result<StackPlan> {
+    let manifest = StackManifest::read(file).map_err(anyhow::Error::msg)?;
+    let library = Library::open(library).map_err(anyhow::Error::msg)?;
+    StackPlan::build(&manifest, &library).map_err(anyhow::Error::msg)
+}
+
+fn print_stack_plan(plan: &StackPlan) {
+    println!("stack: {}", plan.stack);
+    println!("plan sha256: {}", plan.plan_sha256);
+    println!(
+        "security: {:?}, sandbox {:?}",
+        plan.security.profile, plan.security.sandbox
+    );
+    println!("instances:");
+    for instance in &plan.instances {
+        println!(
+            "  {}: {} {} x{} {:?}",
+            instance.name,
+            instance.cartridge_id,
+            instance.version,
+            instance.replicas,
+            instance.desired
+        );
+        println!("    package: {}", instance.package_sha256);
+        println!("    allowed: {}", stack_capability_list(&instance.allowed));
+        println!("    denied: {}", stack_capability_list(&instance.denied));
+    }
+    for warning in &plan.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn print_stack_report(report: &cartridge_engine::ApplyReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        let action = if report.changed {
+            "updated"
+        } else {
+            "unchanged"
+        };
+        println!(
+            "{} {} {:?} revision={}",
+            action, report.status.stack, report.status.state, report.status.revision
+        );
+        println!("event sha256: {}", report.status.event_sha256);
+    }
+    Ok(())
+}
+
+fn stack_capability_list(value: &BTreeSet<cartridge_engine::StackCapability>) -> String {
+    if value.is_empty() {
+        return "none".into();
+    }
+    value
+        .iter()
+        .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn library_run_command(

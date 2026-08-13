@@ -1,0 +1,23 @@
+[package]
+name = "cartridge-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cartridge-core = { path = "../cartridge-core" }
+cartridge-desktop = { path = "../cartridge-desktop" }
+fs4 = "1.1.0"
+hex.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

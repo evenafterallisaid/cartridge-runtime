@@ -80,11 +80,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cartridge-engine"
+version = "0.1.0"
+dependencies = [
+ "cartridge-core",
+ "cartridge-desktop",
+ "fs4",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "cartridge-fuzz"
 version = "0.0.0"
 dependencies = [
  "cartridge-core",
  "cartridge-desktop",
+ "cartridge-engine",
  "cartridge-media",
  "cartridge-network",
  "cartridge-release",

@@ -14,6 +14,7 @@ anyhow.workspace = true
 cartridge-core = { path = "../cartridge-core" }
 cartridge-desktop = { path = "../cartridge-desktop" }
 cartridge-dev = { path = "../cartridge-dev" }
+cartridge-engine = { path = "../cartridge-engine" }
 cartridge-identity = { path = "../cartridge-identity" }
 cartridge-network = { path = "../cartridge-network" }
 cartridge-release = { path = "../cartridge-release" }

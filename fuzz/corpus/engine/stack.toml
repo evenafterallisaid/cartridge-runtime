@@ -1,0 +1,8 @@
+format_version = 1
+name = "fuzz-stack"
+
+[[instances]]
+name = "app"
+cartridge = "dev.cartridge.fuzz"
+version = "^1"
+allow = ["clock"]

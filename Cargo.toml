@@ -5,6 +5,7 @@ members = [
     "crates/cartridge-release",
     "crates/cartridge-dev",
     "crates/cartridge-desktop",
+    "crates/cartridge-engine",
     "crates/cartridge-media",
     "crates/cartridge-cli",
     "crates/cartridge-core",

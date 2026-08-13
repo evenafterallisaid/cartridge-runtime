@@ -201,6 +201,7 @@ dependencies = [
  "cartridge-core",
  "cartridge-desktop",
  "cartridge-dev",
+ "cartridge-engine",
  "cartridge-identity",
  "cartridge-network",
  "cartridge-release",
@@ -249,6 +250,22 @@ name = "cartridge-dev"
 version = "0.1.0"
 dependencies = [
  "cartridge-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "cartridge-engine"
+version = "0.1.0"
+dependencies = [
+ "cartridge-core",
+ "cartridge-desktop",
+ "fs4",
+ "hex",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

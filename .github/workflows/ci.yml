@@ -141,6 +141,16 @@ jobs:
           cargo run -p cartridge-cli -- trace export hello.trace.json --output hello.timeline.json
           cargo run -p cartridge-cli -- conformance hello.cartridge -- CI
           cargo run -p cartridge-cli -- library install hello.cartridge --root library
+          cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.stack.toml
+          cargo run -p cartridge-cli -- stack plan tests/fixtures/Cartridge.stack.toml --library library --output hello.stack-plan.json
+          cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
+          cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
+          cargo run -p cartridge-cli -- stack list --root engine
+          cargo run -p cartridge-cli -- stack status hello-stack --root engine
+          cargo run -p cartridge-cli -- stack events hello-stack --root engine
+          cargo run -p cartridge-cli -- stack stop hello-stack --root engine
+          cargo run -p cartridge-cli -- stack remove hello-stack --root engine
+          cargo run -p cartridge-cli -- stack status hello-stack --root engine
           cargo run -p cartridge-cli -- pack tests/fixtures/composition-root.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-root.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/composition-provider.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-provider.cartridge
           cargo run -p cartridge-cli -- library install composition-root.cartridge --root library

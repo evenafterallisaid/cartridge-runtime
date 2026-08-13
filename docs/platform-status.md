@@ -19,6 +19,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Distribute | Local signed registry reference, content identities, publishing/resolution/audit, and signed runtime update/install/rollback |
 | Network | Replayable scoped HTTP, encrypted peer-session primitives, verified asset transfer, CRDT document primitives, and deterministic simulation |
 | Compose | Typed dependency/provider declarations, direct semantic-version resolution, exact-byte lockfiles, and verified resolution from the installed library catalog |
+| Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, and a checksum-chained desired-state journal |
 | Quality | Cross-platform CI, parser fuzz targets, deterministic soak/benchmark tooling, compatibility policy, threat model, and RustSec dependency audit |
 
 ## What does not exist yet
@@ -29,9 +30,9 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Live service broker | Manifests and locks describe service edges, but one cartridge cannot yet invoke another through those typed interfaces |
 | Transitive graph solver | Resolution currently handles one root's direct dependencies; it does not yet solve a whole graph, cycles, side-by-side majors, or minimal conflicts |
 | Relationship authorization | Capability grants exist for individual cartridges, but per-service-edge persistent/session grants and revocation are not wired into activation |
-| Multi-instance supervisor | There is no provider activation, idle suspension, restart budget, cancellation tree, backpressure, or stack-wide lifecycle |
+| Multi-instance supervisor | The engine records multi-instance desired state but does not yet activate providers, enforce restart budgets, suspend idle instances, or apply cancellation and backpressure |
 | Engine daemon | Commands are standalone; no per-user control plane owns desired state, reconciles crashes, or exposes one authenticated local API |
-| Stack format | There is no Compose-like declarative document for instances, services, state, secrets, ingress, jobs, health, and update policy |
+| Complete stack schema | Instances, exact packages, resources, secret slots, restart intent, and security policy work; services, ingress, jobs, health checks, rollout policy, and runtime secret delivery remain |
 | Service ingress | HTTP is outbound and fixtureable; inbound routes, TLS identity, rate limits, and typed ingress policy are not implemented |
 | Secret broker | There are developer keys and trust stores, but no runtime secret slots, operation-scoped use, audit trail, or hardware-backed provider |
 | Hermetic build engine | Developer builds work, but source/toolchain lockfiles, sandboxed build graphs, remote cache, provenance, and SBOM gates do not |

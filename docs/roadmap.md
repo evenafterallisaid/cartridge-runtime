@@ -999,20 +999,32 @@ The next concrete sequence is:
    - enforce per-call deadlines, cancellation trees, queue limits, and backpressure
    - add restart budgets, circuit breaking, idle suspension, and crash isolation
    - record activation, calls, failures, and revocation in deterministic traces
-4. Specify and implement `Cartridge.stack.toml` as a read-only planner first:
-   - instances and exact package locks
-   - named state/blob resources and retention
-   - service edges, grants, budgets, health, update, and restart policy
-   - canonical plan digest and human-readable diff
-5. Add crash-consistent local stack apply only after the planner and supervisor are independently tested:
-   - prepare/activate/commit journal
-   - health-gated rollback
-   - restart recovery and idempotent reconciliation
+4. [partially implemented] Extend `Cartridge.stack.toml` beyond its first control-plane slice:
+   - [implemented] bounded instances, version requirements, exact package and composition locks
+   - [implemented] named state/blob resources, retention intent, quotas, and declared secret slots
+   - [implemented] strict/balanced/permissive capability policy with explicit grants and blocks
+   - add service edges, budgets, health checks, jobs, ingress, and rollout policy
+   - add a semantic plan diff alongside the implemented canonical plan digest
+5. [partially implemented] Turn the local desired-state engine into a reconciler:
+   - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
+   - add prepare/activate/commit phases and recovery checkpoints
+   - add health-gated rollback, restart recovery, and process reconciliation
+   - compact long journals through signed checkpoints without losing auditability
 6. Complete the external 1.0 security gates in parallel:
    - platform-native worker sandboxes and kernel resource limits
    - independent review and remediation record
    - signed/notarized installers and rollback-tested release channels
 7. Move lifecycle ownership into a per-user engine daemon only after standalone stack apply is stable. A daemon magnifies state-machine and authorization mistakes, so it is not the first implementation of those semantics.
+8. Build the desktop shell over the same authenticated local API:
+   - library, stack, process, resource, permission, and event views
+   - plan diff and permission confirmation before apply
+   - live logs, health, resource charts, trace inspection, and rollback controls
+   - no privileged background service by default; explicit elevation only for optional adapters
+9. Grow from one machine toward an authority-minimal fleet:
+   - signed node enrollment, short-lived leases, placement constraints, and drain
+   - deterministic rollout plans and health-gated canaries
+   - content-addressed package distribution and verified state transfer
+   - preserve the same cartridge capability boundary on every node
 
 Completed foundations:
 
