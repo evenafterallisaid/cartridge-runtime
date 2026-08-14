@@ -1,0 +1,19 @@
+format_version = 1
+name = "hello-budget-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "hello"
+cartridge = "dev.cartridge.hello"
+version = "^0.1"
+replicas = 1
+restart = "never"
+max_restarts = 0
+
+[instances.limits]
+fuel = 1
+memory_bytes = 8388608
+timeout_ms = 1000

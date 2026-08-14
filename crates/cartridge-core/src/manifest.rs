@@ -95,65 +95,7 @@ impl PackageManifest {
         }
         self.compatibility.validate(self)?;
 
-        if !(1..=MAX_FUEL).contains(&self.runtime.fuel) {
-            return Err(Error::Manifest(format!(
-                "runtime fuel must be between 1 and {MAX_FUEL}"
-            )));
-        }
-        if !(1024 * 1024..=MAX_MEMORY_BYTES).contains(&self.runtime.memory_bytes) {
-            return Err(Error::Manifest(format!(
-                "runtime memory_bytes must be between 1 MiB and {} MiB",
-                MAX_MEMORY_BYTES / 1024 / 1024
-            )));
-        }
-        if !(1..=MAX_TIMEOUT_MS).contains(&self.runtime.timeout_ms) {
-            return Err(Error::Manifest(format!(
-                "runtime timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
-            )));
-        }
-        if !(1..=MAX_STORAGE_BYTES).contains(&self.runtime.storage_bytes) {
-            return Err(Error::Manifest(format!(
-                "runtime storage_bytes must be between 1 and {MAX_STORAGE_BYTES}"
-            )));
-        }
-        if !(1..=MAX_STORAGE_KEYS).contains(&self.runtime.storage_keys) {
-            return Err(Error::Manifest(format!(
-                "runtime storage_keys must be between 1 and {MAX_STORAGE_KEYS}"
-            )));
-        }
-        if self.runtime.storage_value_bytes == 0
-            || self.runtime.storage_value_bytes > self.runtime.storage_bytes
-            || self.runtime.storage_value_bytes > MAX_STORAGE_VALUE_BYTES
-        {
-            return Err(Error::Manifest(format!(
-                "runtime storage_value_bytes must be positive, no larger than storage_bytes, and at most {MAX_STORAGE_VALUE_BYTES}"
-            )));
-        }
-        if !(1..=MAX_GRAPHICS_PIXELS).contains(&self.runtime.graphics_pixels) {
-            return Err(Error::Manifest(format!(
-                "runtime graphics_pixels must be between 1 and {MAX_GRAPHICS_PIXELS}"
-            )));
-        }
-        if !(1..=MAX_GRAPHICS_COMMANDS).contains(&self.runtime.graphics_commands) {
-            return Err(Error::Manifest(format!(
-                "runtime graphics_commands must be between 1 and {MAX_GRAPHICS_COMMANDS}"
-            )));
-        }
-        if !(1..=MAX_AUDIO_NODES).contains(&self.runtime.audio_nodes) {
-            return Err(Error::Manifest(format!(
-                "runtime audio_nodes must be between 1 and {MAX_AUDIO_NODES}"
-            )));
-        }
-        if !(1..=MAX_AUDIO_EVENTS).contains(&self.runtime.audio_events) {
-            return Err(Error::Manifest(format!(
-                "runtime audio_events must be between 1 and {MAX_AUDIO_EVENTS}"
-            )));
-        }
-        if !(1..=MAX_AUDIO_FRAMES).contains(&self.runtime.audio_frames) {
-            return Err(Error::Manifest(format!(
-                "runtime audio_frames must be between 1 and {MAX_AUDIO_FRAMES}"
-            )));
-        }
+        self.runtime.validate()?;
 
         validate_state(self)?;
 
@@ -391,7 +333,7 @@ fn http_policy_is_empty(value: &HttpPolicy) -> bool {
     value.scopes.is_empty()
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimits {
     pub fuel: u64,
@@ -405,6 +347,109 @@ pub struct RuntimeLimits {
     pub audio_nodes: usize,
     pub audio_events: usize,
     pub audio_frames: u64,
+}
+
+impl RuntimeLimits {
+    #[must_use]
+    pub const fn maximum() -> Self {
+        Self {
+            fuel: MAX_FUEL,
+            memory_bytes: MAX_MEMORY_BYTES,
+            timeout_ms: MAX_TIMEOUT_MS,
+            storage_bytes: MAX_STORAGE_BYTES,
+            storage_keys: MAX_STORAGE_KEYS,
+            storage_value_bytes: MAX_STORAGE_VALUE_BYTES,
+            graphics_pixels: MAX_GRAPHICS_PIXELS,
+            graphics_commands: MAX_GRAPHICS_COMMANDS,
+            audio_nodes: MAX_AUDIO_NODES,
+            audio_events: MAX_AUDIO_EVENTS,
+            audio_frames: MAX_AUDIO_FRAMES,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_FUEL).contains(&self.fuel) {
+            return Err(Error::Manifest(format!(
+                "runtime fuel must be between 1 and {MAX_FUEL}"
+            )));
+        }
+        if !(1024 * 1024..=MAX_MEMORY_BYTES).contains(&self.memory_bytes) {
+            return Err(Error::Manifest(format!(
+                "runtime memory_bytes must be between 1 MiB and {} MiB",
+                MAX_MEMORY_BYTES / 1024 / 1024
+            )));
+        }
+        if !(1..=MAX_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return Err(Error::Manifest(format!(
+                "runtime timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
+            )));
+        }
+        if !(1..=MAX_STORAGE_BYTES).contains(&self.storage_bytes) {
+            return Err(Error::Manifest(format!(
+                "runtime storage_bytes must be between 1 and {MAX_STORAGE_BYTES}"
+            )));
+        }
+        if !(1..=MAX_STORAGE_KEYS).contains(&self.storage_keys) {
+            return Err(Error::Manifest(format!(
+                "runtime storage_keys must be between 1 and {MAX_STORAGE_KEYS}"
+            )));
+        }
+        if self.storage_value_bytes == 0
+            || self.storage_value_bytes > self.storage_bytes
+            || self.storage_value_bytes > MAX_STORAGE_VALUE_BYTES
+        {
+            return Err(Error::Manifest(format!(
+                "runtime storage_value_bytes must be positive, no larger than storage_bytes, and at most {MAX_STORAGE_VALUE_BYTES}"
+            )));
+        }
+        if !(1..=MAX_GRAPHICS_PIXELS).contains(&self.graphics_pixels) {
+            return Err(Error::Manifest(format!(
+                "runtime graphics_pixels must be between 1 and {MAX_GRAPHICS_PIXELS}"
+            )));
+        }
+        if !(1..=MAX_GRAPHICS_COMMANDS).contains(&self.graphics_commands) {
+            return Err(Error::Manifest(format!(
+                "runtime graphics_commands must be between 1 and {MAX_GRAPHICS_COMMANDS}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_NODES).contains(&self.audio_nodes) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_nodes must be between 1 and {MAX_AUDIO_NODES}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_EVENTS).contains(&self.audio_events) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_events must be between 1 and {MAX_AUDIO_EVENTS}"
+            )));
+        }
+        if !(1..=MAX_AUDIO_FRAMES).contains(&self.audio_frames) {
+            return Err(Error::Manifest(format!(
+                "runtime audio_frames must be between 1 and {MAX_AUDIO_FRAMES}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn constrained_by(&self, ceiling: &Self) -> Self {
+        let storage_bytes = self.storage_bytes.min(ceiling.storage_bytes);
+        Self {
+            fuel: self.fuel.min(ceiling.fuel),
+            memory_bytes: self.memory_bytes.min(ceiling.memory_bytes),
+            timeout_ms: self.timeout_ms.min(ceiling.timeout_ms),
+            storage_bytes,
+            storage_keys: self.storage_keys.min(ceiling.storage_keys),
+            storage_value_bytes: self
+                .storage_value_bytes
+                .min(ceiling.storage_value_bytes)
+                .min(storage_bytes),
+            graphics_pixels: self.graphics_pixels.min(ceiling.graphics_pixels),
+            graphics_commands: self.graphics_commands.min(ceiling.graphics_commands),
+            audio_nodes: self.audio_nodes.min(ceiling.audio_nodes),
+            audio_events: self.audio_events.min(ceiling.audio_events),
+            audio_frames: self.audio_frames.min(ceiling.audio_frames),
+        }
+    }
 }
 
 impl Default for RuntimeLimits {
@@ -834,6 +879,28 @@ mod tests {
     #[test]
     fn accepts_valid_manifest() {
         manifest().validate().unwrap();
+    }
+
+    #[test]
+    fn runtime_limit_ceiling_can_only_reduce_budgets() {
+        let requested = RuntimeLimits::maximum();
+        let ceiling = RuntimeLimits {
+            fuel: 100,
+            memory_bytes: 8 * 1024 * 1024,
+            timeout_ms: 250,
+            storage_bytes: 1024,
+            storage_value_bytes: 1024,
+            ..RuntimeLimits::maximum()
+        };
+
+        let effective = requested.constrained_by(&ceiling);
+
+        assert_eq!(effective.fuel, 100);
+        assert_eq!(effective.memory_bytes, 8 * 1024 * 1024);
+        assert_eq!(effective.timeout_ms, 250);
+        assert_eq!(effective.storage_bytes, 1024);
+        assert_eq!(effective.storage_value_bytes, 1024);
+        effective.validate().unwrap();
     }
 
     #[test]

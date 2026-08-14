@@ -15,6 +15,14 @@ max_restarts = 3
 allow = ["clock", "assets", "storage"]
 args = ["Stack"]
 
+[instances.limits]
+fuel = 5000000
+memory_bytes = 33554432
+timeout_ms = 5000
+storage_bytes = 524288
+storage_keys = 512
+storage_value_bytes = 131072
+
 [[resources]]
 name = "hello-state"
 kind = "state"

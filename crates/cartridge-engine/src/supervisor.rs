@@ -452,7 +452,7 @@ fn restart_backoff_ms(id: &ReplicaId, attempt: u16) -> u64 {
 mod tests {
     use std::collections::BTreeSet;
 
-    use cartridge_core::{CompositionLock, LockedPackage, ResolutionPlan};
+    use cartridge_core::{CompositionLock, LockedPackage, ResolutionPlan, RuntimeLimits};
 
     use super::*;
     use crate::{PlannedInstance, PlannedSecurity, SandboxPolicy, SecurityProfile};
@@ -482,6 +482,7 @@ mod tests {
                 denied: BTreeSet::new(),
                 args: Vec::new(),
                 secrets: BTreeSet::new(),
+                limits: RuntimeLimits::default(),
                 composition: CompositionLock::new(
                     LockedPackage {
                         cartridge_id: "dev.test.app".into(),

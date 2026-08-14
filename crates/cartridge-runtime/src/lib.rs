@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{
-    CartridgeArchive, MigrationPlan, PackageManifest, Permissions, StateMigration,
+    CartridgeArchive, MigrationPlan, PackageManifest, Permissions, RuntimeLimits, StateMigration,
     negotiate_platform,
 };
 pub use cartridge_media::{
@@ -55,6 +55,7 @@ pub struct Runtime {
     midi_events: Vec<MidiEvent>,
     http_transport: Option<Arc<dyn HttpTransport>>,
     permission_ceiling: Option<Permissions>,
+    limit_ceiling: Option<RuntimeLimits>,
 }
 
 impl Runtime {
@@ -91,6 +92,7 @@ impl Runtime {
             midi_events: Vec::new(),
             http_transport: None,
             permission_ceiling: None,
+            limit_ceiling: None,
         })
     }
 
@@ -123,6 +125,12 @@ impl Runtime {
     pub fn with_permission_ceiling(mut self, permissions: Permissions) -> Self {
         self.permission_ceiling = Some(permissions);
         self
+    }
+
+    pub fn with_limit_ceiling(mut self, limits: RuntimeLimits) -> Result<Self> {
+        limits.validate().map_err(|error| anyhow!(error))?;
+        self.limit_ceiling = Some(limits);
+        Ok(self)
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>, args: &[String]) -> Result<RunReport> {
@@ -183,7 +191,8 @@ impl Runtime {
         )?;
         let cartridge_id = archive.manifest.cartridge.id.clone();
         let state_schema = archive.manifest.state.schema;
-        let limits = storage_limits(&archive.manifest);
+        let runtime_limits = self.effective_limits(&archive.manifest.runtime);
+        let limits = storage_limits(&runtime_limits);
         let branch = Arc::new(SnapshotStorage::from_snapshot(
             source,
             &cartridge_id,
@@ -197,6 +206,7 @@ impl Runtime {
             midi_events: self.midi_events.clone(),
             http_transport: self.http_transport.clone(),
             permission_ceiling: self.permission_ceiling.clone(),
+            limit_ceiling: self.limit_ceiling.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -212,18 +222,19 @@ impl Runtime {
     ) -> Result<RunReport> {
         negotiate_platform(&archive.manifest).map_err(|error| anyhow!(error))?;
         let permissions = self.effective_permissions(&archive.manifest.permissions);
+        let mut manifest = archive.manifest;
+        manifest.runtime = self.effective_limits(&manifest.runtime);
         if replay.is_none() && permissions.storage {
             self.storage.prepare(
-                &archive.manifest.cartridge.id,
-                archive.manifest.state.schema,
-                storage_limits(&archive.manifest),
+                &manifest.cartridge.id,
+                manifest.state.schema,
+                storage_limits(&manifest.runtime),
             )?;
         }
         let component = Component::new(&self.engine, &archive.component)
             .map_err(|error| anyhow!("the package component could not be compiled: {error}"))?;
         let linker = self.linker()?;
 
-        let manifest = archive.manifest;
         let expected_result = replay.as_ref().map(|trace| trace.result.clone());
         let expected_events = replay.map(|trace| trace.events);
         let mut host = HostState::new_with_permissions(
@@ -302,10 +313,12 @@ impl Runtime {
         archive: CartridgeArchive,
         source: StorageSnapshot,
     ) -> Result<MigrationReport> {
-        let plan = archive.manifest.migration_plan(source.state_schema())?;
-        validate_migration_budget(&archive.manifest, &plan)?;
-        let limits = storage_limits(&archive.manifest);
-        let cartridge_id = archive.manifest.cartridge.id.clone();
+        let mut manifest = archive.manifest;
+        manifest.runtime = self.effective_limits(&manifest.runtime);
+        let plan = manifest.migration_plan(source.state_schema())?;
+        validate_migration_budget(&manifest, &plan)?;
+        let limits = storage_limits(&manifest.runtime);
+        let cartridge_id = manifest.cartridge.id.clone();
         let initial = SnapshotStorage::from_snapshot(&source, &cartridge_id, limits)?;
         initial.prepare(&cartridge_id, source.state_schema(), limits)?;
         drop(initial);
@@ -317,17 +330,13 @@ impl Runtime {
                 snapshot: source,
             });
         }
-        if !self
-            .effective_permissions(&archive.manifest.permissions)
-            .storage
-        {
+        if !self.effective_permissions(&manifest.permissions).storage {
             bail!("state migrations require the storage permission");
         }
 
         let component = Component::new(&self.engine, &archive.component)
             .map_err(|error| anyhow!("the migration component could not be compiled: {error}"))?;
         let assets = Arc::new(archive.assets);
-        let manifest = archive.manifest;
         let mut current = source;
         let mut reports = Vec::with_capacity(plan.steps.len());
 
@@ -433,6 +442,13 @@ impl Runtime {
         }
     }
 
+    fn effective_limits(&self, requested: &RuntimeLimits) -> RuntimeLimits {
+        self.limit_ceiling.as_ref().map_or_else(
+            || requested.clone(),
+            |ceiling| requested.constrained_by(ceiling),
+        )
+    }
+
     fn linker(&self) -> Result<Linker<HostState>> {
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
@@ -497,11 +513,11 @@ fn trace_identity(manifest: &cartridge_core::PackageManifest) -> TraceIdentity<'
     }
 }
 
-fn storage_limits(manifest: &cartridge_core::PackageManifest) -> StorageLimits {
+fn storage_limits(limits: &RuntimeLimits) -> StorageLimits {
     StorageLimits {
-        max_bytes: manifest.runtime.storage_bytes,
-        max_keys: manifest.runtime.storage_keys,
-        max_value_bytes: manifest.runtime.storage_value_bytes,
+        max_bytes: limits.storage_bytes,
+        max_keys: limits.storage_keys,
+        max_value_bytes: limits.storage_value_bytes,
     }
 }
 
@@ -668,5 +684,23 @@ mod tests {
         assert!(!effective.storage);
         assert!(!effective.http);
         assert!(!effective.graphics);
+    }
+
+    #[test]
+    fn runtime_limit_ceiling_can_only_reduce_requested_budgets() {
+        let requested = RuntimeLimits::maximum();
+        let ceiling = RuntimeLimits {
+            fuel: 42,
+            memory_bytes: 4 * 1024 * 1024,
+            timeout_ms: 75,
+            ..RuntimeLimits::maximum()
+        };
+        let runtime = Runtime::new().unwrap().with_limit_ceiling(ceiling).unwrap();
+
+        let effective = runtime.effective_limits(&requested);
+
+        assert_eq!(effective.fuel, 42);
+        assert_eq!(effective.memory_bytes, 4 * 1024 * 1024);
+        assert_eq!(effective.timeout_ms, 75);
     }
 }

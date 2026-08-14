@@ -19,7 +19,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_core::{
     CartridgeArchive, CompositionLock, LockedPackage, MAX_RESOLUTION_CANDIDATES, PackOptions,
-    Permissions, ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
+    Permissions, ResolutionPlan, RuntimeLimits, negotiate_platform, pack, resolve_dependencies,
 };
 use cartridge_desktop::{Capability, CatalogPackage, LaunchStatus, Library};
 use cartridge_dev::{
@@ -28,7 +28,8 @@ use cartridge_dev::{
 };
 use cartridge_engine::{
     DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, PlannedInstance,
-    ReplicaId, ReplicaPhase, StackCapability, StackManifest, StackPlan, StackRuntimeStatus,
+    ReplicaId, ReplicaPhase, SandboxPolicy, StackCapability, StackManifest, StackPlan,
+    StackRuntimeStatus,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -63,6 +64,7 @@ const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_STABILITY_WALL_TIME: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SUPERVISOR_WORKERS: u16 = 32;
 const DESIRED_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WORKER_LIMIT_CEILING_ENV: &str = "CARTRIDGE_LIMIT_CEILING";
 
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
@@ -79,6 +81,7 @@ struct RunCommandOptions<'a> {
     storage_trust: Option<&'a Path>,
     local_storage_authority: bool,
     permission_ceiling: Option<&'a Permissions>,
+    limit_ceiling: Option<&'a RuntimeLimits>,
     args: &'a [String],
 }
 
@@ -1234,6 +1237,7 @@ fn run_cli() -> Result<()> {
                 storage_trust: durable_auth.trust.as_deref(),
                 local_storage_authority: false,
                 permission_ceiling: None,
+                limit_ceiling: None,
                 args: &args,
             })
         }
@@ -1259,6 +1263,12 @@ fn run_cli() -> Result<()> {
         } => {
             require_worker_context()?;
             let permission_ceiling = capability_ceiling.map(permissions_from_mask).transpose()?;
+            let limit_ceiling = std::env::var(WORKER_LIMIT_CEILING_ENV)
+                .ok()
+                .as_deref()
+                .map(parse_runtime_limits)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
             if state_dir.is_some() && !local_storage_authority {
                 durable_auth.verify(&package)?;
             }
@@ -1276,6 +1286,7 @@ fn run_cli() -> Result<()> {
                 storage_trust: None,
                 local_storage_authority,
                 permission_ceiling: permission_ceiling.as_ref(),
+                limit_ceiling: limit_ceiling.as_ref(),
                 args: &args,
             })
         }
@@ -1630,6 +1641,7 @@ fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()
         storage_trust: None,
         local_storage_authority: false,
         permission_ceiling: None,
+        limit_ceiling: None,
         args,
     });
     let replay = run.and_then(|()| supervised_replay_command(package, &trace, None, args));
@@ -1741,6 +1753,7 @@ fn run_dev_build(
         storage_trust: None,
         local_storage_authority: true,
         permission_ceiling: None,
+        limit_ceiling: None,
         args: &[],
     });
     fs::remove_file(&package)
@@ -2098,6 +2111,8 @@ struct StackWorkerTemplate {
     state: PathBuf,
     args: Vec<String>,
     permissions: Permissions,
+    limits: RuntimeLimits,
+    harden: bool,
     timeout: Duration,
 }
 
@@ -2366,6 +2381,9 @@ fn stack_worker_templates(
             bail!("installed package no longer matches the desired stack generation");
         }
         let archive = CartridgeArchive::open(&record.path)?;
+        if archive.manifest.runtime.constrained_by(&instance.limits) != instance.limits {
+            bail!("planned runtime limits are not a ceiling on the installed package");
+        }
         for ordinal in 1..=instance.replicas {
             let id = ReplicaId {
                 instance: instance.name.clone(),
@@ -2381,7 +2399,9 @@ fn stack_worker_templates(
                     state,
                     args: instance.args.clone(),
                     permissions: stack_permissions(instance),
-                    timeout: Duration::from_millis(archive.manifest.runtime.timeout_ms),
+                    limits: instance.limits.clone(),
+                    harden: plan.security.sandbox != SandboxPolicy::Disabled,
+                    timeout: Duration::from_millis(instance.limits.timeout_ms),
                 },
             );
         }
@@ -2417,6 +2437,11 @@ fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Resu
     command
         .args(arguments)
         .env("CARTRIDGE_WORKER", "1")
+        .env(
+            WORKER_LIMIT_CEILING_ENV,
+            serde_json::to_string(&template.limits)?,
+        )
+        .harden(template.harden)
         .stdout(OutputMode::Inherit)
         .stderr(OutputMode::Inherit);
     spawn_contained(&mut command, true).context("could not start the cartridge worker")
@@ -2514,6 +2539,15 @@ fn print_stack_plan(plan: &StackPlan) {
             instance.desired
         );
         println!("    package: {}", instance.package_sha256);
+        println!(
+            "    limits: fuel={} memory={} timeout={}ms storage={} graphics={}px audio={}f",
+            instance.limits.fuel,
+            instance.limits.memory_bytes,
+            instance.limits.timeout_ms,
+            instance.limits.storage_bytes,
+            instance.limits.graphics_pixels,
+            instance.limits.audio_frames
+        );
         println!("    allowed: {}", stack_capability_list(&instance.allowed));
         println!("    denied: {}", stack_capability_list(&instance.denied));
     }
@@ -2585,6 +2619,7 @@ fn library_run_command(
         storage_trust: None,
         local_storage_authority: true,
         permission_ceiling: None,
+        limit_ceiling: None,
         args,
     });
     let status = if result.is_ok() {
@@ -3953,6 +3988,15 @@ fn permissions_from_mask(mask: u16) -> Result<Permissions> {
     })
 }
 
+fn parse_runtime_limits(value: &str) -> std::result::Result<RuntimeLimits, String> {
+    if value.len() > 4096 {
+        return Err("runtime limit ceiling exceeds its byte limit".into());
+    }
+    let limits: RuntimeLimits = serde_json::from_str(value).map_err(|error| error.to_string())?;
+    limits.validate().map_err(|error| error.to_string())?;
+    Ok(limits)
+}
+
 fn supervise_worker(
     package: &Path,
     arguments: &[OsString],
@@ -4231,10 +4275,18 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
             .with_context(|| format!("could not inspect {}", options.package.display()))?;
         let snapshot = StorageSnapshot::read(path)
             .with_context(|| format!("could not read snapshot {}", path.display()))?;
+        let effective_limits = options.limit_ceiling.map_or_else(
+            || archive.manifest.runtime.clone(),
+            |ceiling| archive.manifest.runtime.constrained_by(ceiling),
+        );
         let storage = Arc::new(SnapshotStorage::from_snapshot(
             &snapshot,
             &archive.manifest.cartridge.id,
-            storage_limits(&archive.manifest),
+            StorageLimits {
+                max_bytes: effective_limits.storage_bytes,
+                max_keys: effective_limits.storage_keys,
+                max_value_bytes: effective_limits.storage_value_bytes,
+            },
         )?);
         let runtime = configure_http(
             Runtime::with_storage(storage.clone())?
@@ -4242,6 +4294,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
             options.http_fixtures,
         )?;
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
+        let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
         branch = Some(storage);
         runtime.run(archive, options.args)?
     } else {
@@ -4252,6 +4305,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         .with_media_input(input, midi)?;
         let runtime = configure_http(runtime, options.http_fixtures)?;
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
+        let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
         runtime.run_file(options.package, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
@@ -4301,6 +4355,13 @@ fn apply_permission_ceiling(runtime: Runtime, ceiling: Option<&Permissions>) -> 
     match ceiling {
         Some(permissions) => runtime.with_permission_ceiling(permissions.clone()),
         None => runtime,
+    }
+}
+
+fn apply_limit_ceiling(runtime: Runtime, ceiling: Option<&RuntimeLimits>) -> Result<Runtime> {
+    match ceiling {
+        Some(limits) => runtime.with_limit_ceiling(limits.clone()),
+        None => Ok(runtime),
     }
 }
 
@@ -5106,6 +5167,22 @@ fn print_resolution(plan: &ResolutionPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_worker_limit_ceiling_is_strict_and_bounded() {
+        let limits = RuntimeLimits {
+            fuel: 50,
+            memory_bytes: 4 * 1024 * 1024,
+            timeout_ms: 100,
+            ..RuntimeLimits::default()
+        };
+        let encoded = serde_json::to_string(&limits).unwrap();
+
+        assert_eq!(parse_runtime_limits(&encoded).unwrap(), limits);
+        assert!(parse_runtime_limits(r#"{"fuel":0}"#).is_err());
+        assert!(parse_runtime_limits(r#"{"unknown":1}"#).is_err());
+        assert!(parse_runtime_limits(&"x".repeat(4097)).is_err());
+    }
 
     #[test]
     fn blob_gc_uses_snapshot_reachability_roots() {

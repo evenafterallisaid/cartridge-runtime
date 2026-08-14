@@ -10,8 +10,8 @@ use std::{
 use command_group::{CommandGroup, GroupChild};
 #[cfg(windows)]
 use windows_spawn::{
-    Child as WindowsChild, Command as WindowsCommand, DropPolicy, SpawnOptions,
-    Stdio as WindowsStdio,
+    Child as WindowsChild, Command as WindowsCommand, DropPolicy, FontDisable, Mitigation,
+    MitigationPolicy, RelocateImages, SpawnOptions, Stdio as WindowsStdio,
 };
 
 const PARENT_LIVENESS_ENV: &str = "CARTRIDGE_PARENT_LIVENESS";
@@ -30,6 +30,7 @@ pub(crate) struct ContainedCommand {
     environment: Vec<(OsString, OsString)>,
     stdout: OutputMode,
     stderr: OutputMode,
+    harden: bool,
 }
 
 impl ContainedCommand {
@@ -40,6 +41,7 @@ impl ContainedCommand {
             environment: Vec::new(),
             stdout: OutputMode::Null,
             stderr: OutputMode::Null,
+            harden: true,
         }
     }
 
@@ -71,6 +73,11 @@ impl ContainedCommand {
 
     pub(crate) fn stderr(&mut self, mode: OutputMode) -> &mut Self {
         self.stderr = mode;
+        self
+    }
+
+    pub(crate) fn harden(&mut self, enabled: bool) -> &mut Self {
+        self.harden = enabled;
         self
     }
 }
@@ -207,7 +214,11 @@ pub(crate) fn spawn_contained(
             })
             .stdout(windows_stdio(command.stdout))
             .stderr(windows_stdio(command.stderr));
-        native.spawn_with(SpawnOptions::new().drop_policy(DropPolicy::KillTree))?
+        let mut options = SpawnOptions::new().drop_policy(DropPolicy::KillTree);
+        if command.harden {
+            options = options.mitigation(windows_hardening_policy());
+        }
+        native.spawn_with(options)?
     };
 
     Ok(ContainedChild {
@@ -218,6 +229,23 @@ pub(crate) fn spawn_contained(
         running: true,
         exit_status: None,
     })
+}
+
+#[cfg(windows)]
+const fn windows_hardening_policy() -> MitigationPolicy {
+    MitigationPolicy::new()
+        .dep(true)
+        .sehop(true)
+        .relocate_images(RelocateImages::AlwaysOn)
+        .heap_terminate(Mitigation::AlwaysOn)
+        .bottom_up_aslr(Mitigation::AlwaysOn)
+        .high_entropy_aslr(Mitigation::AlwaysOn)
+        .strict_handle_checks(Mitigation::AlwaysOn)
+        .disable_extension_points(Mitigation::AlwaysOn)
+        .font_disable(FontDisable::Block)
+        .block_remote_images(Mitigation::AlwaysOn)
+        .block_low_label_images(Mitigation::AlwaysOn)
+        .prefer_system32_images(Mitigation::AlwaysOn)
 }
 
 #[cfg(unix)]

@@ -504,7 +504,7 @@ Purpose: turn the individual runtime subsystems into one rootless, inspectable a
 
 Work:
 
-- a versioned `Cartridge.stack.toml` format for applications, providers, exact locks, state, blobs, secrets, ingress, schedules, budgets, and update policy
+- [implemented through portable runtime budgets] a versioned `Cartridge.stack.toml` format for applications, providers, exact locks, state, blobs, secrets, ingress, schedules, budgets, and update policy
 - `stack validate`, `plan`, `apply`, `status`, `stop`, `remove`, `export`, and `import`
 - [implemented first slice] a per-user engine daemon over an encrypted authenticated local transport with replay rejection
 - [implemented] cross-platform process-tree ownership with Windows Job Objects, Unix process groups, parent-death liveness, and bounded termination
@@ -516,7 +516,7 @@ Work:
 - secret slots exposed as opaque operation handles rather than files or environment variables
 - typed service routing and declared HTTP ingress without ambient private networks
 - bounded structured logs, metrics, traces, and engine events with redaction policies
-- resource accounting and quotas per instance, stack, publisher, and user
+- [implemented for per-instance portable work ceilings] resource accounting and quotas per instance, stack, publisher, and user
 - orphan detection, content/store garbage collection, and disk-pressure behavior
 - development mode that can replace one component while preserving the rest of the graph
 - offline application bundles containing packages, signatures, lock, policy, and optional state
@@ -1008,7 +1008,8 @@ The next concrete sequence is:
    - [implemented] bounded instances, version requirements, exact package and composition locks
    - [implemented] named state/blob resources, retention intent, quotas, and declared secret slots
    - [implemented] strict/balanced/permissive capability policy with explicit grants and blocks
-   - add service edges, budgets, health checks, jobs, ingress, and rollout policy
+   - [implemented] add per-instance fuel, linear-memory, wall-time, storage, graphics, and audio ceilings
+   - add service edges, kernel budgets, health checks, jobs, ingress, and rollout policy
    - add a semantic plan diff alongside the implemented canonical plan digest
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
@@ -1058,6 +1059,8 @@ Completed foundations:
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
 - Windows Job Object and Unix process-group ownership with parent-death channels and bounded tree termination
+- immutable operator resource ceilings enforced again at the Wasmtime, storage, graphics, and audio boundaries
+- JIT-compatible Windows creation-time exploit mitigations for contained helpers
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals
 - bounded package construction, snapshot decoding, durable-state decoding, and host resource tables
 - pinned CI actions, automated dependency updates, and RustSec advisory checks
@@ -1065,7 +1068,7 @@ Completed foundations:
 Security work immediately ahead:
 
 1. [implemented] Bind package identity to a trusted developer signature before the public CLI treats a cartridge id as a durable-storage principal.
-2. Add platform-native sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
+2. [partially implemented through portable ceilings and Windows exploit mitigations] Add platform-native authority sandbox profiles and kernel memory/CPU limits around the existing execution workers, then move high-risk native adapters into separate capability-specific workers.
 3. [partially implemented] Trace redaction profiles are available; encrypted support bundles remain.
 4. [partially implemented] Keep expanding the seeded parser and protocol fuzz suite; capsule and receipt parsers still need library boundaries before they can join it cleanly.
 

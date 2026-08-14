@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   test:
@@ -31,7 +30,7 @@ jobs:
 
       - name: Build desktop frontend
         working-directory: apps/cartridge-desktop
-        run: npm ci && npm run build
+        run: npm ci && npm audit --audit-level=low && npm run build
 
       - name: Install Linux desktop dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -55,16 +54,10 @@ jobs:
 
       - name: Audit dependencies
         if: matrix.os == 'ubuntu-latest'
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Audit desktop dependencies
-        if: matrix.os == 'ubuntu-latest'
-        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: apps/cartridge-desktop/src-tauri
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+          cargo audit --file apps/cartridge-desktop/src-tauri/Cargo.lock
 
       - name: Build example component
         run: cargo build --manifest-path examples/hello-cartridge/Cargo.toml --target wasm32-wasip2 --release
@@ -170,6 +163,7 @@ jobs:
           cargo run -p cartridge-cli -- library install hello.cartridge --root library
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.stack.toml
           cargo run -p cartridge-cli -- stack plan tests/fixtures/Cartridge.stack.toml --library library --output hello.stack-plan.json
+          grep '"timeout_ms": 5000' hello.stack-plan.json
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
           cargo run -p cartridge-cli -- stack list --root engine
@@ -180,6 +174,10 @@ jobs:
           cargo run -p cartridge-cli -- stack stop hello-stack --root engine
           cargo run -p cartridge-cli -- stack remove hello-stack --root engine
           cargo run -p cartridge-cli -- stack status hello-stack --root engine
+          cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.limits.stack.toml --library library --root engine
+          cargo run -p cartridge-cli -- stack supervise hello-budget-stack --library library --root engine --json
+          cargo run -p cartridge-cli -- stack ps hello-budget-stack --root engine --json | grep '"phase": "failed"'
+          cargo run -p cartridge-cli -- stack remove hello-budget-stack --root engine
           "$binary" engine serve --root daemon-engine --library library --max-supervisors 2 --workers-per-stack 4 --json > daemon-engine.out 2> daemon-engine.err &
           daemon_pid=$!
           for attempt in {1..100}; do

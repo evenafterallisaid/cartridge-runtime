@@ -141,7 +141,17 @@ cargo run -p cartridge-cli -- stack ps hello-stack --root dist/engine
 cargo run -p cartridge-cli -- stack events hello-stack --root dist/engine
 ```
 
-Stack planning resolves installed versions to exact package and composition hashes. Apply records the desired state in a private, checksum-chained journal and is idempotent. The foreground supervisor re-verifies those bytes, runs a configurable bounded worker set, enforces the reviewed capability ceiling inside the runtime, applies finite restart/backoff policy, isolates state by stack/replica/exact package, and persists checksum-bound observed status. Workers and their descendants are owned as one process tree, with parent-death channels and bounded termination.
+Optional instance budgets are upper bounds, not requests for more authority:
+
+```toml
+[instances.limits]
+fuel = 5000000
+memory_bytes = 33554432
+timeout_ms = 5000
+storage_bytes = 524288
+```
+
+Stack planning resolves installed versions to exact package and composition hashes. Each instance can impose operator ceilings on fuel, linear memory, wall time, storage, graphics work, and audio work; the exact effective values are bound into plan format 2 and intersected again inside the runtime. Apply records the desired state in a private, checksum-chained journal and is idempotent. The foreground supervisor re-verifies those bytes, runs a configurable bounded worker set, enforces the reviewed capability and resource ceilings inside the runtime, applies finite restart/backoff policy, isolates state by stack/replica/exact package, and persists checksum-bound observed status. Workers and their descendants are owned as one process tree, with parent-death channels and bounded termination.
 
 Run the persistent rootless engine in a terminal or user service manager, then control it from other processes:
 
@@ -155,7 +165,7 @@ cargo run -p cartridge-cli -- engine stop hello-stack --root dist/engine
 cargo run -p cartridge-cli -- engine shutdown --root dist/engine
 ```
 
-The daemon owns reconciliation after the invoking terminal is gone. Its loopback protocol is non-HTTP, length-bounded, encrypted and authenticated with a random per-boot capability, bound to one engine instance, freshness checked, and replay rejected. The capability is published only in the private engine root and never printed. Supervisor and worker limits are explicit startup settings with hard safety ceilings. Windows children enter kill-on-close Job Objects before executing; macOS and Linux children enter dedicated process groups; every daemon-supervisor-worker edge also has a private liveness pipe. Native service installation, kernel resource policy, full OS sandboxes, and health-gated rollouts remain open layers.
+The daemon owns reconciliation after the invoking terminal is gone. Its loopback protocol is non-HTTP, length-bounded, encrypted and authenticated with a random per-boot capability, bound to one engine instance, freshness checked, and replay rejected. The capability is published only in the private engine root and never printed. Supervisor and worker limits are explicit startup settings with hard safety ceilings. Windows children enter kill-on-close Job Objects with DEP, ASLR, heap, extension-point, font, and image-loading mitigations applied at process creation; macOS and Linux children enter dedicated process groups; every daemon-supervisor-worker edge also has a private liveness pipe. Native service installation, kernel CPU/RSS policy, restricted-token/AppContainer and Unix authority sandboxes, and health-gated rollouts remain open layers.
 
 Run the native desktop shell:
 
@@ -211,6 +221,8 @@ examples/effect-cartridge/  bounded delay-effect reference
 wit/                        public guest/host contract
 docs/                       format, architecture, and roadmap
 ```
+
+The [whole-repository security review](docs/security-audit-full-2026-08-14.md) records the current audit result, closed findings, evidence, dependency observations, and remaining release gates. The [resource-governance review](docs/security-audit-resource-governance-0.1.md) provides the focused operator-budget and Windows creation-time hardening analysis.
 
 Read [the platform status](docs/platform-status.md) for an exact implemented-versus-missing breakdown, [the architecture](docs/architecture.md) for the trust model, [the threat model](docs/threat-model.md), [1.0 candidate review](docs/security-audit-1.0-rc.md), [engine review](docs/security-audit-engine-0.1.md), [supervisor review](docs/security-audit-supervisor-0.1.md), [daemon review](docs/security-audit-daemon-0.1.md), [process-containment review](docs/security-audit-process-containment-0.1.md), and [desktop review](docs/security-audit-desktop-0.1.md) for security boundaries and current findings, [identity and registry](docs/identity-and-registry.md) for signed distribution, [runtime updates](docs/runtime-updates.md) for signed installation and rollback, [the compatibility policy](docs/compatibility-policy.md) for support guarantees, [networking](docs/networking.md) for HTTP and device-mesh boundaries, [developer workflow](docs/developer-workflow.md), [desktop library](docs/desktop-library.md), [media capabilities](docs/media.md) for graphics/audio contracts and limits, [storage](docs/storage.md) for state isolation and replay rules, [backup and recovery](docs/backup-and-recovery.md), [telemetry and performance](docs/telemetry-and-performance.md), [content-addressed blobs](docs/blob-store.md) and [reachability manifests](docs/blob-reachability-format.md) for larger immutable data, [the durable storage format](docs/storage-format.md) for commit and recovery behavior, [the snapshot format](docs/snapshot-format.md) for portable state transfer, [state migrations](docs/migrations.md) and [migration receipts](docs/migration-receipt-format.md) for upgrade recovery, [execution capsules](docs/capsule-format.md) for reproducible artifact binding, [composition](docs/composition.md) for inter-cartridge services, [the trace format](docs/trace-format.md) for replay rules, and [the roadmap](docs/roadmap.md) for the path toward a complete component platform.
 

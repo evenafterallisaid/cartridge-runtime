@@ -7,7 +7,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Surface | Working implementation |
 | --- | --- |
 | Package | Reproducible `.cartridge` archives, strict manifests, exact component hashes, asset-tree integrity, selective verification, and inflation limits |
-| Execute | Wasmtime Component Model host, WASI 0.2 compatibility, fuel/memory/table/instance/wall-time limits, crash-resistant process-tree containment, capability negotiation, and host-enforced capability ceilings |
+| Execute | Wasmtime Component Model host, WASI 0.2 compatibility, fuel/memory/table/instance/wall-time limits, crash-resistant process-tree containment, capability negotiation, host-enforced capability ceilings, and operator resource ceilings bound into immutable plans |
 | Authority | Deny-by-default clock, randomness, assets, storage, graphics, audio, MIDI, and URL-scoped HTTP contracts |
 | Identity | Ed25519 exact-byte signatures, trust rotation and revocation, authenticated durable-state principals, and immutable registry versions |
 | State | Namespaced memory/durable backends, checksummed generations, snapshots, atomic batches, compare-exchange, migrations, rollback, and recovery receipts |
@@ -19,7 +19,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Distribute | Local signed registry reference, content identities, publishing/resolution/audit, and signed runtime update/install/rollback |
 | Network | Replayable scoped HTTP, encrypted peer-session primitives, verified asset transfer, CRDT document primitives, and deterministic simulation |
 | Compose | Typed dependency/provider declarations, direct semantic-version resolution, exact-byte lockfiles, and verified resolution from the installed library catalog |
-| Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, checksum-chained desired state, generation-fenced observed state, single-owner supervision, per-replica state, bounded concurrency/restarts/backoff/deadlines, and a rootless persistent daemon with encrypted authenticated local control, replay rejection, liveness fencing, process-tree ownership, crash recovery, and Docker-style `engine` lifecycle commands |
+| Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, operator ceilings for fuel/memory/time/storage/media, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, checksum-chained desired state, generation-fenced observed state, single-owner supervision, per-replica state, bounded concurrency/restarts/backoff/deadlines, and a rootless persistent daemon with encrypted authenticated local control, replay rejection, liveness fencing, process-tree ownership, crash recovery, and Docker-style `engine` lifecycle commands |
 | Desktop | Native Tauri shell with overview, library, stack, journal, and settings views; exact plan and permission review; package re-verification; apply/stop/remove controls; persistent light/dark themes, density, motion, and safe new-stack defaults |
 | Quality | Cross-platform CI, parser fuzz targets, deterministic soak/benchmark tooling, compatibility policy, threat model, and RustSec dependency audit |
 
@@ -27,7 +27,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 
 | Missing layer | Why it matters |
 | --- | --- |
-| Native OS sandbox adapters | The helper is killable and authority-poor, but restricted Windows tokens/AppContainer, macOS sandbox profiles, and Linux namespaces/seccomp/cgroups are still external 1.0 gates |
+| Native OS sandbox adapters | The helper is killable, authority-poor, and creation-hardened on Windows, but restricted Windows tokens/AppContainer, macOS sandbox profiles, and Linux namespaces/seccomp/cgroups are still external 1.0 gates |
 | Live service broker | Manifests and locks describe service edges, but one cartridge cannot yet invoke another through those typed interfaces |
 | Transitive graph solver | Resolution currently handles one root's direct dependencies; it does not yet solve a whole graph, cycles, side-by-side majors, or minimal conflicts |
 | Relationship authorization | Capability grants exist for individual cartridges, but per-service-edge persistent/session grants and revocation are not wired into activation |

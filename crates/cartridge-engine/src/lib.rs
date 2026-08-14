@@ -21,7 +21,7 @@ use std::{
 
 use cartridge_core::{
     CartridgeArchive, CompositionLock, LockedPackage, MAX_RESOLUTION_CANDIDATES, PackageManifest,
-    resolve_dependencies,
+    RuntimeLimits, resolve_dependencies,
 };
 use cartridge_desktop::{CatalogPackage, Library};
 use fs4::{FileExt, TryLockError};
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const STACK_FORMAT_VERSION: u32 = 1;
-pub const STACK_PLAN_FORMAT_VERSION: u32 = 1;
+pub const STACK_PLAN_FORMAT_VERSION: u32 = 2;
 pub const ENGINE_EVENT_FORMAT_VERSION: u32 = 1;
 pub const MAX_STACK_BYTES: u64 = 1024 * 1024;
 pub const MAX_STACK_INSTANCES: usize = 64;
@@ -124,6 +124,55 @@ pub struct InstanceSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub secrets: BTreeSet<String>,
+    #[serde(default)]
+    pub limits: InstanceLimits,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstanceLimits {
+    pub fuel: Option<u64>,
+    pub memory_bytes: Option<usize>,
+    pub timeout_ms: Option<u64>,
+    pub storage_bytes: Option<usize>,
+    pub storage_keys: Option<usize>,
+    pub storage_value_bytes: Option<usize>,
+    pub graphics_pixels: Option<usize>,
+    pub graphics_commands: Option<usize>,
+    pub audio_nodes: Option<usize>,
+    pub audio_events: Option<usize>,
+    pub audio_frames: Option<u64>,
+}
+
+impl InstanceLimits {
+    fn ceiling(&self) -> Result<RuntimeLimits, String> {
+        let mut limits = RuntimeLimits::maximum();
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    limits.$field = value;
+                }
+            };
+        }
+        apply!(fuel);
+        apply!(memory_bytes);
+        apply!(timeout_ms);
+        apply!(storage_bytes);
+        apply!(storage_keys);
+        apply!(storage_value_bytes);
+        apply!(graphics_pixels);
+        apply!(graphics_commands);
+        apply!(audio_nodes);
+        apply!(audio_events);
+        apply!(audio_frames);
+        limits.storage_value_bytes = limits.storage_value_bytes.min(limits.storage_bytes);
+        limits.validate().map_err(|error| error.to_string())?;
+        Ok(limits)
+    }
+
+    fn apply(&self, requested: &RuntimeLimits) -> Result<RuntimeLimits, String> {
+        Ok(requested.constrained_by(&self.ceiling()?))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,6 +279,7 @@ pub struct PlannedInstance {
     pub denied: BTreeSet<StackCapability>,
     pub args: Vec<String>,
     pub secrets: BTreeSet<String>,
+    pub limits: RuntimeLimits,
     pub composition: CompositionLock,
 }
 
@@ -514,6 +564,14 @@ impl StackPlan {
                 if checked.insert(key) {
                     verify_locked_package_installed(package, library)?;
                 }
+            }
+            let record =
+                library.catalog_package(&instance.cartridge_id, Some(&instance.version))?;
+            let archive = open_catalog_archive(&record)?;
+            if archive.manifest.runtime.constrained_by(&instance.limits) != instance.limits {
+                return Err(
+                    "planned runtime limits are not a ceiling on the installed package".into(),
+                );
             }
         }
         Ok(())
@@ -990,6 +1048,10 @@ fn validate_planned_instance(
     profile: SecurityProfile,
     declared_secrets: &BTreeSet<&str>,
 ) -> Result<(), String> {
+    instance
+        .limits
+        .validate()
+        .map_err(|error| error.to_string())?;
     let argument_bytes = instance
         .args
         .iter()
@@ -1102,6 +1164,7 @@ fn validate_planned_secrets(secrets: &[PlannedSecret]) -> Result<(), String> {
 }
 
 fn validate_instance(value: &InstanceSpec) -> Result<(), String> {
+    value.limits.ceiling()?;
     let argument_bytes = value
         .args
         .iter()
@@ -1147,6 +1210,7 @@ fn plan_instance(
             )
         })?;
     let archive = open_catalog_archive(&record)?;
+    let limits = spec.limits.apply(&archive.manifest.runtime)?;
     let composition = direct_composition_lock(&archive, library)?;
     let requested = capabilities(&archive.manifest);
     if !spec.allow.is_subset(&requested) || !spec.deny.is_subset(&requested) {
@@ -1183,6 +1247,7 @@ fn plan_instance(
         denied,
         args: spec.args.clone(),
         secrets: spec.secrets.clone(),
+        limits,
         composition,
     })
 }
@@ -1674,6 +1739,7 @@ mod tests {
                 deny: BTreeSet::new(),
                 args: vec!["serve".into()],
                 secrets: BTreeSet::from(["api-key".into()]),
+                limits: InstanceLimits::default(),
             }],
             resources: vec![ResourceSpec {
                 name: "app-state".into(),
@@ -1713,6 +1779,25 @@ mod tests {
     }
 
     #[test]
+    fn plans_bind_operator_limits_below_package_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let mut stack = manifest(SandboxPolicy::Required);
+        stack.instances[0].limits.fuel = Some(50_000);
+        stack.instances[0].limits.memory_bytes = Some(8 * 1024 * 1024);
+        stack.instances[0].limits.timeout_ms = Some(250);
+
+        let plan = StackPlan::build(&stack, &library).unwrap();
+
+        assert_eq!(plan.instances[0].limits.fuel, 50_000);
+        assert_eq!(plan.instances[0].limits.memory_bytes, 8 * 1024 * 1024);
+        assert_eq!(plan.instances[0].limits.timeout_ms, 250);
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
     fn recomputed_plans_cannot_widen_policy_or_detach_package_identity() {
         let directory = tempfile::tempdir().unwrap();
         let package = package(directory.path(), "1.0.0", "clock = true\nstorage = true");
@@ -1729,6 +1814,12 @@ mod tests {
             .remove(&StackCapability::Storage);
         widened.plan_sha256 = widened.computed_sha256().unwrap();
         assert!(widened.validate().is_err());
+
+        let mut raised = plan.clone();
+        raised.instances[0].limits.fuel = RuntimeLimits::maximum().fuel;
+        raised.plan_sha256 = raised.computed_sha256().unwrap();
+        assert!(raised.validate().is_ok());
+        assert!(raised.verify_installed(&library).is_err());
 
         let mut detached = plan;
         detached.instances[0].package_sha256 = "0".repeat(64);

@@ -40,18 +40,19 @@ The last adversary is partially outside the portable boundary. Content hashes de
 
 - ZIP entry, inflation, count, path, and total-byte limits
 - Component Model type boundary with raw WASI networking, directories, environment, terminal, and arguments disabled
-- fuel, epoch deadline, memory/table/instance/resource, media-work, storage, trace, HTTP, peer, CRDT, and simulation limits
+- package and operator fuel, epoch deadline, memory/table/instance/resource, media-work, storage, trace, HTTP, peer, CRDT, and simulation limits; operator ceilings can only reduce package budgets
 - deterministic record/replay with strict event consumption and input revalidation
 - exact-byte package/release signatures and immutable version publishing
 - create-new outputs, staged commits, finite locks, compare-exchange revisions, backups, and quarantine
-- helper process-tree deadline, minimal environment, parent-death liveness, and bounded termination
+- helper process-tree deadline, minimal environment, parent-death liveness, bounded termination, and a creation-time Windows exploit-mitigation baseline
 - no production `unsafe` code in the workspace
 
 ## Residual risks and non-goals
 
 - Wasmtime or an enabled native adapter may contain an unknown vulnerability.
-- The general CLI worker is killable but does not yet enter AppContainer/restricted tokens, macOS sandbox profiles, or Linux namespace/seccomp profiles.
+- The general CLI worker is killable and Windows workers receive exploit mitigations, but it does not yet enter AppContainer/restricted tokens, macOS sandbox profiles, or Linux namespace/seccomp profiles.
 - Job Objects and process groups own complete child trees, while private parent-liveness pipes cover hard daemon and supervisor failure. Kernel-uninterruptible processes can still outlive the two-second reap window, and process containment does not reduce the worker's operating-system authority.
+- Portable operator budgets constrain guest-visible and host-mediated work, but they are not kernel CPU-share, resident-memory, file-I/O, or process-count quotas. A native-host escape still has the worker's user-level resource authority until the platform resource layer exists.
 - The daemon protocol is confidential and authenticated, but it does not yet use Unix peer credentials or Windows named-pipe ACLs. A local process without the endpoint capability cannot issue a valid command, though it can still consume the small bounded unauthenticated connection pool until its short authentication deadline.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.
