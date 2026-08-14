@@ -1048,6 +1048,7 @@ impl EngineStore {
         ensure_directory(&instance)?;
         let replica = instance.join(format!("{:04}", id.ordinal));
         ensure_directory(&replica)?;
+        let replica = fs::canonicalize(replica).map_err(|error| error.to_string())?;
         Ok(replica.join(format!("{run_id}.probe")))
     }
 
@@ -2231,6 +2232,7 @@ mod tests {
         let path = engine
             .replica_probe_path("demo-stack", &generation, &id, &"a".repeat(64))
             .unwrap();
+        assert!(path.is_absolute());
         fs::write(&path, b"stale encrypted signal").unwrap();
 
         assert_eq!(engine.clear_probe_channels("demo-stack").unwrap(), 1);
