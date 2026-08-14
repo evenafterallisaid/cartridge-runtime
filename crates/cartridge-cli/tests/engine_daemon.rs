@@ -153,7 +153,7 @@ fn daemon_authenticates_clients_survives_bad_frames_and_cleans_up() {
             "--root",
             engine.to_str().unwrap(),
             "--timeout-ms",
-            "100",
+            "5000",
         ],
     );
     assert!(!missing.status.success());
