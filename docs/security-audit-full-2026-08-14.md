@@ -6,7 +6,7 @@ Scope: every production Rust crate, the CLI and local daemon, the Tauri command 
 
 ## Result
 
-No known critical or high-severity vulnerability remains in the implemented and reviewed boundaries after this round. The review fixed operator-budget propagation and verification defects, added Windows creation-time exploit mitigations, and repaired a CI audit step that did not scan the lockfile it claimed to scan.
+No known critical or high-severity vulnerability remains in the implemented and reviewed boundaries after this round. The review fixed operator-budget propagation and verification defects, added Windows creation-time exploit mitigations, repaired a CI audit step that did not scan the lockfile it claimed to scan, and moved desktop lifecycle control behind the authenticated daemon boundary.
 
 This result does not make Cartridge safe for arbitrary hostile third-party code. Portable capability and resource controls are substantially implemented, but native OS authority sandboxes, kernel resource controllers, peer-authenticated local IPC transports, and an independently reviewed release boundary remain open gates.
 
@@ -20,6 +20,7 @@ This result does not make Cartridge safe for arbitrary hostile third-party code.
 | FULL-04 | medium | Windows process-tree ownership did not apply a creation-time exploit-mitigation baseline | compatible DEP, SEHOP, ASLR, heap, handle, extension-point, font, and image-loading policies are now part of atomic child creation |
 | FULL-05 | medium | putting internal limits into the generated public CLI graph caused default-stack exhaustion on ordinary Windows commands | the bounded strict document now crosses only the cleared private worker environment; ordinary `pack` is covered by the smoke test |
 | FULL-06 | medium | CI's second `rustsec/audit-check` invocation used an unsupported `working-directory` input, so it rescanned the root lockfile instead of the Tauri lockfile | CI installs a pinned `cargo-audit`, explicitly scans both lockfiles, audits npm dependencies, and no longer grants the obsolete `checks: write` permission |
+| FULL-07 | high | desktop apply, stop, and remove commands wrote the engine store directly, bypassing daemon serialization, shutdown fencing, and supervisor ownership | both CLI and desktop now use one bounded encrypted authenticated daemon client; desktop mutations have no offline direct-store fallback and the webview never receives control keys |
 
 Detailed resource-governance evidence is in [security-audit-resource-governance-0.1.md](security-audit-resource-governance-0.1.md).
 
@@ -37,7 +38,8 @@ The workspace test suite contains direct regressions for each boundary.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 211 tests passed
+- `cargo test --workspace`: 212 tests passed
+- Tauri `cargo test`: 4 tests passed
 - Tauri `cargo clippy --all-targets -- -D warnings`
 - production frontend TypeScript and Vite build from a clean `npm ci`
 - normal reduced-budget stack execution and deterministic fuel exhaustion of the same exact package at a one-unit ceiling
@@ -79,7 +81,7 @@ Plans bind exact package identities, permissions, limits, replicas, and composit
 
 ### Processes and desktop
 
-Daemon, supervisor, and guest descendants are owned as a tree and carry private parent-liveness channels. Windows adds process-creation mitigations; Unix uses process groups. The desktop stores a reviewed plan outside the webview and applies only its reviewed digest after another package verification. Webview plugin authority is empty.
+Daemon, supervisor, and guest descendants are owned as a tree and carry private parent-liveness channels. Windows adds process-creation mitigations; Unix uses process groups. The desktop stores a reviewed plan and daemon credentials outside the webview, applies only its reviewed digest after another package verification, and fails closed on lifecycle mutations when authenticated control is unavailable. Webview plugin authority is empty.
 
 ## Residual risks and release gates
 

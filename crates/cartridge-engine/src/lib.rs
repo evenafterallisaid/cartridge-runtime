@@ -4,7 +4,7 @@ mod supervisor;
 pub use daemon::{
     DAEMON_ENDPOINT_FILE, DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonEndpoint, DaemonFrame,
     DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse, MAX_DAEMON_EVENTS,
-    MAX_DAEMON_FRAME_BYTES, MAX_DAEMON_SUPERVISORS, OpenedDaemonRequest,
+    MAX_DAEMON_FRAME_BYTES, MAX_DAEMON_SUPERVISORS, OpenedDaemonRequest, daemon_request,
 };
 pub use supervisor::{
     ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,

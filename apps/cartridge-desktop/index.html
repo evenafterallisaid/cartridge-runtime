@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
     <title>Cartridge</title>
   </head>
   <body>
@@ -19,7 +19,7 @@
         </div>
         <div class="engine-status" id="engine-status">
           <i></i>
-          <span>Engine ready</span>
+          <span>Reading engine</span>
         </div>
         <label class="global-search" for="global-search">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg>
@@ -62,7 +62,7 @@
             </button>
           </nav>
           <div class="sidebar-footer">
-            <div><span>Runtime</span><strong>local</strong></div>
+            <div><span>Runtime</span><strong class="pending" id="runtime-state">offline</strong></div>
             <div><span>Sandbox</span><strong class="pending">adapter pending</strong></div>
           </div>
         </aside>
@@ -85,7 +85,7 @@
 
           <div class="preview-banner" id="preview-banner">
             <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="8"></circle><path d="M10 9v5M10 6h.01"></path></svg>
-            <div><strong>Control-plane preview</strong><span>Apply records desired state. Workload reconciliation and native sandbox adapters are not active yet.</span></div>
+            <div><strong id="preview-title">Reading engine</strong><span id="preview-copy">Checking the authenticated local control plane…</span></div>
             <button type="button" id="dismiss-banner" aria-label="Dismiss">×</button>
           </div>
 

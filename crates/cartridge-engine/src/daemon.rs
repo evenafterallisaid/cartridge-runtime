@@ -2,8 +2,10 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chacha20poly1305::{
@@ -28,6 +30,7 @@ pub const MAX_DAEMON_SUPERVISORS: u16 = 64;
 const MAX_DAEMON_ENDPOINT_BYTES: u64 = 4096;
 const DAEMON_DIRECTION_REQUEST: &[u8] = b"cartridge-daemon-request-v1";
 const DAEMON_DIRECTION_RESPONSE: &[u8] = b"cartridge-daemon-response-v1";
+const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 static ENDPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -542,6 +545,68 @@ impl DaemonLease {
     }
 }
 
+pub fn daemon_request(root: &Path, request: DaemonRequest) -> Result<DaemonResponse, String> {
+    let endpoint = DaemonEndpoint::read(root)?;
+    if !DaemonLease::is_active(root)? {
+        return Err("engine daemon is not running".into());
+    }
+    let codec = DaemonCodec::from_endpoint(&endpoint)?;
+    let (request_id, frame) = codec.seal_request(request, current_time_ms()?)?;
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port));
+    let mut stream = TcpStream::connect_timeout(&address, DAEMON_CLIENT_TIMEOUT)
+        .map_err(|error| format!("could not connect to the engine daemon: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .and_then(|()| stream.set_read_timeout(Some(DAEMON_CLIENT_TIMEOUT)))
+        .and_then(|()| stream.set_write_timeout(Some(DAEMON_CLIENT_TIMEOUT)))
+        .map_err(|error| format!("could not configure the engine daemon connection: {error}"))?;
+    write_frame(&mut stream, &frame)?;
+    let response = read_frame(&mut stream)?;
+    let response = codec.open_response(&request_id, &response)?;
+    match response {
+        DaemonResponse::Error { code, message } => Err(format!("engine {code}: {message}")),
+        response => Ok(response),
+    }
+}
+
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .map_err(|error| format!("could not read engine frame length: {error}"))?;
+    let length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| "engine frame length overflow".to_string())?;
+    if length == 0 || length > MAX_DAEMON_FRAME_BYTES {
+        return Err("engine frame length is invalid".into());
+    }
+    let mut frame = vec![0_u8; length];
+    stream
+        .read_exact(&mut frame)
+        .map_err(|error| format!("could not read engine frame: {error}"))?;
+    Ok(frame)
+}
+
+fn write_frame(stream: &mut impl Write, frame: &[u8]) -> Result<(), String> {
+    if frame.is_empty() || frame.len() > MAX_DAEMON_FRAME_BYTES {
+        return Err("engine frame length is invalid".into());
+    }
+    let length =
+        u32::try_from(frame.len()).map_err(|_| "engine frame length overflow".to_string())?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .and_then(|()| stream.write_all(frame))
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("could not write engine frame: {error}"))
+}
+
+fn current_time_ms() -> Result<u64, String> {
+    let value = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?
+        .as_millis();
+    u64::try_from(value).map_err(|_| "system clock is outside the supported range".to_string())
+}
+
 #[cfg(unix)]
 fn ensure_daemon_root_private(root: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -644,6 +709,7 @@ fn replace_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{net::TcpListener, sync::Arc, thread};
 
     #[test]
     fn request_and_response_frames_are_confidential_and_bound_to_the_instance() {
@@ -709,6 +775,39 @@ mod tests {
         assert!(!format!("{endpoint:?}").contains(&endpoint.key_hex));
         lease.remove_endpoint(codec.instance_id()).unwrap();
         assert!(!directory.path().join(DAEMON_ENDPOINT_FILE).exists());
+    }
+
+    #[test]
+    fn shared_client_authenticates_and_bounds_a_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let lease = DaemonLease::acquire(directory.path()).unwrap();
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let codec = Arc::new(DaemonCodec::generate());
+        let endpoint = codec.endpoint(listener.local_addr().unwrap().port(), 42, 10);
+        lease.publish(&endpoint).unwrap();
+        let server_codec = codec.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let frame = read_frame(&mut stream).unwrap();
+            let opened = server_codec.open_request(&frame).unwrap();
+            assert!(matches!(opened.request, DaemonRequest::Ping));
+            let response = server_codec
+                .seal_response(&opened.request_id, DaemonResponse::Pong)
+                .unwrap();
+            write_frame(&mut stream, &response).unwrap();
+        });
+
+        assert_eq!(
+            daemon_request(directory.path(), DaemonRequest::Ping).unwrap(),
+            DaemonResponse::Pong
+        );
+        server.join().unwrap();
     }
 
     #[cfg(unix)]

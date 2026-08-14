@@ -1027,8 +1027,10 @@ The next concrete sequence is:
    - [implemented] native Tauri shell with library, stack, security posture, and event views
    - [implemented] exact plan and permission review with server-retained digest and package re-verification before apply
    - [implemented] private native-backed appearance and new-stack preferences with light/dark/system themes, density, and reduced-motion control
-   - add process/resource views, semantic plan diff, package import, and secret prompts
-   - add live logs, health, resource charts, trace inspection, and rollback controls
+   - [implemented] encrypted authenticated daemon client, fail-closed lifecycle mutations, live engine capacity, and observed per-replica lifecycle inspection
+   - add resource charts, semantic plan diff, package import, and secret prompts
+   - add live logs, health checks, trace inspection, and rollback controls
+   - install and supervise the daemon through native per-user service managers, with explicit start/restart/recovery UX
    - no privileged background service by default; explicit elevation only for optional adapters
 9. Grow from one machine toward an authority-minimal fleet:
    - signed node enrollment, short-lived leases, placement constraints, and drain

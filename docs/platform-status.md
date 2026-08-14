@@ -20,7 +20,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Network | Replayable scoped HTTP, encrypted peer-session primitives, verified asset transfer, CRDT document primitives, and deterministic simulation |
 | Compose | Typed dependency/provider declarations, direct semantic-version resolution, exact-byte lockfiles, and verified resolution from the installed library catalog |
 | Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, operator ceilings for fuel/memory/time/storage/media, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, checksum-chained desired state, generation-fenced observed state, single-owner supervision, per-replica state, bounded concurrency/restarts/backoff/deadlines, and a rootless persistent daemon with encrypted authenticated local control, replay rejection, liveness fencing, process-tree ownership, crash recovery, and Docker-style `engine` lifecycle commands |
-| Desktop | Native Tauri shell with overview, library, stack, journal, and settings views; exact plan and permission review; package re-verification; apply/stop/remove controls; persistent light/dark themes, density, motion, and safe new-stack defaults |
+| Desktop | Native Tauri shell with overview, library, stack, journal, and settings views; authenticated daemon health; live and last-recorded replica status; exact plan, limits, and permission review; package re-verification; daemon-only apply/stop/remove controls; persistent light/dark themes, density, motion, and safe new-stack defaults |
 | Quality | Cross-platform CI, parser fuzz targets, deterministic soak/benchmark tooling, compatibility policy, threat model, and RustSec dependency audit |
 
 ## What does not exist yet
@@ -39,7 +39,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Hermetic build engine | Developer builds work, but source/toolchain lockfiles, sandboxed build graphs, remote cache, provenance, and SBOM gates do not |
 | Hosted/federated registry | The local registry proves protocol behavior; production storage, federation, transparency operations, mirrors, and account policy do not exist |
 | Fleet scheduler | Peer primitives are not a cluster: there is no control plane, agent enrollment, placement, leases, rollout, drain, or stateful failover |
-| Complete desktop workflow | The first native control-plane shell works; package import, logs, traces, settings, secret prompts, updates, accessibility polish, signed installers, and native adapters remain |
+| Complete desktop workflow | The daemon-backed native control-plane shell works; package import, daemon lifecycle installation, logs, traces, resource charts, semantic plan diff, secret prompts, updates, accessibility polish, signed installers, and native adapters remain |
 | Independent assurance | The project has internal audits and regression PoCs, but not an independent security assessment or stable release support record |
 
 ## The honest Docker comparison

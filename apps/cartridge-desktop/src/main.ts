@@ -10,6 +10,8 @@ type ThemePreference = "system" | "light" | "dark";
 type DensityPreference = "comfortable" | "compact";
 type SecurityPreference = "strict" | "balanced" | "permissive";
 type SandboxPreference = "required" | "preferred" | "disabled";
+type EngineConnectionState = "online" | "offline" | "degraded";
+type ReplicaPhase = "pending" | "starting" | "running" | "backoff" | "succeeded" | "failed" | "exhausted" | "stopped";
 
 interface LibraryEntry {
   cartridge_id: string;
@@ -35,8 +37,25 @@ interface PlannedInstance {
   package_sha256: string;
   replicas: number;
   desired: "running" | "stopped";
+  restart: "never" | "on-failure" | "always";
+  max_restarts: number;
   allowed: string[];
   denied: string[];
+  limits: RuntimeLimits;
+}
+
+interface RuntimeLimits {
+  fuel: number;
+  memory_bytes: number;
+  timeout_ms: number;
+  storage_bytes: number;
+  storage_keys: number;
+  storage_value_bytes: number;
+  graphics_pixels: number;
+  graphics_commands: number;
+  audio_nodes: number;
+  audio_events: number;
+  audio_frames: number;
 }
 
 interface PlannedResource {
@@ -70,8 +89,57 @@ interface EngineEvent {
 }
 
 interface Dashboard {
+  engine: EngineConnection;
   packages: LibraryEntry[];
   stacks: StackStatus[];
+}
+
+interface EngineInfo {
+  protocol_version: number;
+  instance_id: string;
+  pid: number;
+  started_at_ms: number;
+  active_supervisors: number;
+  max_supervisors: number;
+  workers_per_stack: number;
+  known_stacks: number;
+  applied_stacks: number;
+}
+
+interface EngineConnection {
+  state: EngineConnectionState;
+  info: EngineInfo | null;
+  message: string | null;
+}
+
+interface ReplicaRuntime {
+  id: { instance: string; ordinal: number };
+  desired: "running" | "stopped";
+  restart: "never" | "on-failure" | "always";
+  max_restarts: number;
+  attempt: number;
+  phase: ReplicaPhase;
+  run_id: string | null;
+  started_at_ms: number | null;
+  finished_at_ms: number | null;
+  next_start_at_ms: number | null;
+  last_exit_code: number | null;
+  detail: string | null;
+}
+
+interface StackRuntimeStatus {
+  format_version: number;
+  stack: string;
+  revision: number;
+  generation: string;
+  observed_at_ms: number;
+  replicas: ReplicaRuntime[];
+  status_sha256: string;
+}
+
+interface StackDetails {
+  plan: StackPlan | null;
+  runtime: StackRuntimeStatus | null;
 }
 
 interface AppSettings {
@@ -103,7 +171,11 @@ const engineStatus = required<HTMLElement>("engine-status");
 const confirmDialog = required<HTMLDialogElement>("confirm-dialog");
 const previewBanner = required<HTMLElement>("preview-banner");
 
-let dashboard: Dashboard = { packages: [], stacks: [] };
+let dashboard: Dashboard = {
+  engine: { state: "offline", info: null, message: null },
+  packages: [],
+  stacks: [],
+};
 let currentView: View = "stacks";
 let currentPlan: StackPlan | null = null;
 let refreshing = false;
@@ -159,8 +231,7 @@ async function refresh(): Promise<void> {
   engineStatus.classList.add("working");
   try {
     dashboard = await invoke<Dashboard>("dashboard");
-    engineStatus.className = "engine-status";
-    engineStatus.querySelector("span")!.textContent = "Engine ready";
+    updateEngineChrome();
     required<HTMLElement>("stack-count").textContent = String(dashboard.stacks.length);
     required<HTMLElement>("package-count").textContent = String(dashboard.packages.length);
     render();
@@ -171,6 +242,35 @@ async function refresh(): Promise<void> {
     showNotice(String(error), "error");
   } finally {
     refreshing = false;
+  }
+}
+
+function updateEngineChrome(): void {
+  const engine = dashboard.engine;
+  const labels: Record<EngineConnectionState, string> = {
+    online: "Engine running",
+    offline: "Engine offline",
+    degraded: "Engine degraded",
+  };
+  engineStatus.className = `engine-status ${engine.state}`;
+  engineStatus.querySelector("span")!.textContent = labels[engine.state];
+  engineStatus.title = engine.message ?? (engine.info ? `PID ${engine.info.pid} · ${engine.info.active_supervisors} supervisors` : labels[engine.state]);
+  const runtimeState = required<HTMLElement>("runtime-state");
+  runtimeState.textContent = engine.state;
+  runtimeState.className = engine.state === "online" ? "online" : "pending";
+  const bannerTitle = required<HTMLElement>("preview-title");
+  const bannerCopy = required<HTMLElement>("preview-copy");
+  previewBanner.classList.remove("online", "offline", "degraded");
+  previewBanner.classList.add(engine.state);
+  if (engine.state === "online" && engine.info) {
+    bannerTitle.textContent = "Engine connected";
+    bannerCopy.textContent = `Daemon ${shortDigest(engine.info.instance_id)} owns ${engine.info.active_supervisors} of ${engine.info.max_supervisors} supervisor slots.`;
+  } else if (engine.state === "degraded") {
+    bannerTitle.textContent = "Engine degraded";
+    bannerCopy.textContent = engine.message ?? "Authenticated daemon control is unavailable; mutations are disabled.";
+  } else {
+    bannerTitle.textContent = "Engine offline";
+    bannerCopy.textContent = "Local state remains inspectable, but apply, stop, and remove require the authenticated engine daemon.";
   }
 }
 
@@ -234,11 +334,18 @@ function renderSettings(): void {
   page.append(runtime);
 
   const boundary = settingsSection("Runtime", "Current local engine and WebAssembly boundary.");
+  const engine = dashboard.engine;
+  const engineValue = engine.state === "online" ? "Running" : engine.state === "degraded" ? "Degraded" : "Offline";
+  const supervisorCopy = engine.info
+    ? `${engine.info.active_supervisors} active of ${engine.info.max_supervisors} allowed`
+    : "Available after the authenticated daemon connects";
+  const workerValue = engine.info ? `${engine.info.workers_per_stack} per stack` : "Unavailable";
   boundary.append(
-    readOnlySetting("Engine", "Local per-user control plane", "Desired state"),
+    readOnlySetting("Engine", engine.message ?? "Authenticated local per-user control plane", engineValue),
+    readOnlySetting("Supervisors", supervisorCopy, engine.info ? String(engine.info.active_supervisors) : "—"),
+    readOnlySetting("Worker slots", "Maximum concurrent workers assigned to each stack supervisor", workerValue),
     readOnlySetting("WebAssembly", "WASI 0.2 component model", "Preview 2"),
     readOnlySetting("Package identity", "Exact bytes rechecked before apply", "Always on"),
-    readOnlySetting("Workload supervisor", "Worker reconciliation is not active in this preview", "Pending"),
   );
   page.append(boundary);
 
@@ -409,9 +516,9 @@ function tableHead(labels: string[]): HTMLTableSectionElement {
 function stackRow(stack: StackStatus): HTMLTableRowElement {
   const row = element("tr");
   row.tabIndex = 0;
-  row.addEventListener("click", () => showStack(stack));
+  row.addEventListener("click", () => void showStack(stack));
   row.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") showStack(stack);
+    if (event.key === "Enter" || event.key === " ") void showStack(stack);
   });
   const name = element("td");
   const identity = element("div", "primary-cell");
@@ -433,7 +540,7 @@ function stackRow(stack: StackStatus): HTMLTableRowElement {
   menu.setAttribute("aria-label", `Actions for ${stack.stack}`);
   menu.addEventListener("click", (event) => {
     event.stopPropagation();
-    showStack(stack);
+    void showStack(stack);
   });
   actions.append(menu);
   row.append(actions);
@@ -674,6 +781,8 @@ function renderPlan(plan: StackPlan, source: string): void {
   cancel.addEventListener("click", closeInspector);
   const apply = element("button", "button primary", "Apply stack");
   apply.type = "button";
+  apply.disabled = dashboard.engine.state !== "online";
+  if (apply.disabled) apply.title = "Start the authenticated engine daemon before applying this stack.";
   apply.addEventListener("click", () => void applyCurrentPlan());
   footer.append(cancel, apply);
   wrapper.append(footer);
@@ -706,6 +815,15 @@ function planInstance(instance: PlannedInstance): HTMLElement {
   copy.append(element("strong", undefined, instance.name), element("span", undefined, instance.cartridge_id));
   head.append(copy, element("code", undefined, instance.version));
   card.append(head, element("code", "package-digest", instance.package_sha256));
+  const limits = element("div", "instance-limits");
+  limits.append(
+    detailMetric("Replicas", String(instance.replicas)),
+    detailMetric("Memory", formatBytes(instance.limits.memory_bytes)),
+    detailMetric("Timeout", `${instance.limits.timeout_ms} ms`),
+    detailMetric("Fuel", instance.limits.fuel.toLocaleString()),
+  );
+  card.append(limits);
+  card.append(element("p", "restart-policy", `restart ${instance.restart} · up to ${instance.max_restarts} retries`));
   card.append(capabilityRow("Allowed", instance.allowed, false));
   if (instance.denied.length > 0) card.append(capabilityRow("Denied", instance.denied, true));
   return card;
@@ -724,6 +842,10 @@ function capabilityRow(label: string, values: string[], denied: boolean): HTMLEl
 async function applyCurrentPlan(): Promise<void> {
   const plan = currentPlan;
   if (!plan || mutating) return;
+  if (dashboard.engine.state !== "online") {
+    showNotice("Start the authenticated engine daemon before applying a stack.", "error");
+    return;
+  }
   const insecure = plan.security.sandbox === "disabled";
   if (insecure) {
     const approved = await confirmAction(
@@ -750,38 +872,125 @@ async function applyCurrentPlan(): Promise<void> {
   }
 }
 
-function showStack(stack: StackStatus): void {
+async function showStack(stack: StackStatus): Promise<void> {
   const wrapper = element("div", "details-content");
   wrapper.append(detailsHeader("Stack details", stack.stack, closeInspector));
   const status = element("div", "details-status");
   status.append(statusBadge(stack.state), element("span", undefined, `Revision ${stack.revision}`));
   wrapper.append(status);
-  const metrics = element("div", "policy-grid");
-  metrics.append(
-    detailMetric("Instances", String(stack.instance_count)),
-    detailMetric("Desired replicas", String(stack.desired_replicas)),
-  );
-  wrapper.append(metrics);
-  const identity = element("section", "details-section definition-list");
-  identity.append(element("h3", undefined, "Identity"));
-  identity.append(definition("Plan digest", stack.plan_sha256 ?? "Removed"), definition("Event digest", stack.event_sha256));
-  wrapper.append(identity);
-  const note = element("div", "neutral-callout");
-  note.append(element("strong", undefined, "Desired state only"), element("p", undefined, "The local supervisor is not active, so applied does not mean a worker process is running."));
-  wrapper.append(note);
+  const body = element("div", "stack-detail-body");
+  body.append(loadingRow("Reading observed replica state…"));
+  wrapper.append(body);
   const footer = element("div", "details-footer");
   const stop = element("button", "button secondary", "Stop");
   stop.type = "button";
-  stop.disabled = stack.state !== "applied";
+  stop.disabled = stack.state !== "applied" || dashboard.engine.state !== "online";
+  if (dashboard.engine.state !== "online") stop.title = "The engine daemon is offline.";
   stop.addEventListener("click", () => void mutateStack("stop_stack", stack.stack));
   const remove = element("button", "button danger", "Remove");
   remove.type = "button";
-  remove.disabled = stack.state === "removed";
+  remove.disabled = stack.state === "removed" || dashboard.engine.state !== "online";
+  if (dashboard.engine.state !== "online") remove.title = "The engine daemon is offline.";
   remove.addEventListener("click", () => void removeStack(stack.stack));
   footer.append(stop, remove);
   wrapper.append(footer);
   inspector.replaceChildren(wrapper);
   inspector.classList.add("open");
+  try {
+    const details = await invoke<StackDetails>("stack_details", { stack: stack.stack });
+    if (!inspector.contains(wrapper)) return;
+    body.replaceChildren(renderStackDetails(stack, details));
+  } catch (error) {
+    if (inspector.contains(wrapper)) body.replaceChildren(emptyState("Could not read runtime state", String(error), "error"));
+  }
+}
+
+function renderStackDetails(stack: StackStatus, details: StackDetails): HTMLElement {
+  const body = element("div");
+  const replicas = details.runtime?.replicas ?? [];
+  const running = replicas.filter((replica) => replica.phase === "running").length;
+  const starting = replicas.filter((replica) => replica.phase === "starting" || replica.phase === "pending" || replica.phase === "backoff").length;
+  const failed = replicas.filter((replica) => replica.phase === "failed" || replica.phase === "exhausted").length;
+  const stopped = replicas.filter((replica) => replica.phase === "stopped" || replica.phase === "succeeded").length;
+  const metrics = element("div", "policy-grid");
+  metrics.append(
+    detailMetric("Running", String(running)),
+    detailMetric("Starting", String(starting), starting > 0),
+    detailMetric("Failed", String(failed), failed > 0),
+    detailMetric("Stopped", String(stopped)),
+  );
+  body.append(metrics);
+
+  if (dashboard.engine.state !== "online") {
+    const note = element("div", "warning-callout");
+    note.append(
+      element("strong", undefined, "Offline snapshot"),
+      element("p", undefined, "This is the last recorded runtime status. Start the authenticated daemon for live reconciliation and mutations."),
+    );
+    body.append(note);
+  }
+
+  if (replicas.length > 0) {
+    const observed = element("section", "details-section");
+    const observedTitle = details.runtime
+      ? `Observed replicas · ${new Date(details.runtime.observed_at_ms).toLocaleTimeString()}`
+      : "Observed replicas";
+    observed.append(element("h3", undefined, observedTitle));
+    for (const replica of replicas) observed.append(replicaCard(replica));
+    body.append(observed);
+  } else {
+    const note = element("div", "neutral-callout");
+    note.append(element("strong", undefined, "No observed replicas"), element("p", undefined, "The supervisor has not recorded worker state for this stack."));
+    body.append(note);
+  }
+
+  if (details.plan) {
+    const planned = element("section", "details-section");
+    planned.append(element("h3", undefined, "Desired instances"));
+    for (const instance of details.plan.instances) planned.append(planInstance(instance));
+    body.append(planned);
+  }
+
+  const identity = element("section", "details-section definition-list");
+  identity.append(element("h3", undefined, "Identity"));
+  identity.append(
+    definition("Plan digest", stack.plan_sha256 ?? "Removed"),
+    definition("Event digest", stack.event_sha256),
+  );
+  if (details.runtime) {
+    identity.append(
+      definition("Generation", details.runtime.generation),
+      definition("Status digest", details.runtime.status_sha256),
+    );
+  }
+  body.append(identity);
+  return body;
+}
+
+function replicaCard(replica: ReplicaRuntime): HTMLElement {
+  const card = element("article", "replica-card");
+  const head = element("div", "replica-head");
+  const identity = element("div");
+  identity.append(
+    element("strong", undefined, `${replica.id.instance} #${replica.id.ordinal}`),
+    element("span", undefined, `attempt ${replica.attempt} · restart ${replica.restart}`),
+  );
+  head.append(identity, replicaBadge(replica.phase));
+  card.append(head);
+  const facts = element("div", "replica-facts");
+  facts.append(
+    element("span", undefined, replica.run_id ? `run ${shortDigest(replica.run_id)}` : "no active run"),
+    element("span", undefined, replica.last_exit_code === null ? "no exit code" : `exit ${replica.last_exit_code}`),
+  );
+  card.append(facts);
+  if (replica.detail) card.append(element("p", "replica-detail", replica.detail));
+  return card;
+}
+
+function replicaBadge(phase: ReplicaPhase): HTMLElement {
+  const badge = element("span", `replica-phase ${phase}`);
+  badge.append(element("i"), document.createTextNode(phase));
+  return badge;
 }
 
 function definition(label: string, value: string): HTMLElement {
@@ -801,6 +1010,10 @@ async function removeStack(stack: string): Promise<void> {
 
 async function mutateStack(command: "stop_stack" | "remove_stack", stack: string): Promise<void> {
   if (mutating) return;
+  if (dashboard.engine.state !== "online") {
+    showNotice("The authenticated engine daemon must be running for this action.", "error");
+    return;
+  }
   mutating = true;
   try {
     await invoke(command, { stack });
@@ -871,3 +1084,7 @@ async function initialize(): Promise<void> {
 }
 
 void initialize();
+
+window.setInterval(() => {
+  if (!document.hidden && currentView === "stacks" && !mutating && !refreshing) void refresh();
+}, 5000);

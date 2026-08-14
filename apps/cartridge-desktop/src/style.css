@@ -36,6 +36,10 @@ code, .mono-cell, .digest-cell { font-family: "SFMono-Regular", Consolas, "Liber
 .app-brand .brand-contacts { fill: var(--coral); }
 .engine-status { display: inline-flex; align-items: center; gap: 7px; width: max-content; color: #47515b; font-size: 12px; }
 .engine-status i { width: 8px; height: 8px; border: 2px solid #fff; border-radius: 50%; background: #2da44e; box-shadow: 0 0 0 1px #1a7f43; }
+.engine-status.online i { background: #2da44e; box-shadow: 0 0 0 1px #1a7f43; }
+.engine-status.offline i { background: #8c959f; box-shadow: 0 0 0 1px #6e7781; }
+.engine-status.degraded { color: #7d4e00; }
+.engine-status.degraded i { background: var(--amber); box-shadow: 0 0 0 1px #9a6700; }
 .engine-status.working i { border-color: #d0e7ff; background: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
 .engine-status.error { color: var(--red); }
 .engine-status.error i { border-color: #ffebe9; background: var(--red); box-shadow: 0 0 0 1px var(--red); }
@@ -70,6 +74,7 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 .sidebar-footer span { color: #7a838c; }
 .sidebar-footer strong { color: #46505a; font-weight: 600; }
 .sidebar-footer strong.pending { color: var(--amber); }
+.sidebar-footer strong.online { color: var(--green); }
 
 .workspace { min-width: 0; overflow: auto; padding: 0 30px 42px; }
 .page-header { display: flex; align-items: center; justify-content: space-between; min-height: 99px; }
@@ -90,6 +95,10 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 .preview-banner strong { font-size: 11px; }
 .preview-banner span { overflow: hidden; color: #45645e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .preview-banner button { border: 0; color: #55726d; background: transparent; font-size: 18px; cursor: pointer; }
+.preview-banner.offline { border-color: #c8ced4; color: #46505a; background: #f3f5f7; }
+.preview-banner.degraded { border-color: #e7c866; color: #633c01; background: #fff8c5; }
+.preview-banner.offline > svg, .preview-banner.offline span { color: #66707a; }
+.preview-banner.degraded > svg, .preview-banner.degraded span { color: #7d4e00; }
 .notice { position: fixed; top: 70px; left: 50%; z-index: 20; max-width: 620px; padding: 10px 14px; border: 1px solid #67b37f; border-radius: 6px; color: #14532d; background: #ecfdf3; box-shadow: 0 8px 24px #24292f26; transform: translateX(-50%); font-size: 12px; }
 .notice.error { border-color: #ff8182; color: #82071e; background: #ffebe9; }
 .content { min-width: 0; }
@@ -179,6 +188,10 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 .instance-review strong { color: #1f2328; font-size: 11px; }
 .instance-review span { overflow: hidden; color: #66707a; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .instance-review code { color: #46505a; font-size: 9px; }
+.instance-limits { display: grid !important; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px !important; margin-top: 10px; }
+.instance-limits .detail-metric { min-height: 45px; padding: 7px 8px; }
+.instance-limits .detail-metric strong { font-size: 9px; }
+.restart-policy { margin: 8px 0 0; color: #66707a; font-size: 9px; }
 .package-digest { display: block; overflow: hidden; margin: 7px 0; color: #8c959f !important; text-overflow: ellipsis; white-space: nowrap; }
 .capability-row { display: grid; grid-template-columns: 52px 1fr; align-items: start; gap: 7px; margin-top: 5px; }
 .capability-row > span { padding-top: 3px; color: #66707a; font-size: 9px; }
@@ -195,6 +208,22 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 .definition-list > div { display: grid; grid-template-columns: 85px 1fr; gap: 10px; margin-top: 9px; }
 .definition-list dt { color: #66707a; font-size: 9px; }
 .definition-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #46505a; font: 9px/1.45 "SFMono-Regular", Consolas, monospace; }
+.stack-detail-body { padding-bottom: 10px; }
+.replica-card { margin-top: 8px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 7px; background: #fafbfc; }
+.replica-head, .replica-facts { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.replica-head > div { display: grid; gap: 3px; min-width: 0; }
+.replica-head strong { color: #24292f; font-size: 10px; }
+.replica-head span, .replica-facts { color: #66707a; font-size: 9px; }
+.replica-facts { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--border-soft); }
+.replica-phase { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 999px; color: #46505a; background: #eaeef2; font-size: 8px; text-transform: capitalize; }
+.replica-phase i { width: 6px; height: 6px; border-radius: 50%; background: #8c959f; }
+.replica-phase.running { color: #116329; background: #dafbe1; }
+.replica-phase.running i { background: #2da44e; }
+.replica-phase.pending, .replica-phase.starting, .replica-phase.backoff { color: #7d4e00; background: #fff8c5; }
+.replica-phase.pending i, .replica-phase.starting i, .replica-phase.backoff i { background: #bf8700; }
+.replica-phase.failed, .replica-phase.exhausted { color: #a40e26; background: #ffebe9; }
+.replica-phase.failed i, .replica-phase.exhausted i { background: #cf222e; }
+.replica-detail { margin: 8px 0 0; overflow-wrap: anywhere; color: #66707a; font: 8px/1.45 "SFMono-Regular", Consolas, monospace; }
 .details-footer { position: absolute; right: 0; bottom: 0; left: 0; display: flex; justify-content: flex-end; gap: 8px; padding: 13px 22px; border-top: 1px solid var(--border); background: #fff; }
 
 .confirm-dialog { width: 410px; padding: 0; border: 1px solid #c9d1d9; border-radius: 8px; color: #1f2328; background: #fff; box-shadow: 0 18px 55px #24292f4d; }
@@ -294,6 +323,10 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 :root[data-theme="dark"] .button.danger { border-color: #cf3949; color: #fff; background: #b42335; }
 :root[data-theme="dark"] .preview-banner, :root[data-theme="dark"] .neutral-callout { border-color: #356d5d; color: #b7ebc7; background: #102a22; }
 :root[data-theme="dark"] .preview-banner span { color: #9ec5b2; }
+:root[data-theme="dark"] .preview-banner.offline { border-color: #414642; color: #c5cac6; background: #202422; }
+:root[data-theme="dark"] .preview-banner.offline span { color: #9da39f; }
+:root[data-theme="dark"] .preview-banner.degraded { border-color: #785d26; color: #f2d18b; background: #302713; }
+:root[data-theme="dark"] .preview-banner.degraded span { color: #d9bc7a; }
 :root[data-theme="dark"] .table-toolbar, :root[data-theme="dark"] .data-table th { border-color: var(--border); color: #aeb4b0; background: #202321; }
 :root[data-theme="dark"] .filter-tabs button, :root[data-theme="dark"] .table-summary { color: #9da39f; }
 :root[data-theme="dark"] .filter-tabs button.active { color: #f3f3ef; }
@@ -310,6 +343,13 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 :root[data-theme="dark"] .capability-row b { border-color: #356d4a; color: #8fe1a8; background: #142a1c; }
 :root[data-theme="dark"] .capability-row b.denied { border-color: #713943; color: #ff9aa4; background: #30181c; }
 :root[data-theme="dark"] .capability-row b.muted { border-color: #454a47; color: #aeb4b0; background: #252927; }
+:root[data-theme="dark"] .replica-card { background: #1c201e; }
+:root[data-theme="dark"] .replica-head strong { color: #f3f3ef; }
+:root[data-theme="dark"] .replica-head span, :root[data-theme="dark"] .replica-facts, :root[data-theme="dark"] .replica-detail, :root[data-theme="dark"] .restart-policy { color: #9da39f; }
+:root[data-theme="dark"] .replica-phase { color: #aeb4b0; background: #292d2b; }
+:root[data-theme="dark"] .replica-phase.running { color: #8fe1a8; background: #142a1c; }
+:root[data-theme="dark"] .replica-phase.pending, :root[data-theme="dark"] .replica-phase.starting, :root[data-theme="dark"] .replica-phase.backoff { color: #f2d18b; background: #302713; }
+:root[data-theme="dark"] .replica-phase.failed, :root[data-theme="dark"] .replica-phase.exhausted { color: #ff9aa4; background: #30181c; }
 :root[data-theme="dark"] .settings-intro { color: #f3f3ef; background: #073f35; }
 :root[data-theme="dark"] .settings-section > header { background: #202321; }
 :root[data-theme="dark"] .setting-value, :root[data-theme="dark"] .settings-footer span { color: #aeb4b0; }

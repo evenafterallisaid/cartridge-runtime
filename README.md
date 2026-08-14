@@ -175,7 +175,7 @@ npm ci
 npm run tauri dev
 ```
 
-The first shell shows the local library, stacks, security posture, event history, and native-backed settings. It can load a stack manifest, review its exact hashes and effective permissions, apply the reviewed digest, stop it, and tombstone it. The backend retains the reviewed plan outside the webview and re-verifies every installed package before apply. Light, dark, density, motion, and new-stack defaults persist in the private app-data directory.
+The desktop connects to the same encrypted authenticated local daemon as the CLI. It shows daemon capacity plus live or last-recorded replica lifecycle, restart, run, and exit state. It can load a stack manifest, review exact hashes, resource ceilings, and effective permissions, then apply that reviewed digest, stop it, or tombstone it. Mutations fail closed while the daemon is unavailable; offline state remains inspectable. The backend keeps the control key and reviewed plan outside the webview and re-verifies every installed package before apply. Light, dark, density, motion, and new-stack defaults persist in the private app-data directory.
 
 Build and run the visual reference with a replayable screenshot sidecar:
 

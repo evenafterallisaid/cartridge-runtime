@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::{ErrorKind, Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
@@ -12,9 +12,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_desktop::Library;
 use cartridge_engine::{
-    DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonEndpoint, DaemonInfo, DaemonLease, DaemonRequest,
-    DaemonResponse, EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
-    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_REPLICAS, ReplicaPhase, StackPlan,
+    DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse,
+    EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
+    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_REPLICAS, ReplicaPhase, StackPlan, daemon_request,
 };
 
 use crate::process_control::{
@@ -179,27 +179,7 @@ pub fn serve(options: &ServeOptions<'_>) -> Result<()> {
 }
 
 pub fn request(root: &Path, request: DaemonRequest) -> Result<DaemonResponse> {
-    let endpoint = DaemonEndpoint::read(root).map_err(anyhow::Error::msg)?;
-    if !DaemonLease::is_active(root).map_err(anyhow::Error::msg)? {
-        bail!("engine daemon is not running");
-    }
-    let codec = DaemonCodec::from_endpoint(&endpoint).map_err(anyhow::Error::msg)?;
-    let (request_id, frame) = codec
-        .seal_request(request, current_time_ms()?)
-        .map_err(anyhow::Error::msg)?;
-    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port));
-    let mut stream = TcpStream::connect_timeout(&address, CLIENT_TIMEOUT)
-        .context("could not connect to the engine daemon")?;
-    configure_stream(&stream)?;
-    write_frame(&mut stream, &frame)?;
-    let response = read_frame(&mut stream)?;
-    let response = codec
-        .open_response(&request_id, &response)
-        .map_err(anyhow::Error::msg)?;
-    match response {
-        DaemonResponse::Error { code, message } => bail!("engine {code}: {message}"),
-        response => Ok(response),
-    }
+    daemon_request(root, request).map_err(anyhow::Error::msg)
 }
 
 fn accept_clients(
