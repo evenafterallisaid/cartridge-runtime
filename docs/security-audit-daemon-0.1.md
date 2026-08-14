@@ -8,7 +8,7 @@ Scope: the complete Rust workspace, native desktop shell, dependency graphs, pac
 
 ## Result
 
-No known exploitable issue remains in the implemented daemon protocol and lifecycle boundary after the fixes below. This result does not certify the missing platform-native worker sandboxes, OS process-tree containment, peer-credential transports, service broker, secret broker, ingress, health-gated rollout, signed installers, or fleet control plane.
+No known exploitable issue remains in the implemented daemon protocol and lifecycle boundary after the fixes below. This result does not certify the missing platform-native worker authority sandboxes, peer-credential transports, service broker, secret broker, ingress, application probes and rolling/canary scheduling, signed installers, or fleet control plane. Transactional whole-generation rollout was reviewed separately after this document.
 
 ## Findings fixed during review
 

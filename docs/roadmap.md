@@ -1016,8 +1016,13 @@ The next concrete sequence is:
    - [implemented] generation-fenced replica expansion, durable observed status, restart recovery, process reconciliation, and one-supervisor leases
    - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, graceful client/supervisor drain, and crash-resistant process-tree ownership
    - [implemented] checksum-bound supervisor heartbeats, authenticated bounded health aggregation, stale-generation detection, and deadline-bounded readiness waits
-   - add explicit prepare/activate/commit rollout phases and recovery checkpoints
-   - add manifest-defined application probes, health-gated rollback, and rolling/canary replacement
+   - [implemented] explicit prepare/activate/commit/cancel/rollback phases, bounded archived checkpoints, journal-adjacent crash recovery, and direct-mutation fencing
+   - [implemented at process-health level] deadline-gated automatic update commit with exact previous-generation rollback
+   - add manifest-defined startup, readiness, and liveness probes with bounded schedules, timeouts, output, consecutive-success/failure thresholds, and explicit probe capabilities
+   - add rollout policy for `max_surge`, `max_unavailable`, minimum ready time, progress deadlines, pause/resume, and per-instance ordering
+   - retain old and new generation supervisors concurrently, route only to ready replicas, drain gracefully, and recover ownership after daemon failure
+   - add deterministic canary cohorts, metric/trace gates, operator promotion, and automatic abort without widening package authority
+   - require migration compatibility or a verified rollback receipt before updating stateful instances whose schema changes
    - compact long journals through signed checkpoints without losing auditability
 6. Complete the external 1.0 security gates in parallel:
    - platform-native worker sandboxes and kernel resource limits

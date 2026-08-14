@@ -22,7 +22,7 @@ This result does not make Cartridge safe for arbitrary hostile third-party code.
 | FULL-06 | medium | CI's second `rustsec/audit-check` invocation used an unsupported `working-directory` input, so it rescanned the root lockfile instead of the Tauri lockfile | CI installs a pinned `cargo-audit`, explicitly scans both lockfiles, audits npm dependencies, and no longer grants the obsolete `checks: write` permission |
 | FULL-07 | high | desktop apply, stop, and remove commands wrote the engine store directly, bypassing daemon serialization, shutdown fencing, and supervisor ownership | both CLI and desktop now use one bounded encrypted authenticated daemon client; desktop mutations have no offline direct-store fallback and the webview never receives control keys |
 
-Detailed resource-governance evidence is in [security-audit-resource-governance-0.1.md](security-audit-resource-governance-0.1.md).
+Detailed resource-governance evidence is in [security-audit-resource-governance-0.1.md](security-audit-resource-governance-0.1.md). The later engine-health and transactional-update additions have focused reviews in [security-audit-engine-health-0.1.md](security-audit-engine-health-0.1.md) and [security-audit-rollout-0.1.md](security-audit-rollout-0.1.md).
 
 ## Historical exploit regression status
 
@@ -38,7 +38,7 @@ The workspace test suite contains direct regressions for each boundary.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 212 tests passed
+- `cargo test --workspace`: 228 tests passed
 - Tauri `cargo test`: 4 tests passed
 - Tauri `cargo clippy --all-targets -- -D warnings`
 - production frontend TypeScript and Vite build from a clean `npm ci`
@@ -77,7 +77,7 @@ Guests receive the WASI 0.2 Component Model surface selected by Cartridge, not a
 
 ### Desired state and local control
 
-Plans bind exact package identities, permissions, limits, replicas, and composition edges. Apply revalidates installed bytes before journal mutation. Journals, observed status, and daemon frames are integrity checked and bounded. Local control frames are confidential, authenticated, freshness checked, replay rejected, and tied to one daemon generation.
+Plans bind exact package identities, permissions, limits, replicas, and composition edges. Apply revalidates installed bytes before journal mutation. Transactional updates retain the exact previous generation, re-verify both activation and rollback packages, fence conflicting mutations, require stable process health, and recover journal/checkpoint crash windows. Journals, rollout checkpoints, compact rollout status, observed status, and daemon frames are integrity checked and bounded. Local control frames are confidential, authenticated, freshness checked, replay rejected, and tied to one daemon generation.
 
 ### Processes and desktop
 
@@ -89,6 +89,7 @@ Daemon, supervisor, and guest descendants are owned as a tree and carry private 
 - No cgroup, Job Object memory/CPU-rate, macOS resource-policy, disk-I/O, handle-count, or engine-wide disk quota layer yet.
 - An unknown Wasmtime, compiler, webview, native adapter, or operating-system vulnerability can cross the portable boundary.
 - The daemon still uses authenticated loopback TCP rather than named pipes/Unix sockets with kernel peer credentials and ACLs.
+- Rollouts replace a whole generation and rely on process stability; application probes, canary routing, and surge/unavailable rolling windows remain open scheduler gates.
 - Same-user processes with direct filesystem authority remain partly outside the threat boundary.
 - State and traces are integrity protected where documented but are not generally encrypted at rest.
 - Live HTTP, device, GPU, and service-composition adapters require separate adapter-specific sandbox and confused-deputy reviews.

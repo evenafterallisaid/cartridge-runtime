@@ -29,6 +29,8 @@ fn growing_engine_commands_keep_cli_construction_bounded() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("health"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("wait"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("update"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rollout"));
 }
 
 #[test]
@@ -143,6 +145,25 @@ fn daemon_authenticates_clients_survives_bad_frames_and_cleans_up() {
     );
     let health: serde_json::Value = serde_json::from_slice(&health.stdout).unwrap();
     assert_eq!(health, serde_json::json!([]));
+
+    let rollout = run(
+        binary,
+        &[
+            "engine",
+            "rollout",
+            "status",
+            "missing-stack",
+            "--root",
+            engine.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        rollout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollout.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&rollout.stdout).trim(), "null");
 
     let missing = run(
         binary,

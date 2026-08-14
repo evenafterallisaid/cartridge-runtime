@@ -190,13 +190,25 @@ jobs:
           done
           test -e daemon-engine/daemon.json
           "$binary" engine ping --root daemon-engine --json | grep '"reachable":true'
-          "$binary" engine apply tests/fixtures/Cartridge.stack.toml --root daemon-engine
+          "$binary" engine update tests/fixtures/Cartridge.stack.toml --root daemon-engine --timeout-ms 15000 --json | grep '"phase": "committed"'
+          "$binary" engine rollout status hello-stack --root daemon-engine --json | grep '"health_report_sha256"'
           "$binary" engine wait hello-stack --root daemon-engine --timeout-ms 15000 --json | grep -E '"state": "(healthy|completed)"'
           "$binary" engine health hello-stack --root daemon-engine --json | grep '"report_sha256"'
           "$binary" engine ps hello-stack --root daemon-engine --json | grep -E '"phase": "(running|succeeded)"'
           "$binary" engine events hello-stack --root daemon-engine --tail 1 --json | grep '"revision": 1'
           "$binary" engine stop hello-stack --root daemon-engine
           "$binary" engine remove hello-stack --root daemon-engine
+          set +e
+          failed_update=$("$binary" engine update tests/fixtures/Cartridge.limits.stack.toml --root daemon-engine --timeout-ms 15000 2>&1)
+          failed_update_status=$?
+          set -e
+          if [ "$failed_update_status" -eq 0 ]; then
+            echo "resource-exhausted rollout unexpectedly committed"
+            exit 1
+          fi
+          printf '%s' "$failed_update" | grep 'rollout failed and was RolledBack'
+          "$binary" engine status hello-budget-stack --root daemon-engine --json | grep '"state": "removed"'
+          "$binary" engine rollout status hello-budget-stack --root daemon-engine --json | grep '"phase": "rolled-back"'
           "$binary" engine shutdown --root daemon-engine --json | grep '"stopping":true'
           wait "$daemon_pid"
           test ! -e daemon-engine/daemon.json

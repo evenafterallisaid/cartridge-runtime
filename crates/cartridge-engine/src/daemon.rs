@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use super::{
-    ApplyReport, EngineEvent, StackHealthReport, StackManifest, StackPlan, StackRuntimeStatus,
-    StackStatus, ensure_directory, is_digest, is_regular_file, private_options, valid_name,
-    valid_text, validate_health_reports,
+    ApplyReport, EngineEvent, RolloutStatus, StackHealthReport, StackManifest, StackPlan,
+    StackRuntimeStatus, StackStatus, ensure_directory, is_digest, is_regular_file, private_options,
+    valid_name, valid_text, validate_health_reports,
 };
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const DAEMON_ENDPOINT_FILE: &str = "daemon.json";
 pub const MAX_DAEMON_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DAEMON_EVENTS: u16 = 256;
@@ -104,6 +104,25 @@ pub enum DaemonRequest {
         plan: Box<StackPlan>,
         allow_insecure: bool,
     },
+    RolloutStatus {
+        stack: String,
+    },
+    RolloutPrepare {
+        plan: Box<StackPlan>,
+        allow_insecure: bool,
+    },
+    RolloutActivate {
+        stack: String,
+        rollout_id: String,
+    },
+    RolloutCommit {
+        stack: String,
+        rollout_id: String,
+    },
+    RolloutRollback {
+        stack: String,
+        rollout_id: String,
+    },
     Stop {
         stack: String,
     },
@@ -130,6 +149,7 @@ pub enum DaemonResponse {
     Health(Vec<StackHealthReport>),
     Planned(Box<StackPlan>),
     Applied(ApplyReport),
+    Rollout(Option<RolloutStatus>),
     Stopped(ApplyReport),
     Removed(ApplyReport),
     ShuttingDown,
@@ -251,6 +271,7 @@ impl DaemonRequest {
             Self::Ping | Self::Info | Self::List | Self::Shutdown => Ok(()),
             Self::Status { stack }
             | Self::RuntimeStatus { stack }
+            | Self::RolloutStatus { stack }
             | Self::Stop { stack }
             | Self::Remove { stack }
                 if valid_name(stack) =>
@@ -266,7 +287,14 @@ impl DaemonRequest {
                 Ok(())
             }
             Self::Plan { manifest } => manifest.validate(),
-            Self::Apply { plan, .. } => plan.validate(),
+            Self::Apply { plan, .. } | Self::RolloutPrepare { plan, .. } => plan.validate(),
+            Self::RolloutActivate { stack, rollout_id }
+            | Self::RolloutCommit { stack, rollout_id }
+            | Self::RolloutRollback { stack, rollout_id }
+                if valid_name(stack) && is_digest(rollout_id) =>
+            {
+                Ok(())
+            }
             _ => Err("daemon request is invalid".into()),
         }
     }
@@ -279,7 +307,9 @@ impl DaemonResponse {
             Self::Stacks(stacks) => validate_stack_responses(stacks),
             Self::Status(status) => validate_stack_responses(std::slice::from_ref(status)),
             Self::RuntimeStatus(Some(status)) => status.validate(),
-            Self::Pong | Self::ShuttingDown | Self::RuntimeStatus(None) => Ok(()),
+            Self::Pong | Self::ShuttingDown | Self::RuntimeStatus(None) | Self::Rollout(None) => {
+                Ok(())
+            }
             Self::Events(events) => {
                 if events.len() > usize::from(MAX_DAEMON_EVENTS) {
                     return Err("daemon response contains too many events".into());
@@ -291,6 +321,7 @@ impl DaemonResponse {
             }
             Self::Health(reports) => validate_health_reports(reports),
             Self::Planned(plan) => plan.validate(),
+            Self::Rollout(Some(record)) => record.validate(),
             Self::Applied(report) | Self::Stopped(report) | Self::Removed(report) => {
                 validate_stack_responses(std::slice::from_ref(&report.status))
             }

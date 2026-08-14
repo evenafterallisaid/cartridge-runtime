@@ -314,12 +314,63 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
             Ok(DaemonResponse::Events(events))
         }
         DaemonRequest::Health { stack } => engine_health(state, stack),
+        request @ (DaemonRequest::RolloutStatus { .. }
+        | DaemonRequest::RolloutPrepare { .. }
+        | DaemonRequest::RolloutActivate { .. }
+        | DaemonRequest::RolloutCommit { .. }
+        | DaemonRequest::RolloutRollback { .. }) => execute_rollout_request(state, request),
         DaemonRequest::Plan { manifest } => {
             let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
             let plan = StackPlan::build(&manifest, &library).map_err(anyhow::Error::msg)?;
             Ok(DaemonResponse::Planned(Box::new(plan)))
         }
+        request @ (DaemonRequest::Apply { .. }
+        | DaemonRequest::Stop { .. }
+        | DaemonRequest::Remove { .. }) => execute_stack_mutation(state, request),
+        DaemonRequest::Shutdown => Ok(DaemonResponse::ShuttingDown),
+    }
+}
+
+fn execute_stack_mutation(state: &DaemonState, request: DaemonRequest) -> Result<DaemonResponse> {
+    let _mutation = lock_mutation(state)?;
+    let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+    match request {
         DaemonRequest::Apply {
+            plan,
+            allow_insecure,
+        } => {
+            let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
+            plan.verify_installed(&library)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Applied(
+                engine
+                    .apply(&plan, allow_insecure)
+                    .map_err(anyhow::Error::msg)?,
+            ))
+        }
+        DaemonRequest::Stop { stack } => Ok(DaemonResponse::Stopped(
+            engine.stop(&stack).map_err(anyhow::Error::msg)?,
+        )),
+        DaemonRequest::Remove { stack } => Ok(DaemonResponse::Removed(
+            engine.remove(&stack).map_err(anyhow::Error::msg)?,
+        )),
+        _ => bail!("request is not a stack mutation"),
+    }
+}
+
+fn execute_rollout_request(state: &DaemonState, request: DaemonRequest) -> Result<DaemonResponse> {
+    match request {
+        DaemonRequest::RolloutStatus { stack } => Ok(DaemonResponse::Rollout(
+            EngineStore::open(&state.root)
+                .map_err(anyhow::Error::msg)?
+                .rollout(&stack)
+                .map_err(anyhow::Error::msg)?
+                .as_ref()
+                .map(cartridge_engine::RolloutStatus::from_record)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
+        )),
+        DaemonRequest::RolloutPrepare {
             plan,
             allow_insecure,
         } => {
@@ -327,32 +378,78 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
             let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
             plan.verify_installed(&library)
                 .map_err(anyhow::Error::msg)?;
-            let report = EngineStore::open(&state.root)
+            let record = EngineStore::open(&state.root)
                 .map_err(anyhow::Error::msg)?
-                .apply(&plan, allow_insecure)
+                .prepare_rollout(&plan, allow_insecure, current_time_ms()?)
                 .map_err(anyhow::Error::msg)?;
-            Ok(DaemonResponse::Applied(report))
-        }
-        DaemonRequest::Stop { stack } => {
-            let _mutation = lock_mutation(state)?;
-            Ok(DaemonResponse::Stopped(
-                EngineStore::open(&state.root)
-                    .map_err(anyhow::Error::msg)?
-                    .stop(&stack)
+            Ok(DaemonResponse::Rollout(Some(
+                cartridge_engine::RolloutStatus::from_record(&record)
                     .map_err(anyhow::Error::msg)?,
-            ))
+            )))
         }
-        DaemonRequest::Remove { stack } => {
+        DaemonRequest::RolloutActivate { stack, rollout_id } => {
             let _mutation = lock_mutation(state)?;
-            Ok(DaemonResponse::Removed(
-                EngineStore::open(&state.root)
-                    .map_err(anyhow::Error::msg)?
-                    .remove(&stack)
+            let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+            let checkpoint = current_rollout(&engine, &stack, &rollout_id)?;
+            let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
+            checkpoint
+                .candidate_plan
+                .verify_installed(&library)
+                .map_err(anyhow::Error::msg)?;
+            let record = engine
+                .activate_rollout(&stack, &rollout_id, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Rollout(Some(
+                cartridge_engine::RolloutStatus::from_record(&record)
                     .map_err(anyhow::Error::msg)?,
-            ))
+            )))
         }
-        DaemonRequest::Shutdown => Ok(DaemonResponse::ShuttingDown),
+        DaemonRequest::RolloutCommit { stack, rollout_id } => {
+            let _mutation = lock_mutation(state)?;
+            let record = EngineStore::open(&state.root)
+                .map_err(anyhow::Error::msg)?
+                .commit_rollout(&stack, &rollout_id, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Rollout(Some(
+                cartridge_engine::RolloutStatus::from_record(&record)
+                    .map_err(anyhow::Error::msg)?,
+            )))
+        }
+        DaemonRequest::RolloutRollback { stack, rollout_id } => {
+            let _mutation = lock_mutation(state)?;
+            let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+            let checkpoint = current_rollout(&engine, &stack, &rollout_id)?;
+            if let Some(previous) = &checkpoint.previous_plan {
+                let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
+                previous
+                    .verify_installed(&library)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            let record = engine
+                .rollback_rollout(&stack, &rollout_id, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Rollout(Some(
+                cartridge_engine::RolloutStatus::from_record(&record)
+                    .map_err(anyhow::Error::msg)?,
+            )))
+        }
+        _ => bail!("request is not a rollout operation"),
     }
+}
+
+fn current_rollout(
+    engine: &EngineStore,
+    stack: &str,
+    rollout_id: &str,
+) -> Result<cartridge_engine::RolloutRecord> {
+    let checkpoint = engine
+        .rollout(stack)
+        .map_err(anyhow::Error::msg)?
+        .context("stack has no rollout checkpoint")?;
+    if checkpoint.rollout_id != rollout_id {
+        bail!("rollout identity does not match the current checkpoint");
+    }
+    Ok(checkpoint)
 }
 
 fn engine_health(state: &DaemonState, stack: Option<String>) -> Result<DaemonResponse> {

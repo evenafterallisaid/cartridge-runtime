@@ -28,8 +28,9 @@ use cartridge_dev::{
 };
 use cartridge_engine::{
     DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, PlannedInstance,
-    ReplicaId, ReplicaPhase, SandboxPolicy, StackCapability, StackHealthReport, StackManifest,
-    StackPlan, StackRuntimeStatus, daemon_request_with_timeout,
+    ROLLOUT_STABILITY_WINDOW_MS, ReplicaId, ReplicaPhase, RolloutPhase, RolloutStatus,
+    SandboxPolicy, StackCapability, StackHealthReport, StackHealthState, StackManifest, StackPlan,
+    StackRuntimeStatus, daemon_request_with_timeout,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -809,6 +810,27 @@ enum EngineCommand {
         #[arg(long)]
         json: bool,
     },
+    /// apply a plan transactionally and roll it back if readiness fails
+    Update {
+        file: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        allow_insecure: bool,
+        #[arg(
+            long,
+            default_value_t = 60_000,
+            value_parser = clap::value_parser!(u64).range(1..=3_600_000)
+        )]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// control a durable prepare, activate, commit, or rollback transaction
+    Rollout {
+        #[command(subcommand)]
+        command: Box<EngineRolloutCommand>,
+    },
     /// inspect one stack's desired state
     Status {
         stack: String,
@@ -875,6 +897,55 @@ enum EngineCommand {
     },
     /// gracefully stop the engine service
     Shutdown {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineRolloutCommand {
+    /// inspect the current rollout checkpoint
+    Status {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// resolve, verify, and stage a candidate without changing desired state
+    Prepare {
+        file: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        allow_insecure: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// atomically make a prepared candidate the desired generation
+    Activate {
+        stack: String,
+        rollout_id: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// commit an activated rollout only after its health gate is ready
+    Commit {
+        stack: String,
+        rollout_id: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// cancel a prepared rollout or restore the previous desired generation
+    Rollback {
+        stack: String,
+        rollout_id: String,
         #[arg(long)]
         root: PathBuf,
         #[arg(long)]
@@ -1500,6 +1571,14 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             };
             print_stack_report(&report, json)
         }
+        EngineCommand::Update {
+            file,
+            root,
+            allow_insecure,
+            timeout_ms,
+            json,
+        } => update_engine_stack(&file, &root, allow_insecure, timeout_ms, json),
+        EngineCommand::Rollout { command } => run_engine_rollout_command(*command),
         EngineCommand::Status { stack, root, json } => {
             let DaemonResponse::Status(status) =
                 engine_daemon::request(&root, DaemonRequest::Status { stack })?
@@ -1603,6 +1682,256 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
     }
 }
 
+fn run_engine_rollout_command(command: EngineRolloutCommand) -> Result<()> {
+    match command {
+        EngineRolloutCommand::Status { stack, root, json } => {
+            let DaemonResponse::Rollout(record) = engine_daemon::request(
+                &root,
+                DaemonRequest::RolloutStatus {
+                    stack: stack.clone(),
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if let Some(record) = record {
+                print_rollout(&record, json)
+            } else {
+                if json {
+                    println!("null");
+                } else {
+                    println!("{stack} has no rollout checkpoint");
+                }
+                Ok(())
+            }
+        }
+        EngineRolloutCommand::Prepare {
+            file,
+            root,
+            allow_insecure,
+            json,
+        } => {
+            let plan = request_engine_plan(&root, &file)?;
+            let record = request_rollout(
+                &root,
+                DaemonRequest::RolloutPrepare {
+                    plan,
+                    allow_insecure,
+                },
+            )?;
+            print_rollout(&record, json)
+        }
+        EngineRolloutCommand::Activate {
+            stack,
+            rollout_id,
+            root,
+            json,
+        } => {
+            let record =
+                request_rollout(&root, DaemonRequest::RolloutActivate { stack, rollout_id })?;
+            print_rollout(&record, json)
+        }
+        EngineRolloutCommand::Commit {
+            stack,
+            rollout_id,
+            root,
+            json,
+        } => {
+            let record =
+                request_rollout(&root, DaemonRequest::RolloutCommit { stack, rollout_id })?;
+            print_rollout(&record, json)
+        }
+        EngineRolloutCommand::Rollback {
+            stack,
+            rollout_id,
+            root,
+            json,
+        } => {
+            let record =
+                request_rollout(&root, DaemonRequest::RolloutRollback { stack, rollout_id })?;
+            print_rollout(&record, json)
+        }
+    }
+}
+
+fn update_engine_stack(
+    file: &Path,
+    root: &Path,
+    allow_insecure: bool,
+    timeout_ms: u64,
+    json: bool,
+) -> Result<()> {
+    let plan = request_engine_plan(root, file)?;
+    let stack = plan.stack.clone();
+    let stopped_candidate = plan
+        .instances
+        .iter()
+        .all(|instance| instance.desired == cartridge_engine::DesiredState::Stopped);
+    let prepared = prepare_rollout_for_update(root, plan, allow_insecure)?;
+    let rollout_id = prepared.rollout_id.clone();
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .context("rollout deadline overflow")?;
+    let result = (|| -> Result<RolloutStatus> {
+        request_rollout(
+            root,
+            DaemonRequest::RolloutActivate {
+                stack: stack.clone(),
+                rollout_id: rollout_id.clone(),
+            },
+        )?;
+        let initial = wait_for_engine_health_report_before(
+            root,
+            &stack,
+            deadline,
+            timeout_ms,
+            stopped_candidate,
+        )?;
+        if initial.state == StackHealthState::Healthy {
+            let stability_delay = Duration::from_millis(ROLLOUT_STABILITY_WINDOW_MS)
+                .saturating_add(ENGINE_HEALTH_POLL_INTERVAL);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining <= stability_delay {
+                bail!("timed out after {timeout_ms}ms waiting for {stack} rollout stability");
+            }
+            thread::sleep(stability_delay);
+            wait_for_engine_health_report_before(root, &stack, deadline, timeout_ms, false)?;
+        }
+        request_rollout(
+            root,
+            DaemonRequest::RolloutCommit {
+                stack: stack.clone(),
+                rollout_id: rollout_id.clone(),
+            },
+        )
+    })();
+    match result {
+        Ok(record) => print_rollout(&record, json),
+        Err(update_error) => {
+            let rollback = rollback_update(root, &stack, &rollout_id);
+            match rollback {
+                Ok(record) => bail!(
+                    "rollout failed and was {:?}: {update_error:#}",
+                    record.phase
+                ),
+                Err(rollback_error) => bail!(
+                    "rollout failed: {update_error:#}; rollback also failed: {rollback_error:#}"
+                ),
+            }
+        }
+    }
+}
+
+fn prepare_rollout_for_update(
+    root: &Path,
+    plan: Box<StackPlan>,
+    allow_insecure: bool,
+) -> Result<RolloutStatus> {
+    let stack = plan.stack.clone();
+    let candidate = plan.plan_sha256.clone();
+    match request_rollout(
+        root,
+        DaemonRequest::RolloutPrepare {
+            plan,
+            allow_insecure,
+        },
+    ) {
+        Ok(record) => Ok(record),
+        Err(prepare_error) => {
+            let recovered = current_rollout_over_daemon(root, &stack).ok().flatten();
+            if let Some(record) = recovered
+                && record.phase == RolloutPhase::Prepared
+                && record.candidate_plan_sha256 == candidate
+            {
+                Ok(record)
+            } else {
+                Err(prepare_error)
+            }
+        }
+    }
+}
+
+fn rollback_update(root: &Path, stack: &str, rollout_id: &str) -> Result<RolloutStatus> {
+    match request_rollout(
+        root,
+        DaemonRequest::RolloutRollback {
+            stack: stack.into(),
+            rollout_id: rollout_id.into(),
+        },
+    ) {
+        Ok(record) => Ok(record),
+        Err(rollback_error) => {
+            let recovered = current_rollout_over_daemon(root, stack).ok().flatten();
+            if let Some(record) = recovered
+                && record.rollout_id == rollout_id
+                && matches!(
+                    record.phase,
+                    RolloutPhase::Cancelled | RolloutPhase::RolledBack
+                )
+            {
+                Ok(record)
+            } else {
+                Err(rollback_error)
+            }
+        }
+    }
+}
+
+fn current_rollout_over_daemon(root: &Path, stack: &str) -> Result<Option<RolloutStatus>> {
+    let DaemonResponse::Rollout(record) = engine_daemon::request(
+        root,
+        DaemonRequest::RolloutStatus {
+            stack: stack.into(),
+        },
+    )?
+    else {
+        bail!("engine returned an unexpected rollout response");
+    };
+    Ok(record)
+}
+
+fn request_engine_plan(root: &Path, file: &Path) -> Result<Box<StackPlan>> {
+    let manifest = StackManifest::read(file).map_err(anyhow::Error::msg)?;
+    let DaemonResponse::Planned(plan) = engine_daemon::request(
+        root,
+        DaemonRequest::Plan {
+            manifest: Box::new(manifest),
+        },
+    )?
+    else {
+        bail!("engine returned an unexpected response");
+    };
+    Ok(plan)
+}
+
+fn request_rollout(root: &Path, request: DaemonRequest) -> Result<RolloutStatus> {
+    let DaemonResponse::Rollout(Some(record)) = engine_daemon::request(root, request)? else {
+        bail!("engine returned an unexpected rollout response");
+    };
+    Ok(record)
+}
+
+fn print_rollout(record: &RolloutStatus, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(record)?);
+    } else {
+        println!(
+            "{} {:?} rollout={} candidate={}",
+            record.stack, record.phase, record.rollout_id, record.candidate_plan_sha256
+        );
+        if let Some(generation) = &record.activated_generation {
+            println!("activated generation: {generation}");
+        }
+        if let Some(generation) = &record.rollback_generation {
+            println!("rollback generation: {generation}");
+        }
+        if let Some(health) = &record.health_report_sha256 {
+            println!("commit health: {health}");
+        }
+    }
+    Ok(())
+}
+
 fn print_health_reports(reports: &[StackHealthReport], json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(reports)?);
@@ -1629,8 +1958,28 @@ fn print_health_reports(reports: &[StackHealthReport], json: bool) -> Result<()>
 }
 
 fn wait_for_engine_health(root: &Path, stack: &str, timeout_ms: u64, json: bool) -> Result<()> {
-    let timeout = Duration::from_millis(timeout_ms);
-    let deadline = Instant::now() + timeout;
+    let report = wait_for_engine_health_report(root, stack, timeout_ms)?;
+    print_health_reports(std::slice::from_ref(&report), json)
+}
+
+fn wait_for_engine_health_report(
+    root: &Path,
+    stack: &str,
+    timeout_ms: u64,
+) -> Result<StackHealthReport> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .context("engine health deadline overflow")?;
+    wait_for_engine_health_report_before(root, stack, deadline, timeout_ms, false)
+}
+
+fn wait_for_engine_health_report_before(
+    root: &Path,
+    stack: &str,
+    deadline: Instant,
+    timeout_ms: u64,
+    accept_stopped: bool,
+) -> Result<StackHealthReport> {
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -1654,11 +2003,14 @@ fn wait_for_engine_health(root: &Path, stack: &str, timeout_ms: u64, json: bool)
         if !reports.is_empty() || report.stack != stack {
             bail!("engine returned an invalid health selection");
         }
-        if report.ready() {
-            return print_health_reports(std::slice::from_ref(&report), json);
+        if report.ready()
+            || (accept_stopped
+                && report.state == StackHealthState::Stopped
+                && report.desired_replicas == 0)
+        {
+            return Ok(report);
         }
         if report.terminal_failure() {
-            print_health_reports(std::slice::from_ref(&report), json)?;
             bail!("stack reached terminal health state {:?}", report.state);
         }
         let now = Instant::now();

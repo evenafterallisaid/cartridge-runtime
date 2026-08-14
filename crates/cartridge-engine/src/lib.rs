@@ -1,5 +1,6 @@
 mod daemon;
 mod health;
+mod rollout;
 mod supervisor;
 
 pub use daemon::{
@@ -11,6 +12,11 @@ pub use daemon::{
 pub use health::{
     ENGINE_HEALTH_FORMAT_VERSION, MAX_ENGINE_HEALTH_REPORTS, SUPERVISOR_STALE_AFTER_MS,
     StackHealthReport, StackHealthState, validate_health_reports,
+};
+pub use rollout::{
+    ENGINE_ROLLOUT_FORMAT_VERSION, MAX_ROLLOUT_BYTES, MAX_ROLLOUT_HISTORY,
+    MAX_ROLLOUT_HISTORY_BYTES, ROLLOUT_STABILITY_WINDOW_MS, RolloutPhase, RolloutRecord,
+    RolloutStatus,
 };
 pub use supervisor::{
     ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
@@ -713,6 +719,7 @@ impl EngineStore {
 
     pub fn apply(&self, plan: &StackPlan, allow_insecure: bool) -> Result<ApplyReport, String> {
         plan.validate()?;
+        self.ensure_no_active_rollout(&plan.stack)?;
         if plan.security.sandbox == SandboxPolicy::Disabled && !allow_insecure {
             return Err(
                 "sandbox-disabled stacks require an explicit insecure-apply confirmation".into(),
@@ -747,6 +754,7 @@ impl EngineStore {
     }
 
     pub fn stop(&self, stack: &str) -> Result<ApplyReport, String> {
+        self.ensure_no_active_rollout(stack)?;
         let previous = self
             .latest(stack)?
             .ok_or_else(|| "stack is not known to the engine".to_string())?;
@@ -773,6 +781,7 @@ impl EngineStore {
     }
 
     pub fn remove(&self, stack: &str) -> Result<ApplyReport, String> {
+        self.ensure_no_active_rollout(stack)?;
         let previous = self
             .latest(stack)?
             .ok_or_else(|| "stack is not known to the engine".to_string())?;
