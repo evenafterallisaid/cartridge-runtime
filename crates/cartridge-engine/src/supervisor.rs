@@ -293,6 +293,14 @@ impl StackRuntimeStatus {
         Ok(recovered)
     }
 
+    pub fn heartbeat(&mut self, now_ms: u64) -> Result<(), String> {
+        if now_ms < self.observed_at_ms {
+            return Err("runtime observation time cannot move backwards".into());
+        }
+        self.observed_at_ms = now_ms;
+        self.refresh()
+    }
+
     fn replica_mut(&mut self, id: &ReplicaId) -> Result<&mut ReplicaRuntime, String> {
         self.replicas
             .iter_mut()
@@ -579,5 +587,20 @@ mod tests {
         status.status_sha256 = status.computed_sha256().unwrap();
 
         assert!(status.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_advances_liveness_without_changing_replica_state() {
+        let plan = plan(RestartPolicy::OnFailure, 1);
+        let mut status = StackRuntimeStatus::from_plan(&plan, 1, &"4".repeat(64), 10).unwrap();
+        let replicas = status.replicas.clone();
+        let digest = status.status_sha256.clone();
+
+        status.heartbeat(20).unwrap();
+
+        assert_eq!(status.observed_at_ms, 20);
+        assert_eq!(status.replicas, replicas);
+        assert_ne!(status.status_sha256, digest);
+        assert!(status.heartbeat(19).is_err());
     }
 }

@@ -313,6 +313,7 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
             }
             Ok(DaemonResponse::Events(events))
         }
+        DaemonRequest::Health { stack } => engine_health(state, stack),
         DaemonRequest::Plan { manifest } => {
             let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
             let plan = StackPlan::build(&manifest, &library).map_err(anyhow::Error::msg)?;
@@ -352,6 +353,23 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
         }
         DaemonRequest::Shutdown => Ok(DaemonResponse::ShuttingDown),
     }
+}
+
+fn engine_health(state: &DaemonState, stack: Option<String>) -> Result<DaemonResponse> {
+    let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+    let observed_at_ms = current_time_ms()?;
+    let reports = if let Some(stack) = stack {
+        vec![
+            engine
+                .health(&stack, observed_at_ms)
+                .map_err(anyhow::Error::msg)?,
+        ]
+    } else {
+        engine
+            .health_all(observed_at_ms)
+            .map_err(anyhow::Error::msg)?
+    };
+    Ok(DaemonResponse::Health(reports))
 }
 
 fn lock_mutation(state: &DaemonState) -> Result<std::sync::MutexGuard<'_, ()>> {

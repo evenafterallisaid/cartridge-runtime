@@ -1,11 +1,11 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chacha20poly1305::{
@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use super::{
-    ApplyReport, EngineEvent, StackManifest, StackPlan, StackRuntimeStatus, StackStatus,
-    ensure_directory, is_digest, is_regular_file, private_options, valid_name, valid_text,
+    ApplyReport, EngineEvent, StackHealthReport, StackManifest, StackPlan, StackRuntimeStatus,
+    StackStatus, ensure_directory, is_digest, is_regular_file, private_options, valid_name,
+    valid_text, validate_health_reports,
 };
 
 pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
@@ -93,6 +94,9 @@ pub enum DaemonRequest {
         stack: String,
         tail: u16,
     },
+    Health {
+        stack: Option<String>,
+    },
     Plan {
         manifest: Box<StackManifest>,
     },
@@ -123,6 +127,7 @@ pub enum DaemonResponse {
     Status(StackStatus),
     RuntimeStatus(Option<StackRuntimeStatus>),
     Events(Vec<EngineEvent>),
+    Health(Vec<StackHealthReport>),
     Planned(Box<StackPlan>),
     Applied(ApplyReport),
     Stopped(ApplyReport),
@@ -257,6 +262,9 @@ impl DaemonRequest {
             {
                 Ok(())
             }
+            Self::Health { stack } if stack.as_ref().is_none_or(|value| valid_name(value)) => {
+                Ok(())
+            }
             Self::Plan { manifest } => manifest.validate(),
             Self::Apply { plan, .. } => plan.validate(),
             _ => Err("daemon request is invalid".into()),
@@ -281,6 +289,7 @@ impl DaemonResponse {
                 }
                 Ok(())
             }
+            Self::Health(reports) => validate_health_reports(reports),
             Self::Planned(plan) => plan.validate(),
             Self::Applied(report) | Self::Stopped(report) | Self::Removed(report) => {
                 validate_stack_responses(std::slice::from_ref(&report.status))
@@ -546,6 +555,21 @@ impl DaemonLease {
 }
 
 pub fn daemon_request(root: &Path, request: DaemonRequest) -> Result<DaemonResponse, String> {
+    daemon_request_with_timeout(root, request, DAEMON_CLIENT_TIMEOUT)
+}
+
+pub fn daemon_request_with_timeout(
+    root: &Path,
+    request: DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, String> {
+    if timeout.is_zero() {
+        return Err("engine request timeout is invalid".into());
+    }
+    let timeout = timeout.min(DAEMON_CLIENT_TIMEOUT);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "engine request deadline overflow".to_string())?;
     let endpoint = DaemonEndpoint::read(root)?;
     if !DaemonLease::is_active(root)? {
         return Err("engine daemon is not running".into());
@@ -553,15 +577,13 @@ pub fn daemon_request(root: &Path, request: DaemonRequest) -> Result<DaemonRespo
     let codec = DaemonCodec::from_endpoint(&endpoint)?;
     let (request_id, frame) = codec.seal_request(request, current_time_ms()?)?;
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, endpoint.port));
-    let mut stream = TcpStream::connect_timeout(&address, DAEMON_CLIENT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
         .map_err(|error| format!("could not connect to the engine daemon: {error}"))?;
     stream
         .set_nodelay(true)
-        .and_then(|()| stream.set_read_timeout(Some(DAEMON_CLIENT_TIMEOUT)))
-        .and_then(|()| stream.set_write_timeout(Some(DAEMON_CLIENT_TIMEOUT)))
         .map_err(|error| format!("could not configure the engine daemon connection: {error}"))?;
-    write_frame(&mut stream, &frame)?;
-    let response = read_frame(&mut stream)?;
+    write_frame_before(&mut stream, &frame, deadline)?;
+    let response = read_frame_before(&mut stream, deadline)?;
     let response = codec.open_response(&request_id, &response)?;
     match response {
         DaemonResponse::Error { code, message } => Err(format!("engine {code}: {message}")),
@@ -569,6 +591,93 @@ pub fn daemon_request(root: &Path, request: DaemonRequest) -> Result<DaemonRespo
     }
 }
 
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err("engine request deadline exceeded".into())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn read_frame_before(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, String> {
+    let mut length = [0_u8; 4];
+    read_exact_before(stream, &mut length, deadline, "engine frame length")?;
+    let length = usize::try_from(u32::from_be_bytes(length))
+        .map_err(|_| "engine frame length overflow".to_string())?;
+    if length == 0 || length > MAX_DAEMON_FRAME_BYTES {
+        return Err("engine frame length is invalid".into());
+    }
+    let mut frame = vec![0_u8; length];
+    read_exact_before(stream, &mut frame, deadline, "engine frame")?;
+    Ok(frame)
+}
+
+fn read_exact_before(
+    stream: &mut TcpStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+    label: &str,
+) -> Result<(), String> {
+    while !buffer.is_empty() {
+        stream
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|error| {
+                format!("could not configure the engine daemon connection: {error}")
+            })?;
+        match stream.read(buffer) {
+            Ok(0) => return Err(format!("could not read {label}: connection closed")),
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err("engine request deadline exceeded".into());
+            }
+            Err(error) => return Err(format!("could not read {label}: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn write_frame_before(
+    stream: &mut TcpStream,
+    frame: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    if frame.is_empty() || frame.len() > MAX_DAEMON_FRAME_BYTES {
+        return Err("engine frame length is invalid".into());
+    }
+    let length =
+        u32::try_from(frame.len()).map_err(|_| "engine frame length overflow".to_string())?;
+    write_all_before(stream, &length.to_be_bytes(), deadline)?;
+    write_all_before(stream, frame, deadline)?;
+    stream
+        .flush()
+        .map_err(|error| format!("could not write engine frame: {error}"))
+}
+
+fn write_all_before(
+    stream: &mut TcpStream,
+    mut remaining_bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !remaining_bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining(deadline)?))
+            .map_err(|error| {
+                format!("could not configure the engine daemon connection: {error}")
+            })?;
+        match stream.write(remaining_bytes) {
+            Ok(0) => return Err("could not write engine frame: connection closed".into()),
+            Ok(written) => remaining_bytes = &remaining_bytes[written..],
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err("engine request deadline exceeded".into());
+            }
+            Err(error) => return Err(format!("could not write engine frame: {error}")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     let mut length = [0_u8; 4];
     stream
@@ -586,6 +695,7 @@ fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
+#[cfg(test)]
 fn write_frame(stream: &mut impl Write, frame: &[u8]) -> Result<(), String> {
     if frame.is_empty() || frame.len() > MAX_DAEMON_FRAME_BYTES {
         return Err("engine frame length is invalid".into());
@@ -807,6 +917,48 @@ mod tests {
             daemon_request(directory.path(), DaemonRequest::Ping).unwrap(),
             DaemonResponse::Pong
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_client_rejects_a_zero_deadline_before_endpoint_access() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            daemon_request_with_timeout(directory.path(), DaemonRequest::Ping, Duration::ZERO)
+                .unwrap_err(),
+            "engine request timeout is invalid"
+        );
+    }
+
+    #[test]
+    fn shared_client_enforces_the_response_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let lease = DaemonLease::acquire(directory.path()).unwrap();
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let codec = DaemonCodec::generate();
+        lease
+            .publish(&codec.endpoint(listener.local_addr().unwrap().port(), 42, 10))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_frame(&mut stream).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let error = daemon_request_with_timeout(
+            directory.path(),
+            DaemonRequest::Ping,
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "engine request deadline exceeded");
         server.join().unwrap();
     }
 

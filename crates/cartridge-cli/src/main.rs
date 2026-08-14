@@ -28,8 +28,8 @@ use cartridge_dev::{
 };
 use cartridge_engine::{
     DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, PlannedInstance,
-    ReplicaId, ReplicaPhase, SandboxPolicy, StackCapability, StackManifest, StackPlan,
-    StackRuntimeStatus,
+    ReplicaId, ReplicaPhase, SandboxPolicy, StackCapability, StackHealthReport, StackManifest,
+    StackPlan, StackRuntimeStatus, daemon_request_with_timeout,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -64,6 +64,9 @@ const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_STABILITY_WALL_TIME: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_SUPERVISOR_WORKERS: u16 = 32;
 const DESIRED_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SUPERVISOR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const ENGINE_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CLI_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 const WORKER_LIMIT_CEILING_ENV: &str = "CARTRIDGE_LIMIT_CEILING";
 
 #[derive(Clone, Copy)]
@@ -183,7 +186,7 @@ enum Command {
     /// run and control the persistent local cartridge engine
     Engine {
         #[command(subcommand)]
-        command: EngineCommand,
+        command: Box<EngineCommand>,
     },
     /// build a cartridge archive from a manifest and component
     Pack {
@@ -832,6 +835,28 @@ enum EngineCommand {
         #[arg(long)]
         json: bool,
     },
+    /// summarize bounded stack convergence and supervisor liveness
+    Health {
+        stack: Option<String>,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// wait until a stack is running or has completed successfully
+    Wait {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 60_000,
+            value_parser = clap::value_parser!(u64).range(1..=3_600_000)
+        )]
+        timeout_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// set a stack's desired state to stopped
     Stop {
         stack: String,
@@ -1156,13 +1181,23 @@ enum StorageCommand {
 }
 
 fn main() -> ExitCode {
-    match run_cli() {
+    match run_cli_on_bounded_stack() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {}", terminal_safe(&format!("{error:#}")));
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_cli_on_bounded_stack() -> Result<()> {
+    thread::Builder::new()
+        .name("cartridge-cli".into())
+        .stack_size(CLI_THREAD_STACK_BYTES)
+        .spawn(run_cli)
+        .context("could not start the cartridge command thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("cartridge command thread panicked"))?
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1189,7 +1224,7 @@ fn run_cli() -> Result<()> {
         } => conformance_command(&package, json, &args),
         Command::Library { command } => run_library_command(command),
         Command::Stack { command } => run_stack_command(command),
-        Command::Engine { command } => run_engine_command(command),
+        Command::Engine { command } => run_engine_command(*command),
         Command::Pack {
             manifest,
             component,
@@ -1527,6 +1562,20 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             }
             Ok(())
         }
+        EngineCommand::Health { stack, root, json } => {
+            let DaemonResponse::Health(reports) =
+                engine_daemon::request(&root, DaemonRequest::Health { stack })?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            print_health_reports(&reports, json)
+        }
+        EngineCommand::Wait {
+            stack,
+            root,
+            timeout_ms,
+            json,
+        } => wait_for_engine_health(&root, &stack, timeout_ms, json),
         EngineCommand::Stop { stack, root, json } => {
             let DaemonResponse::Stopped(report) =
                 engine_daemon::request(&root, DaemonRequest::Stop { stack })?
@@ -1551,6 +1600,75 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn print_health_reports(reports: &[StackHealthReport], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(reports)?);
+    } else if reports.is_empty() {
+        println!("engine has no stacks");
+    } else {
+        for report in reports {
+            println!(
+                "{} {:?} revision={} ready={}/{} waiting={} failed={} observed={}",
+                report.stack,
+                report.state,
+                report.revision,
+                report.running + report.succeeded,
+                report.desired_replicas,
+                report.pending + report.starting + report.backoff,
+                report.failed + report.exhausted,
+                report
+                    .runtime_observed_at_ms
+                    .map_or_else(|| "none".into(), |value| value.to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_engine_health(root: &Path, stack: &str, timeout_ms: u64, json: bool) -> Result<()> {
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("timed out after {timeout_ms}ms waiting for {stack}");
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let DaemonResponse::Health(mut reports) = daemon_request_with_timeout(
+            root,
+            DaemonRequest::Health {
+                stack: Some(stack.into()),
+            },
+            remaining,
+        )
+        .map_err(anyhow::Error::msg)?
+        else {
+            bail!("engine returned an unexpected response");
+        };
+        let report = reports
+            .pop()
+            .context("engine returned no health report for the stack")?;
+        if !reports.is_empty() || report.stack != stack {
+            bail!("engine returned an invalid health selection");
+        }
+        if report.ready() {
+            return print_health_reports(std::slice::from_ref(&report), json);
+        }
+        if report.terminal_failure() {
+            print_health_reports(std::slice::from_ref(&report), json)?;
+            bail!("stack reached terminal health state {:?}", report.state);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "timed out after {timeout_ms}ms waiting for {stack}; last state was {:?}",
+                report.state
+            );
+        }
+        thread::sleep(ENGINE_HEALTH_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -2186,6 +2304,7 @@ fn supervise_stack(
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
         .context("could not install the supervisor shutdown handler")?;
     let mut next_desired_check = Instant::now();
+    let mut next_heartbeat = Instant::now() + SUPERVISOR_HEARTBEAT_INTERVAL;
     loop {
         if interrupted.load(Ordering::Acquire) {
             stop_active_workers(&mut active, &mut status, root)?;
@@ -2256,6 +2375,14 @@ fn supervise_stack(
         }
         if changed {
             persist_runtime_status(root, &status)?;
+        }
+
+        if Instant::now() >= next_heartbeat {
+            status
+                .heartbeat(current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            persist_runtime_status(root, &status)?;
+            next_heartbeat = Instant::now() + SUPERVISOR_HEARTBEAT_INTERVAL;
         }
 
         while active.0.len() < max_workers {

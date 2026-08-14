@@ -1015,8 +1015,9 @@ The next concrete sequence is:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
    - [implemented] generation-fenced replica expansion, durable observed status, restart recovery, process reconciliation, and one-supervisor leases
    - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, graceful client/supervisor drain, and crash-resistant process-tree ownership
+   - [implemented] checksum-bound supervisor heartbeats, authenticated bounded health aggregation, stale-generation detection, and deadline-bounded readiness waits
    - add explicit prepare/activate/commit rollout phases and recovery checkpoints
-   - add health-gated rollback and rolling/canary replacement
+   - add manifest-defined application probes, health-gated rollback, and rolling/canary replacement
    - compact long journals through signed checkpoints without losing auditability
 6. Complete the external 1.0 security gates in parallel:
    - platform-native worker sandboxes and kernel resource limits

@@ -23,6 +23,15 @@ impl Drop for DaemonGuard {
 }
 
 #[test]
+fn growing_engine_commands_keep_cli_construction_bounded() {
+    let output = run(env!("CARGO_BIN_EXE_cartridge"), &["engine", "--help"]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("health"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("wait"));
+}
+
+#[test]
 fn internal_workers_require_a_parent_liveness_channel() {
     let output = Command::new(env!("CARGO_BIN_EXE_cartridge"))
         .args(["__worker-run", "missing.cartridge"])
@@ -41,6 +50,7 @@ fn internal_workers_require_a_parent_liveness_channel() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn daemon_authenticates_clients_survives_bad_frames_and_cleans_up() {
     let directory = tempfile::tempdir().unwrap();
     let engine = directory.path().join("engine");
@@ -115,6 +125,43 @@ fn daemon_authenticates_clients_survives_bad_frames_and_cleans_up() {
     assert_eq!(info["instance_id"], endpoint.instance_id);
     assert_eq!(info["max_supervisors"], 2);
     assert_eq!(info["workers_per_stack"], 4);
+
+    let health = run(
+        binary,
+        &[
+            "engine",
+            "health",
+            "--root",
+            engine.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        health.status.success(),
+        "{}",
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let health: serde_json::Value = serde_json::from_slice(&health.stdout).unwrap();
+    assert_eq!(health, serde_json::json!([]));
+
+    let missing = run(
+        binary,
+        &[
+            "engine",
+            "wait",
+            "missing-stack",
+            "--root",
+            engine.to_str().unwrap(),
+            "--timeout-ms",
+            "100",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("stack is not known"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 
     let shutdown = run(
         binary,

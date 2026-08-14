@@ -1,10 +1,16 @@
 mod daemon;
+mod health;
 mod supervisor;
 
 pub use daemon::{
     DAEMON_ENDPOINT_FILE, DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonEndpoint, DaemonFrame,
     DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse, MAX_DAEMON_EVENTS,
     MAX_DAEMON_FRAME_BYTES, MAX_DAEMON_SUPERVISORS, OpenedDaemonRequest, daemon_request,
+    daemon_request_with_timeout,
+};
+pub use health::{
+    ENGINE_HEALTH_FORMAT_VERSION, MAX_ENGINE_HEALTH_REPORTS, SUPERVISOR_STALE_AFTER_MS,
+    StackHealthReport, StackHealthState, validate_health_reports,
 };
 pub use supervisor::{
     ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
@@ -814,6 +820,29 @@ impl EngineStore {
         }
         status.validate_against(&plan, revision, &generation)?;
         Ok(Some(status))
+    }
+
+    pub fn health(&self, stack: &str, now_ms: u64) -> Result<StackHealthReport, String> {
+        let status = self.status(stack)?;
+        let runtime = self.runtime_status(stack)?;
+        StackHealthReport::from_status(&status, runtime.as_ref(), now_ms)
+    }
+
+    pub fn health_all(&self, now_ms: u64) -> Result<Vec<StackHealthReport>, String> {
+        let statuses = self.list()?;
+        if statuses.len() > MAX_ENGINE_HEALTH_REPORTS {
+            return Err("engine health inventory is too large; select one stack".into());
+        }
+        let mut reports = statuses
+            .into_iter()
+            .map(|status| {
+                let runtime = self.runtime_status(&status.stack)?;
+                StackHealthReport::from_status(&status, runtime.as_ref(), now_ms)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        reports.sort_by(|left, right| left.stack.cmp(&right.stack));
+        validate_health_reports(&reports)?;
+        Ok(reports)
     }
 
     pub fn save_runtime_status(&self, status: &StackRuntimeStatus) -> Result<(), String> {
@@ -1960,6 +1989,50 @@ mod tests {
             .unwrap();
         let engine = EngineStore::open(engine_root).unwrap();
         assert!(engine.runtime_status("demo-stack").is_err());
+    }
+
+    #[test]
+    fn engine_health_tracks_convergence_and_desired_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let plan = StackPlan::build(&manifest(SandboxPolicy::Required), &library).unwrap();
+        let engine = EngineStore::open(directory.path().join("engine")).unwrap();
+        engine.apply(&plan, false).unwrap();
+
+        let starting = engine.health("demo-stack", 1).unwrap();
+        assert_eq!(starting.state, StackHealthState::Starting);
+        assert!(!starting.ready());
+
+        let (revision, generation, desired) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        let mut runtime =
+            StackRuntimeStatus::from_plan(&desired, revision, &generation, 2).unwrap();
+        for ordinal in 1..=2 {
+            let id = ReplicaId {
+                instance: "app".into(),
+                ordinal,
+            };
+            let run_id = format!("{ordinal:064x}");
+            runtime.begin_start(&id, &run_id, 2).unwrap();
+            runtime.mark_running(&id, &run_id, 2).unwrap();
+        }
+        engine.save_runtime_status(&runtime).unwrap();
+        assert_eq!(
+            engine.health("demo-stack", 2).unwrap().state,
+            StackHealthState::Healthy
+        );
+
+        engine.stop("demo-stack").unwrap();
+        assert_eq!(
+            engine.health("demo-stack", 3).unwrap().state,
+            StackHealthState::Stopped
+        );
+        engine.remove("demo-stack").unwrap();
+        assert_eq!(
+            engine.health("demo-stack", 4).unwrap().state,
+            StackHealthState::Removed
+        );
     }
 
     #[test]
