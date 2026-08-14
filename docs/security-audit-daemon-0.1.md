@@ -2,6 +2,8 @@
 
 Date: 2026-08-14
 
+> Historical boundary note: the process-containment gaps recorded here were closed later the same day and are reviewed in [security-audit-process-containment-0.1.md](security-audit-process-containment-0.1.md). The remaining daemon findings stay as the record of this earlier slice.
+
 Scope: the complete Rust workspace, native desktop shell, dependency graphs, package/runtime/storage boundaries, desired and observed engine state, foreground supervision, and the first rootless persistent engine daemon. This is an internal review, not an independent security assessment.
 
 ## Result

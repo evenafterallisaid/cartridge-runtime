@@ -23,6 +23,24 @@ impl Drop for DaemonGuard {
 }
 
 #[test]
+fn internal_workers_require_a_parent_liveness_channel() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cartridge"))
+        .args(["__worker-run", "missing.cartridge"])
+        .env_clear()
+        .env("CARTRIDGE_WORKER", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no parent-liveness channel"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn daemon_authenticates_clients_survives_bad_frames_and_cleans_up() {
     let directory = tempfile::tempdir().unwrap();
     let engine = directory.path().join("engine");

@@ -3,7 +3,6 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
@@ -16,6 +15,10 @@ use cartridge_engine::{
     DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonEndpoint, DaemonInfo, DaemonLease, DaemonRequest,
     DaemonResponse, EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
     MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_REPLICAS, ReplicaPhase, StackPlan,
+};
+
+use crate::process_control::{
+    ContainedChild, ContainedCommand, OutputMode, TERMINATION_GRACE, spawn_contained,
 };
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -57,7 +60,7 @@ struct DaemonState {
 struct ReplayCache(BTreeMap<String, u64>);
 
 struct ManagedSupervisor {
-    child: Child,
+    child: ContainedChild,
     generation: String,
     started_at: Instant,
 }
@@ -505,8 +508,9 @@ fn schedule_supervisor_retry(
     );
 }
 
-fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Result<Child> {
-    Command::new(executable)
+fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Result<ContainedChild> {
+    let mut command = ContainedCommand::new(executable);
+    command
         .arg("stack")
         .arg("supervise")
         .arg(stack)
@@ -519,12 +523,9 @@ fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Resu
         .arg("--daemon-instance")
         .arg(state.codec.instance_id())
         .arg("--json")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("could not start a stack supervisor")
+        .stdout(OutputMode::Null)
+        .stderr(OutputMode::Null);
+    spawn_contained(&mut command, true).context("could not start a stack supervisor")
 }
 
 fn stop_supervisors(supervisors: &mut BTreeMap<String, ManagedSupervisor>) {
@@ -536,8 +537,7 @@ fn stop_supervisors(supervisors: &mut BTreeMap<String, ManagedSupervisor>) {
         }
     }
     for supervisor in supervisors.values_mut() {
-        let _ = supervisor.child.kill();
-        let _ = supervisor.child.wait();
+        let _ = supervisor.child.terminate(TERMINATION_GRACE);
     }
     supervisors.clear();
 }

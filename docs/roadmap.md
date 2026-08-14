@@ -507,6 +507,7 @@ Work:
 - a versioned `Cartridge.stack.toml` format for applications, providers, exact locks, state, blobs, secrets, ingress, schedules, budgets, and update policy
 - `stack validate`, `plan`, `apply`, `status`, `stop`, `remove`, `export`, and `import`
 - [implemented first slice] a per-user engine daemon over an encrypted authenticated local transport with replay rejection
+- [implemented] cross-platform process-tree ownership with Windows Job Objects, Unix process groups, parent-death liveness, and bounded termination
 - [implemented first slice] one desired-state reconciler and append-only event journal
 - atomic plan application with preflight, staged activation, health gates, and rollback
 - instance identities separated from package identities
@@ -1012,7 +1013,7 @@ The next concrete sequence is:
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
    - [implemented] generation-fenced replica expansion, durable observed status, restart recovery, process reconciliation, and one-supervisor leases
-   - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, and graceful client/supervisor drain
+   - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, graceful client/supervisor drain, and crash-resistant process-tree ownership
    - add explicit prepare/activate/commit rollout phases and recovery checkpoints
    - add health-gated rollback and rolling/canary replacement
    - compact long journals through signed checkpoints without losing auditability
@@ -1020,7 +1021,7 @@ The next concrete sequence is:
    - platform-native worker sandboxes and kernel resource limits
    - independent review and remediation record
    - signed/notarized installers and rollback-tested release channels
-7. [implemented first slice] Move lifecycle ownership into a per-user engine daemon after standalone stack apply is stable. The next daemon slices are native service installation, OS peer credentials, process-tree containment, health-gated rollout, and structured observability.
+7. [implemented through process ownership] Move lifecycle ownership into a per-user engine daemon after standalone stack apply is stable. The next daemon slices are native service installation, OS peer credentials, kernel resource enforcement, health-gated rollout, and structured observability.
 8. [partially implemented] Build the desktop shell over the same control-plane types:
    - [implemented] native Tauri shell with library, stack, security posture, and event views
    - [implemented] exact plan and permission review with server-retained digest and package re-verification before apply
@@ -1056,6 +1057,7 @@ Completed foundations:
 - seeded archive, package-manifest, composition-lock, snapshot, trace, transaction, blob-reachability, media, network, release, GPU-stream, and WIT fuzz targets with scheduled bounded runs
 - bounded archive inflation, WASI waits, storage locks, tables, traces, and diagnostic inputs
 - supervised CLI workers for killable component compilation and execution
+- Windows Job Object and Unix process-group ownership with parent-death channels and bounded tree termination
 - minimized Wasmtime features and explicit rejection of unused Wasm proposals
 - bounded package construction, snapshot decoding, durable-state decoding, and host resource tables
 - pinned CI actions, automated dependency updates, and RustSec advisory checks

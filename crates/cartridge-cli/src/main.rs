@@ -1,6 +1,7 @@
 mod capsule;
 mod engine_daemon;
 mod migration_receipt;
+mod process_control;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,7 +9,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command as ProcessCommand, ExitCode, Stdio},
+    process::{Command as ProcessCommand, ExitCode, Stdio},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
@@ -47,6 +48,10 @@ use cartridge_trace::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use migration_receipt::{MigrationReceipt, MigrationReceiptPayload};
+use process_control::{
+    ContainedChild, ContainedCommand, OutputMode, TERMINATION_GRACE,
+    install_parent_liveness_watchdog, spawn_contained,
+};
 use sha2::{Digest, Sha256};
 
 static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2097,7 +2102,7 @@ struct StackWorkerTemplate {
 }
 
 struct ActiveStackWorker {
-    child: Child,
+    child: ContainedChild,
     run_id: String,
     deadline: Instant,
 }
@@ -2108,8 +2113,7 @@ struct ActiveStackWorkers(BTreeMap<ReplicaId, ActiveStackWorker>);
 impl ActiveStackWorkers {
     fn terminate_all(&mut self) {
         for worker in self.0.values_mut() {
-            let _ = worker.child.kill();
-            let _ = worker.child.wait();
+            let _ = worker.child.terminate(TERMINATION_GRACE);
         }
         self.0.clear();
     }
@@ -2137,6 +2141,9 @@ fn supervise_stack(
         && (!valid_daemon_instance(instance) || !daemon_owner_is_active(root, instance)?)
     {
         bail!("engine daemon ownership could not be verified");
+    }
+    if daemon_instance.is_some() {
+        install_parent_liveness_watchdog()?;
     }
     let now = current_time_ms()?;
     let engine = EngineStore::open(root).map_err(anyhow::Error::msg)?;
@@ -2206,14 +2213,13 @@ fn supervise_stack(
                 .is_some_and(|worker| Instant::now() >= worker.deadline);
             let outcome = if timed_out {
                 let worker = active.0.get_mut(&id).context("active worker disappeared")?;
-                worker
+                let exit = worker
                     .child
-                    .kill()
+                    .terminate(TERMINATION_GRACE)
                     .context("could not terminate timed-out worker")?;
-                let exit = worker.child.wait()?;
                 Some((
-                    exit.success(),
-                    exit.code(),
+                    false,
+                    exit.and_then(|status| status.code()),
                     "worker exceeded its supervised deadline",
                 ))
             } else {
@@ -2322,20 +2328,19 @@ fn stop_active_workers(
     for id in ids {
         let mut worker = active.0.remove(&id).context("active worker disappeared")?;
         let exit = if let Some(exit) = worker.child.try_wait()? {
-            exit
+            Some(exit)
         } else {
             worker
                 .child
-                .kill()
-                .context("could not terminate interrupted worker")?;
-            worker.child.wait()?
+                .terminate(TERMINATION_GRACE)
+                .context("could not terminate interrupted worker")?
         };
         status
             .mark_exit(
                 &id,
                 &worker.run_id,
                 false,
-                exit.code(),
+                exit.and_then(|status| status.code()),
                 "supervisor was interrupted",
                 current_time_ms()?,
             )
@@ -2397,7 +2402,7 @@ fn stack_permissions(instance: &PlannedInstance) -> Permissions {
     }
 }
 
-fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Result<Child> {
+fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Result<ContainedChild> {
     let mut arguments = vec![
         OsString::from("__worker-run"),
         template.package.as_os_str().to_owned(),
@@ -2408,15 +2413,13 @@ fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Resu
         OsString::from(permissions_mask(&template.permissions).to_string()),
     ];
     push_worker_arguments(&mut arguments, &template.args);
-    ProcessCommand::new(executable)
+    let mut command = ContainedCommand::new(executable);
+    command
         .args(arguments)
-        .env_clear()
         .env("CARTRIDGE_WORKER", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("could not start the cartridge worker")
+        .stdout(OutputMode::Inherit)
+        .stderr(OutputMode::Inherit);
+    spawn_contained(&mut command, true).context("could not start the cartridge worker")
 }
 
 fn runtime_generation_is_current(
@@ -3965,15 +3968,14 @@ fn supervise_worker(
     };
     let deadline = Instant::now() + WORKER_STARTUP_BUDGET + execution_budget;
     let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
-    let mut worker = ProcessCommand::new(executable)
+    let mut command = ContainedCommand::new(executable);
+    command
         .args(arguments)
-        .env_clear()
         .env("CARTRIDGE_WORKER", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("could not start the cartridge worker")?;
+        .stdout(OutputMode::Inherit)
+        .stderr(OutputMode::Inherit);
+    let mut worker =
+        spawn_contained(&mut command, true).context("could not start the cartridge worker")?;
 
     loop {
         if let Some(status) = worker.try_wait()? {
@@ -3984,9 +3986,8 @@ fn supervise_worker(
         }
         if Instant::now() >= deadline {
             worker
-                .kill()
+                .terminate(TERMINATION_GRACE)
                 .context("could not terminate the cartridge worker")?;
-            let _ = worker.wait();
             return Err(anyhow::anyhow!(
                 "cartridge worker exceeded its {} ms supervised deadline",
                 (WORKER_STARTUP_BUDGET + execution_budget).as_millis()
@@ -4000,6 +4001,7 @@ fn require_worker_context() -> Result<()> {
     if std::env::var_os("CARTRIDGE_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
         bail!("internal worker commands cannot be invoked directly");
     }
+    install_parent_liveness_watchdog()?;
     Ok(())
 }
 

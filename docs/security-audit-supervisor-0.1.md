@@ -2,6 +2,8 @@
 
 Date: 2026-08-14
 
+> Historical boundary note: the hard-parent-failure gap recorded here was closed later the same day and is reviewed in [security-audit-process-containment-0.1.md](security-audit-process-containment-0.1.md). The remaining supervisor findings stay as the record of this earlier slice.
+
 Scope: the complete Rust workspace, native desktop shell, dependency graphs, execution and storage boundaries, engine desired/observed state, the foreground stack supervisor, CI/fuzz integration, and end-to-end stack execution. This is an internal review, not an independent assessment.
 
 ## Result

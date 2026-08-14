@@ -29,7 +29,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 1. Archive reader: compressed attacker bytes become a validated manifest, component, and asset map.
 2. Wasmtime component: guest memory and code call only linked WIT imports.
 3. Host capabilities: permissions, version negotiation, quotas, normalized paths/URLs, and tracing mediate authority.
-4. Worker process: compiler and guest failure are killable independently from the UI.
+4. Worker process tree: compiler and guest failure are killable independently from the UI; OS process groups/jobs and parent-liveness pipes prevent descendants surviving owner failure.
 5. Native adapters: graphics, audio, HTTP, discovery, and future devices receive validated host-owned documents, never guest pointers or raw handles.
 6. Persistent storage: the public CLI authenticates a cartridge id with a trusted package signature before opening its hashed namespace; stack replicas additionally partition engine-owned state by exact package digest. Commits use locks, revisions, checksums, and rollback generations.
 7. Distribution: Ed25519 trust authenticates packages and runtime releases; content addresses and transparency chains detect replacement.
@@ -44,14 +44,14 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - deterministic record/replay with strict event consumption and input revalidation
 - exact-byte package/release signatures and immutable version publishing
 - create-new outputs, staged commits, finite locks, compare-exchange revisions, backups, and quarantine
-- helper process deadline and minimal environment
+- helper process-tree deadline, minimal environment, parent-death liveness, and bounded termination
 - no production `unsafe` code in the workspace
 
 ## Residual risks and non-goals
 
 - Wasmtime or an enabled native adapter may contain an unknown vulnerability.
 - The general CLI worker is killable but does not yet enter AppContainer/restricted tokens, macOS sandbox profiles, or Linux namespace/seccomp profiles.
-- A graceful supervisor signal kills owned children, and every worker retains a Wasmtime deadline. A hard supervisor crash can still leave a child alive until that deadline because platform job objects and parent-death controls are not implemented yet.
+- Job Objects and process groups own complete child trees, while private parent-liveness pipes cover hard daemon and supervisor failure. Kernel-uninterruptible processes can still outlive the two-second reap window, and process containment does not reduce the worker's operating-system authority.
 - The daemon protocol is confidential and authenticated, but it does not yet use Unix peer credentials or Windows named-pipe ACLs. A local process without the endpoint capability cannot issue a valid command, though it can still consume the small bounded unauthenticated connection pool until its short authentication deadline.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.
