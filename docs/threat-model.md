@@ -34,6 +34,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 6. Persistent storage: the public CLI authenticates a cartridge id with a trusted package signature before opening its hashed namespace; stack replicas additionally partition engine-owned state by exact package digest. Commits use locks, revisions, checksums, and rollback generations.
 7. Distribution: Ed25519 trust authenticates packages and runtime releases; content addresses and transparency chains detect replacement.
 8. Peer mesh: X25519 identities derive authenticated session keys; sequence numbers and AEAD reject forgery and replay.
+9. Local engine control: a private random per-boot capability authenticates bounded encrypted loopback frames; instance ids, request ids, freshness checks, replay state, mutation serialization, and daemon leases prevent cross-generation or replayed control.
 
 ## Main defenses
 
@@ -51,6 +52,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - Wasmtime or an enabled native adapter may contain an unknown vulnerability.
 - The general CLI worker is killable but does not yet enter AppContainer/restricted tokens, macOS sandbox profiles, or Linux namespace/seccomp profiles.
 - A graceful supervisor signal kills owned children, and every worker retains a Wasmtime deadline. A hard supervisor crash can still leave a child alive until that deadline because platform job objects and parent-death controls are not implemented yet.
+- The daemon protocol is confidential and authenticated, but it does not yet use Unix peer credentials or Windows named-pipe ACLs. A local process without the endpoint capability cannot issue a valid command, though it can still consume the small bounded unauthenticated connection pool until its short authentication deadline.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.
 - Local state and trace files are integrity-protected where documented but not generally encrypted at rest.

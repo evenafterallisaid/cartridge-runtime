@@ -19,7 +19,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Distribute | Local signed registry reference, content identities, publishing/resolution/audit, and signed runtime update/install/rollback |
 | Network | Replayable scoped HTTP, encrypted peer-session primitives, verified asset transfer, CRDT document primitives, and deterministic simulation |
 | Compose | Typed dependency/provider declarations, direct semantic-version resolution, exact-byte lockfiles, and verified resolution from the installed library catalog |
-| Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, checksum-chained desired state, generation-fenced observed state, single-owner foreground supervision, per-replica state, bounded concurrency/restarts/backoff/deadlines, and `stack ps` status |
+| Control plane | Strict `Cartridge.stack.toml` parsing, exact installed-package plans, bounded resources and secret declarations, explicit security profiles, idempotent apply/stop/remove, checksum-chained desired state, generation-fenced observed state, single-owner supervision, per-replica state, bounded concurrency/restarts/backoff/deadlines, and a rootless persistent daemon with encrypted authenticated local control, replay rejection, liveness fencing, crash recovery, and Docker-style `engine` lifecycle commands |
 | Desktop | Native Tauri shell with overview, library, stack, journal, and settings views; exact plan and permission review; package re-verification; apply/stop/remove controls; persistent light/dark themes, density, motion, and safe new-stack defaults |
 | Quality | Cross-platform CI, parser fuzz targets, deterministic soak/benchmark tooling, compatibility policy, threat model, and RustSec dependency audit |
 
@@ -32,7 +32,7 @@ Cartridge is a substantial portable runtime prototype, not yet a Docker replacem
 | Transitive graph solver | Resolution currently handles one root's direct dependencies; it does not yet solve a whole graph, cycles, side-by-side majors, or minimal conflicts |
 | Relationship authorization | Capability grants exist for individual cartridges, but per-service-edge persistent/session grants and revocation are not wired into activation |
 | Service-aware supervisor | Standalone replica lifecycle and restart reconciliation work; provider-first activation, typed service wiring, health checks, rolling replacement, idle suspension, cancellation trees, circuit breaking, and backpressure remain |
-| Engine daemon | Commands are standalone; no per-user control plane owns desired state, reconciles crashes, or exposes one authenticated local API |
+| OS service integration and process trees | The daemon is a working foreground service suitable for a user service manager, but installers, login startup, Windows Job Objects, macOS parent-death containment, and Linux process groups/cgroups are not wired yet |
 | Complete stack schema | Instances, exact packages, resources, secret slots, restart intent, and security policy work; services, ingress, jobs, health checks, rollout policy, and runtime secret delivery remain |
 | Service ingress | HTTP is outbound and fixtureable; inbound routes, TLS identity, rate limits, and typed ingress policy are not implemented |
 | Secret broker | There are developer keys and trust stores, but no runtime secret slots, operation-scoped use, audit trail, or hardware-backed provider |
@@ -55,4 +55,4 @@ That makes Cartridge a poor target for an arbitrary database image or Linux dist
 - fast-starting managed edge jobs
 - replayable test, simulation, and support workloads
 
-The next product milestone is therefore not OCI compatibility. It is a rootless local engine that can apply a signed, locked stack of cartridges and explain every process, service edge, grant, resource, and state transition.
+The rootless local engine now owns desired-state reconciliation through an authenticated API. The next milestone is to make it explain and control every service edge, health decision, rollout, grant, resource, and state transition while adding native worker containment on each supported operating system.

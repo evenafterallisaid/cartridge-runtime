@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -219,8 +219,15 @@ fn load_settings(path: &Path) -> Result<AppSettings, String> {
     if metadata.len() > MAX_SETTINGS_BYTES {
         return Err("desktop settings exceed the size limit".into());
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("could not read desktop settings: {error}"))?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|error| format!("could not open desktop settings: {error}"))?
+        .take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read desktop settings: {error}"))?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err("desktop settings exceeded the size limit while reading".into());
+    }
     let settings: AppSettings = serde_json::from_slice(&bytes)
         .map_err(|error| format!("desktop settings are invalid: {error}"))?;
     validate_settings(&settings)?;

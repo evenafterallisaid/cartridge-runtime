@@ -506,8 +506,8 @@ Work:
 
 - a versioned `Cartridge.stack.toml` format for applications, providers, exact locks, state, blobs, secrets, ingress, schedules, budgets, and update policy
 - `stack validate`, `plan`, `apply`, `status`, `stop`, `remove`, `export`, and `import`
-- a per-user engine daemon over an authenticated local transport
-- one desired-state reconciler and append-only event journal
+- [implemented first slice] a per-user engine daemon over an encrypted authenticated local transport with replay rejection
+- [implemented first slice] one desired-state reconciler and append-only event journal
 - atomic plan application with preflight, staged activation, health gates, and rollback
 - instance identities separated from package identities
 - restart policies, exponential backoff, circuit breaking, graceful shutdown, and kill deadlines
@@ -525,7 +525,7 @@ Security order:
 1. specify the stack document, canonical digest, limits, and trust semantics
 2. implement an in-process planner with no mutation
 3. add a crash-recoverable journal and atomic local apply
-4. move lifecycle ownership into a per-user daemon with authenticated clients
+4. [implemented first slice] move lifecycle ownership into a per-user daemon with authenticated clients
 5. add platform-native worker sandboxes before remote or unattended workloads
 6. add secrets and ingress only after audit events, revocation, and redaction exist
 
@@ -1012,6 +1012,7 @@ The next concrete sequence is:
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
    - [implemented] generation-fenced replica expansion, durable observed status, restart recovery, process reconciliation, and one-supervisor leases
+   - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, and graceful client/supervisor drain
    - add explicit prepare/activate/commit rollout phases and recovery checkpoints
    - add health-gated rollback and rolling/canary replacement
    - compact long journals through signed checkpoints without losing auditability
@@ -1019,7 +1020,7 @@ The next concrete sequence is:
    - platform-native worker sandboxes and kernel resource limits
    - independent review and remediation record
    - signed/notarized installers and rollback-tested release channels
-7. Move lifecycle ownership into a per-user engine daemon only after standalone stack apply is stable. A daemon magnifies state-machine and authorization mistakes, so it is not the first implementation of those semantics.
+7. [implemented first slice] Move lifecycle ownership into a per-user engine daemon after standalone stack apply is stable. The next daemon slices are native service installation, OS peer credentials, process-tree containment, health-gated rollout, and structured observability.
 8. [partially implemented] Build the desktop shell over the same control-plane types:
    - [implemented] native Tauri shell with library, stack, security posture, and event views
    - [implemented] exact plan and permission review with server-retained digest and package re-verification before apply

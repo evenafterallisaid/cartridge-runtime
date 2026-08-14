@@ -1,5 +1,11 @@
+mod daemon;
 mod supervisor;
 
+pub use daemon::{
+    DAEMON_ENDPOINT_FILE, DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonEndpoint, DaemonFrame,
+    DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse, MAX_DAEMON_EVENTS,
+    MAX_DAEMON_FRAME_BYTES, MAX_DAEMON_SUPERVISORS, OpenedDaemonRequest,
+};
 pub use supervisor::{
     ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
 };
@@ -37,7 +43,9 @@ pub const MAX_STACK_ARGUMENTS: usize = 256;
 pub const MAX_STACK_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_STACK_PLAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENGINE_EVENTS_PER_STACK: usize = 4096;
+pub const MAX_ENGINE_STACKS: usize = 1024;
 pub const MAX_ENGINE_EVENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_ENGINE_EVENT_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_STATUS_BYTES: u64 = 1024 * 1024;
 
 const ENGINE_LOCK_ATTEMPTS: usize = 200;
@@ -647,6 +655,9 @@ impl EngineStore {
             );
         }
         let previous = self.latest(&plan.stack)?;
+        if previous.is_none() && self.list()?.len() >= MAX_ENGINE_STACKS {
+            return Err("engine stack limit reached".into());
+        }
         if let Some(previous) = &previous
             && previous.kind == EngineEventKind::Apply
             && previous
@@ -740,6 +751,9 @@ impl EngineStore {
             return Ok(None);
         }
         let status = read_runtime_status(&path)?;
+        if status.revision != revision || status.generation != generation {
+            return Ok(None);
+        }
         status.validate_against(&plan, revision, &generation)?;
         Ok(Some(status))
     }
@@ -871,6 +885,9 @@ impl EngineStore {
                 return Err("engine contains an unsafe stack directory".into());
             }
             names.push(name);
+            if names.len() > MAX_ENGINE_STACKS {
+                return Err("engine stack limit exceeded".into());
+            }
         }
         names.sort();
         names
@@ -912,7 +929,7 @@ impl EngineStore {
     fn append(&self, event: &EngineEvent) -> Result<(), String> {
         event.validate()?;
         let events = self.create_stack_events(&event.stack)?;
-        let current = read_events(&events, &event.stack)?;
+        let (current, current_bytes) = read_events_with_size(&events, &event.stack)?;
         if current.len() >= MAX_ENGINE_EVENTS_PER_STACK {
             return Err("engine event history limit reached".into());
         }
@@ -926,6 +943,12 @@ impl EngineStore {
         let bytes = serde_json::to_vec(event).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_ENGINE_EVENT_BYTES {
             return Err("engine event exceeds its byte limit".into());
+        }
+        if current_bytes
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|total| total > MAX_ENGINE_EVENT_HISTORY_BYTES)
+        {
+            return Err("engine event history byte limit reached".into());
         }
         let final_path = events.join(format!("{:020}.json", event.revision));
         write_new_atomic(&final_path, &bytes)
@@ -1305,8 +1328,12 @@ fn next_event(
 }
 
 fn read_events(path: &Path, stack: &str) -> Result<Vec<EngineEvent>, String> {
+    Ok(read_events_with_size(path, stack)?.0)
+}
+
+fn read_events_with_size(path: &Path, stack: &str) -> Result<(Vec<EngineEvent>, u64), String> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut paths = Vec::new();
     for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
@@ -1326,8 +1353,15 @@ fn read_events(path: &Path, stack: &str) -> Result<Vec<EngineEvent>, String> {
         return Err("engine event history limit exceeded".into());
     }
     let mut events = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0_u64;
     for path in paths {
-        let event: EngineEvent = read_bounded_json(&path)?;
+        let remaining = MAX_ENGINE_EVENT_HISTORY_BYTES
+            .checked_sub(total_bytes)
+            .ok_or_else(|| "engine event history byte limit exceeded".to_string())?;
+        let (event, event_bytes): (EngineEvent, u64) = read_bounded_json(&path, remaining)?;
+        total_bytes = total_bytes
+            .checked_add(event_bytes)
+            .ok_or_else(|| "engine event history byte count overflow".to_string())?;
         event.validate()?;
         let expected_revision = events
             .last()
@@ -1345,27 +1379,30 @@ fn read_events(path: &Path, stack: &str) -> Result<Vec<EngineEvent>, String> {
         }
         events.push(event);
     }
-    Ok(events)
+    Ok((events, total_bytes))
 }
 
-fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+fn read_bounded_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    remaining: u64,
+) -> Result<(T, u64), String> {
+    let limit = MAX_ENGINE_EVENT_BYTES.min(remaining);
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_ENGINE_EVENT_BYTES
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
         return Err("engine event must be a bounded regular file".into());
     }
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(|error| error.to_string())?
-        .take(MAX_ENGINE_EVENT_BYTES + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_ENGINE_EVENT_BYTES {
+    if bytes.len() as u64 > limit {
         return Err("engine event exceeded its byte limit while reading".into());
     }
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    let length = bytes.len() as u64;
+    let value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok((value, length))
 }
 
 fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1818,7 +1855,7 @@ mod tests {
 
         engine.stop("demo-stack").unwrap();
         assert!(engine.save_runtime_status(&runtime).is_err());
-        assert!(engine.runtime_status("demo-stack").is_err());
+        assert!(engine.runtime_status("demo-stack").unwrap().is_none());
 
         let (revision, generation, stopped) = engine.desired_plan("demo-stack").unwrap().unwrap();
         runtime = StackRuntimeStatus::from_plan(&stopped, revision, &generation, 2).unwrap();
@@ -1846,6 +1883,34 @@ mod tests {
             value.instances.push(instance);
         }
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn engine_rejects_more_than_the_bounded_stack_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine_root = directory.path().join("engine");
+        let engine = EngineStore::open(&engine_root).unwrap();
+        for index in 0..=MAX_ENGINE_STACKS {
+            fs::create_dir(engine_root.join("stacks").join(format!("stack-{index:04}"))).unwrap();
+        }
+        assert!(engine.list().is_err());
+    }
+
+    #[test]
+    fn journal_reads_enforce_the_remaining_aggregate_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let event = EngineEvent::new(
+            1,
+            "demo-stack".into(),
+            EngineEventKind::Remove,
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let path = directory.path().join("event.json");
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_bounded_json::<EngineEvent>(&path, bytes.len() as u64 - 1).is_err());
     }
 
     #[test]

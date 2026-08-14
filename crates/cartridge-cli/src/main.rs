@@ -1,4 +1,5 @@
 mod capsule;
+mod engine_daemon;
 mod migration_receipt;
 
 use std::{
@@ -25,8 +26,8 @@ use cartridge_dev::{
     source_fingerprint,
 };
 use cartridge_engine::{
-    EngineStore, PlannedInstance, ReplicaId, ReplicaPhase, StackCapability, StackManifest,
-    StackPlan, StackRuntimeStatus,
+    DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, PlannedInstance,
+    ReplicaId, ReplicaPhase, StackCapability, StackManifest, StackPlan, StackRuntimeStatus,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -55,7 +56,7 @@ const MAX_BLOB_GC_ROOT_ARTIFACTS: usize = 256;
 const MAX_BLOB_GC_REFERENCES: usize = 100_000;
 const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_STABILITY_WALL_TIME: Duration = Duration::from_secs(60 * 60);
-const MAX_SUPERVISOR_WORKERS: usize = 32;
+const DEFAULT_SUPERVISOR_WORKERS: u16 = 32;
 const DESIRED_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
@@ -170,6 +171,11 @@ enum Command {
     Stack {
         #[command(subcommand)]
         command: StackCommand,
+    },
+    /// run and control the persistent local cartridge engine
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
     },
     /// build a cartridge archive from a manifest and component
     Pack {
@@ -668,6 +674,14 @@ enum StackCommand {
         library: PathBuf,
         #[arg(long)]
         root: PathBuf,
+        #[arg(
+            long,
+            default_value_t = DEFAULT_SUPERVISOR_WORKERS,
+            value_parser = clap::value_parser!(u16).range(1..=256)
+        )]
+        max_workers: u16,
+        #[arg(long, hide = true)]
+        daemon_instance: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -713,6 +727,121 @@ enum StackCommand {
     /// show the checksum-chained control-plane event history
     Events {
         stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCommand {
+    /// run the authenticated per-user engine service
+    Serve {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 8,
+            value_parser = clap::value_parser!(u16).range(1..=64)
+        )]
+        max_supervisors: u16,
+        #[arg(
+            long,
+            default_value_t = DEFAULT_SUPERVISOR_WORKERS,
+            value_parser = clap::value_parser!(u16).range(1..=256)
+        )]
+        workers_per_stack: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// verify that the engine is reachable and authenticated
+    Ping {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// show engine identity, capacity, and stack counts
+    Info {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// list stacks through the persistent engine
+    List {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// resolve a manifest using the daemon's installed library
+    Plan {
+        file: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// apply a manifest and let the daemon reconcile it
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        allow_insecure: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// inspect one stack's desired state
+    Status {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// inspect one stack's observed replica state
+    Ps {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// show the latest checksum-chained stack events
+    Events {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=256))]
+        tail: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// set a stack's desired state to stopped
+    Stop {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// tombstone a stack while retaining its audit journal
+    Remove {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// gracefully stop the engine service
+    Shutdown {
         #[arg(long)]
         root: PathBuf,
         #[arg(long)]
@@ -1052,6 +1181,7 @@ fn run_cli() -> Result<()> {
         } => conformance_command(&package, json, &args),
         Command::Library { command } => run_library_command(command),
         Command::Stack { command } => run_stack_command(command),
+        Command::Engine { command } => run_engine_command(command),
         Command::Pack {
             manifest,
             component,
@@ -1194,6 +1324,216 @@ fn run_cli() -> Result<()> {
         Command::WorkerStability { command } => {
             require_worker_context()?;
             run_stability_command(command)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_engine_command(command: EngineCommand) -> Result<()> {
+    match command {
+        EngineCommand::Serve {
+            root,
+            library,
+            max_supervisors,
+            workers_per_stack,
+            json,
+        } => engine_daemon::serve(&engine_daemon::ServeOptions {
+            root: &root,
+            library: &library,
+            max_supervisors,
+            workers_per_stack,
+            json,
+        }),
+        EngineCommand::Ping { root, json } => {
+            match engine_daemon::request(&root, DaemonRequest::Ping)? {
+                DaemonResponse::Pong if json => println!("{{\"reachable\":true}}"),
+                DaemonResponse::Pong => println!("engine is reachable and authenticated"),
+                _ => bail!("engine returned an unexpected response"),
+            }
+            Ok(())
+        }
+        EngineCommand::Info { root, json } => {
+            let DaemonResponse::Info(info) = engine_daemon::request(&root, DaemonRequest::Info)?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                println!("engine {} pid={}", info.instance_id, info.pid);
+                println!("started: {}", info.started_at_ms);
+                println!(
+                    "supervisors: {}/{} ({} workers per stack)",
+                    info.active_supervisors, info.max_supervisors, info.workers_per_stack
+                );
+                println!(
+                    "stacks: {} known, {} applied",
+                    info.known_stacks, info.applied_stacks
+                );
+            }
+            Ok(())
+        }
+        EngineCommand::List { root, json } => {
+            let DaemonResponse::Stacks(statuses) =
+                engine_daemon::request(&root, DaemonRequest::List)?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else {
+                for status in statuses {
+                    println!(
+                        "{} {:?} revision={} instances={} replicas={}",
+                        status.stack,
+                        status.state,
+                        status.revision,
+                        status.instance_count,
+                        status.desired_replicas
+                    );
+                }
+            }
+            Ok(())
+        }
+        EngineCommand::Plan {
+            file,
+            root,
+            output,
+            json,
+        } => {
+            let manifest = StackManifest::read(&file).map_err(anyhow::Error::msg)?;
+            let DaemonResponse::Planned(plan) = engine_daemon::request(
+                &root,
+                DaemonRequest::Plan {
+                    manifest: Box::new(manifest),
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if let Some(path) = output {
+                write_private(&path, &serde_json::to_vec_pretty(&plan)?)?;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                print_stack_plan(&plan);
+            }
+            Ok(())
+        }
+        EngineCommand::Apply {
+            file,
+            root,
+            allow_insecure,
+            json,
+        } => {
+            let manifest = StackManifest::read(&file).map_err(anyhow::Error::msg)?;
+            let DaemonResponse::Planned(plan) = engine_daemon::request(
+                &root,
+                DaemonRequest::Plan {
+                    manifest: Box::new(manifest),
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            let DaemonResponse::Applied(report) = engine_daemon::request(
+                &root,
+                DaemonRequest::Apply {
+                    plan,
+                    allow_insecure,
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            print_stack_report(&report, json)
+        }
+        EngineCommand::Status { stack, root, json } => {
+            let DaemonResponse::Status(status) =
+                engine_daemon::request(&root, DaemonRequest::Status { stack })?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "{} {:?} revision={} instances={} replicas={}",
+                    status.stack,
+                    status.state,
+                    status.revision,
+                    status.instance_count,
+                    status.desired_replicas
+                );
+            }
+            Ok(())
+        }
+        EngineCommand::Ps { stack, root, json } => {
+            let DaemonResponse::RuntimeStatus(runtime) = engine_daemon::request(
+                &root,
+                DaemonRequest::RuntimeStatus {
+                    stack: stack.clone(),
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runtime)?);
+            } else if let Some(runtime) = runtime {
+                print_runtime_status(&runtime);
+            } else {
+                println!("{stack} has no observed runtime state");
+            }
+            Ok(())
+        }
+        EngineCommand::Events {
+            stack,
+            root,
+            tail,
+            json,
+        } => {
+            let DaemonResponse::Events(events) =
+                engine_daemon::request(&root, DaemonRequest::Events { stack, tail })?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                for event in events {
+                    println!(
+                        "{} {:?} {} {}",
+                        event.revision, event.kind, event.created_at_ms, event.event_sha256
+                    );
+                }
+            }
+            Ok(())
+        }
+        EngineCommand::Stop { stack, root, json } => {
+            let DaemonResponse::Stopped(report) =
+                engine_daemon::request(&root, DaemonRequest::Stop { stack })?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            print_stack_report(&report, json)
+        }
+        EngineCommand::Remove { stack, root, json } => {
+            let DaemonResponse::Removed(report) =
+                engine_daemon::request(&root, DaemonRequest::Remove { stack })?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            print_stack_report(&report, json)
+        }
+        EngineCommand::Shutdown { root, json } => {
+            match engine_daemon::request(&root, DaemonRequest::Shutdown)? {
+                DaemonResponse::ShuttingDown if json => println!("{{\"stopping\":true}}"),
+                DaemonResponse::ShuttingDown => println!("engine is shutting down"),
+                _ => bail!("engine returned an unexpected response"),
+            }
+            Ok(())
         }
     }
 }
@@ -1647,8 +1987,17 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
             stack,
             library,
             root,
+            max_workers,
+            daemon_instance,
             json,
-        } => supervise_stack(&stack, &root, &library, json),
+        } => supervise_stack(
+            &stack,
+            &root,
+            &library,
+            usize::from(max_workers),
+            daemon_instance.as_deref(),
+            json,
+        ),
         StackCommand::List { root, json } => {
             let statuses = EngineStore::open(root)
                 .map_err(anyhow::Error::msg)?
@@ -1773,7 +2122,22 @@ impl Drop for ActiveStackWorkers {
 }
 
 #[allow(clippy::too_many_lines)]
-fn supervise_stack(stack: &str, root: &Path, library_root: &Path, json: bool) -> Result<()> {
+fn supervise_stack(
+    stack: &str,
+    root: &Path,
+    library_root: &Path,
+    max_workers: usize,
+    daemon_instance: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if max_workers == 0 || max_workers > 256 {
+        bail!("supervisor worker limit is invalid");
+    }
+    if let Some(instance) = daemon_instance
+        && (!valid_daemon_instance(instance) || !daemon_owner_is_active(root, instance)?)
+    {
+        bail!("engine daemon ownership could not be verified");
+    }
     let now = current_time_ms()?;
     let engine = EngineStore::open(root).map_err(anyhow::Error::msg)?;
     let (revision, generation, plan) = engine
@@ -1812,10 +2176,20 @@ fn supervise_stack(stack: &str, root: &Path, library_root: &Path, json: bool) ->
             return Ok(());
         }
         if Instant::now() >= next_desired_check {
-            if !runtime_generation_is_current(root, stack, revision, &generation)? {
-                active.terminate_all();
+            let generation_is_current =
+                runtime_generation_is_current(root, stack, revision, &generation)?;
+            let daemon_is_current = daemon_instance
+                .map(|instance| daemon_owner_is_active(root, instance))
+                .transpose()?
+                .unwrap_or(true);
+            if !generation_is_current || !daemon_is_current {
+                if generation_is_current {
+                    stop_active_workers(&mut active, &mut status, root)?;
+                } else {
+                    active.terminate_all();
+                }
                 if !json {
-                    println!("{stack} desired state changed; stopped generation {revision}");
+                    println!("{stack} ownership changed; stopped generation {revision}");
                 }
                 return Ok(());
             }
@@ -1863,7 +2237,7 @@ fn supervise_stack(stack: &str, root: &Path, library_root: &Path, json: bool) ->
             persist_runtime_status(root, &status)?;
         }
 
-        while active.0.len() < MAX_SUPERVISOR_WORKERS {
+        while active.0.len() < max_workers {
             let Some(id) = status
                 .eligible_starts(now_ms)
                 .into_iter()
@@ -2058,6 +2432,21 @@ fn runtime_generation_is_current(
         .is_some_and(|(current_revision, current_generation, _)| {
             current_revision == revision && current_generation == generation
         }))
+}
+
+fn daemon_owner_is_active(root: &Path, instance: &str) -> Result<bool> {
+    let Ok(endpoint) = DaemonEndpoint::read(root) else {
+        return Ok(false);
+    };
+    Ok(endpoint.instance_id == instance
+        && DaemonLease::is_active(root).map_err(anyhow::Error::msg)?)
+}
+
+fn valid_daemon_instance(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn persist_runtime_status(root: &Path, status: &StackRuntimeStatus) -> Result<()> {

@@ -180,6 +180,34 @@ jobs:
           cargo run -p cartridge-cli -- stack stop hello-stack --root engine
           cargo run -p cartridge-cli -- stack remove hello-stack --root engine
           cargo run -p cartridge-cli -- stack status hello-stack --root engine
+          "$binary" engine serve --root daemon-engine --library library --max-supervisors 2 --workers-per-stack 4 --json > daemon-engine.out 2> daemon-engine.err &
+          daemon_pid=$!
+          for attempt in {1..100}; do
+            if [ -e daemon-engine/daemon.json ]; then break; fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              cat daemon-engine.err
+              exit 1
+            fi
+            sleep 0.05
+          done
+          test -e daemon-engine/daemon.json
+          "$binary" engine ping --root daemon-engine --json | grep '"reachable":true'
+          "$binary" engine apply tests/fixtures/Cartridge.stack.toml --root daemon-engine
+          for attempt in {1..100}; do
+            if "$binary" engine ps hello-stack --root daemon-engine --json | grep -q '"phase": "succeeded"'; then break; fi
+            sleep 0.05
+          done
+          "$binary" engine ps hello-stack --root daemon-engine --json | grep '"phase": "succeeded"'
+          "$binary" engine events hello-stack --root daemon-engine --tail 1 --json | grep '"revision": 1'
+          "$binary" engine stop hello-stack --root daemon-engine
+          "$binary" engine remove hello-stack --root daemon-engine
+          "$binary" engine shutdown --root daemon-engine --json | grep '"stopping":true'
+          wait "$daemon_pid"
+          test ! -e daemon-engine/daemon.json
+          if grep -q 'key_hex' daemon-engine.out; then
+            echo "daemon exposed its control key"
+            exit 1
+          fi
           cargo run -p cartridge-cli -- pack tests/fixtures/composition-root.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-root.cartridge
           cargo run -p cartridge-cli -- pack tests/fixtures/composition-provider.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output composition-provider.cartridge
           cargo run -p cartridge-cli -- library install composition-root.cartridge --root library

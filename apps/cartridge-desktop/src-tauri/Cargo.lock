@@ -323,13 +323,16 @@ version = "0.1.0"
 dependencies = [
  "cartridge-core",
  "cartridge-desktop",
+ "chacha20poly1305",
  "fs4",
  "hex",
+ "rand",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "toml 1.1.4+spec-1.1.0",
+ "zeroize",
 ]
 
 [[package]]
