@@ -8,14 +8,15 @@ mod bindings {
     export!(HelloCartridge);
 }
 use bindings::cartridge::api::host::{
-    LogLevel, StorageMutation, log, read_asset, storage_apply, storage_compare_exchange,
-    storage_get, storage_list, storage_revision, wall_clock_ms,
+    HealthState, LogLevel, StorageMutation, health_report, log, read_asset, storage_apply,
+    storage_compare_exchange, storage_get, storage_list, storage_revision, wall_clock_ms,
 };
 
 struct HelloCartridge;
 
 impl bindings::Guest for HelloCartridge {
     fn run(args: Vec<String>) -> Result<String, String> {
+        health_report(HealthState::Started, "");
         let name = args.first().map_or("there", String::as_str);
         log(LogLevel::Info, &format!("starting for {name}"));
 
@@ -64,6 +65,7 @@ impl bindings::Guest for HelloCartridge {
             return Err("stored name was not listed".into());
         }
         let timestamp = wall_clock_ms()?;
+        health_report(HealthState::Ready, "");
         Ok(format!(
             "{} {name} (previous: {previous_name}, host time: {timestamp} ms)",
             message.trim()

@@ -1,0 +1,14 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.legacy-api"
+name = "Legacy API Fixture"
+version = "0.1.0"
+
+[compatibility]
+host_api = "^0.4"
+
+[runtime]
+fuel = 1000000
+memory_bytes = 8388608
+timeout_ms = 1000

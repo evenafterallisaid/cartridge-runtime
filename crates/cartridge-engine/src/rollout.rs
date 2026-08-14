@@ -493,9 +493,15 @@ impl EngineStore {
                 .runtime_status(stack)?
                 .ok_or_else(|| "rollout has no observed runtime state".to_string())?;
             let stable = runtime.replicas.iter().all(|replica| match replica.phase {
-                super::ReplicaPhase::Running => replica.started_at_ms.is_some_and(|started| {
-                    now_ms.saturating_sub(started) >= ROLLOUT_STABILITY_WINDOW_MS
-                }),
+                super::ReplicaPhase::Running => {
+                    let stable_since = replica
+                        .probe
+                        .as_ref()
+                        .map_or(replica.started_at_ms, |probe| probe.ready_at_ms);
+                    stable_since.is_some_and(|started| {
+                        now_ms.saturating_sub(started) >= ROLLOUT_STABILITY_WINDOW_MS
+                    })
+                }
                 super::ReplicaPhase::Succeeded | super::ReplicaPhase::Stopped => true,
                 _ => false,
             });
@@ -870,6 +876,7 @@ mod tests {
                 args: Vec::new(),
                 secrets: BTreeSet::new(),
                 limits: RuntimeLimits::default(),
+                health: None,
                 composition: CompositionLock::new(
                     LockedPackage {
                         cartridge_id: "dev.test.app".into(),

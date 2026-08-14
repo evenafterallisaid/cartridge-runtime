@@ -83,10 +83,15 @@ jobs:
       - name: Build migration regression component
         run: cargo build --manifest-path tests/fixtures/migration-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
+      - name: Build legacy API regression component
+        run: cargo build --manifest-path tests/fixtures/legacy-api-cartridge/Cargo.toml --target wasm32-wasip2 --release
+
       - name: Run end-to-end example
         shell: bash
         run: |
           cargo run -p cartridge-cli -- pack examples/hello-cartridge/Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --assets examples/hello-cartridge/assets --output hello.cartridge
+          cargo run -p cartridge-cli -- pack tests/fixtures/legacy-api-cartridge/Cartridge.toml --component tests/fixtures/legacy-api-cartridge/target/wasm32-wasip2/release/legacy_api_cartridge.wasm --output legacy-api.cartridge
+          cargo run -p cartridge-cli -- run legacy-api.cartridge | grep 'legacy 0.4 component ran'
           cargo run -p cartridge-cli -- inspect hello.cartridge
           cargo run -p cartridge-cli -- verify hello.cartridge
           cargo run -p cartridge-cli -- platform hello.cartridge --json
@@ -161,7 +166,11 @@ jobs:
           cargo run -p cartridge-cli -- trace export hello.trace.json --output hello.timeline.json
           cargo run -p cartridge-cli -- conformance hello.cartridge -- CI
           cargo run -p cartridge-cli -- library install hello.cartridge --root library
+          cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
+          cargo run -p cartridge-cli -- library install timeout.cartridge --root library
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.stack.toml
+          cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-timeout.stack.toml
+          cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-liveness.stack.toml
           cargo run -p cartridge-cli -- stack plan tests/fixtures/Cartridge.stack.toml --library library --output hello.stack-plan.json
           grep '"timeout_ms": 5000' hello.stack-plan.json
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
@@ -174,6 +183,17 @@ jobs:
           cargo run -p cartridge-cli -- stack stop hello-stack --root engine
           cargo run -p cartridge-cli -- stack remove hello-stack --root engine
           cargo run -p cartridge-cli -- stack status hello-stack --root engine
+          cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.probe-timeout.stack.toml --library library --root engine
+          cargo run -p cartridge-cli -- stack supervise probe-timeout-stack --library library --root engine --json > probe-timeout.json
+          grep '"phase": "failed"' probe-timeout.json
+          grep 'application startup probe timed out' probe-timeout.json
+          cargo run -p cartridge-cli -- stack remove probe-timeout-stack --root engine
+          cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.probe-liveness.stack.toml --library library --root engine
+          cargo run -p cartridge-cli -- stack supervise probe-liveness-stack --library library --root engine --json > probe-liveness.json
+          grep '"phase": "failed"' probe-liveness.json
+          grep 'application liveness probe timed out' probe-liveness.json
+          grep '"consecutive_failures": 2' probe-liveness.json
+          cargo run -p cartridge-cli -- stack remove probe-liveness-stack --root engine
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.limits.stack.toml --library library --root engine
           cargo run -p cartridge-cli -- stack supervise hello-budget-stack --library library --root engine --json
           cargo run -p cartridge-cli -- stack ps hello-budget-stack --root engine --json | grep '"phase": "failed"'
@@ -265,7 +285,6 @@ jobs:
           cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json storage migration-recover migration.cartridge migration-receipt.json --state-dir uncommitted-migration-state --json | grep '"status": "not_committed"'
           cargo run -p cartridge-cli -- --storage-signature migration.signature.json --storage-trust trust.json run migration.cartridge --state-dir migration-state
           cargo run -p cartridge-cli -- pack tests/fixtures/migration-cartridge/missing-export.Cartridge.toml --component examples/hello-cartridge/target/wasm32-wasip2/release/hello_cartridge.wasm --output missing-migration-export.cartridge
-          cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
           printf ' ' >> capsule-result.cartridge-state.json
           set +e
           "$binary" capsule verify run.cartridge-capsule.json

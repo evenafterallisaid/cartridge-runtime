@@ -31,7 +31,10 @@ use wasmtime_wasi_io::{
     poll::{DynPollable, Pollable, subscribe},
 };
 
-use crate::{MAX_TRACE_BYTES, MAX_TRACE_EVENTS, ReplayError, TraceEvent, cartridge};
+use crate::{
+    GuestHealthState, HealthReporter, MAX_HEALTH_DETAIL_BYTES, MAX_HEALTH_REPORTS_PER_RUN,
+    MAX_TRACE_BYTES, MAX_TRACE_EVENTS, ReplayError, TraceEvent, cartridge,
+};
 
 const MAX_RANDOM_BYTES: u32 = 1024 * 1024;
 const MAX_LOG_CHARACTERS: usize = 16 * 1024;
@@ -68,6 +71,8 @@ pub(crate) struct HostState {
     media_metrics: crate::MediaMetrics,
     http_policy: HttpPolicy,
     http_transport: Option<Arc<dyn HttpTransport>>,
+    health_reporter: Option<Arc<dyn HealthReporter>>,
+    health_reports: u32,
 }
 
 impl HostState {
@@ -161,7 +166,17 @@ impl HostState {
             media_metrics: crate::MediaMetrics::default(),
             http_policy: manifest.http.clone(),
             http_transport: None,
+            health_reporter: None,
+            health_reports: 0,
         }
+    }
+
+    pub(crate) fn with_health_reporter(
+        mut self,
+        reporter: Option<Arc<dyn HealthReporter>>,
+    ) -> Self {
+        self.health_reporter = reporter;
+        self
     }
 
     pub(crate) fn with_http_transport(mut self, transport: Option<Arc<dyn HttpTransport>>) -> Self {
@@ -481,6 +496,29 @@ impl cartridge::api::host::Host for HostState {
             "write",
             json!({ "level": label, "message": message }),
         );
+    }
+
+    fn health_report(&mut self, state: cartridge::api::host::HealthState, detail: String) {
+        if detail.len() > MAX_HEALTH_DETAIL_BYTES
+            || detail
+                .chars()
+                .any(|character| character.is_control() && character != '\t')
+        {
+            return;
+        }
+        let state = match state {
+            cartridge::api::host::HealthState::Started => GuestHealthState::Started,
+            cartridge::api::host::HealthState::Ready => GuestHealthState::Ready,
+            cartridge::api::host::HealthState::Heartbeat => GuestHealthState::Heartbeat,
+            cartridge::api::host::HealthState::Unhealthy => GuestHealthState::Unhealthy,
+        };
+        if let Some(reporter) = &self.health_reporter {
+            if self.health_reports >= MAX_HEALTH_REPORTS_PER_RUN {
+                return;
+            }
+            self.health_reports += 1;
+            let _ = reporter.report(state, &detail);
+        }
     }
 
     fn wall_clock_ms(&mut self) -> Result<u64, String> {
@@ -1100,6 +1138,7 @@ mod tests {
     use cartridge_core::{CartridgeMetadata, Integrity, RuntimeLimits, Services, StateConfig};
     use cartridge_storage::MemoryStorage;
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct FixedHttp;
@@ -1111,6 +1150,16 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: b"ok".to_vec(),
             })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordedHealth(Mutex<Vec<(GuestHealthState, String)>>);
+
+    impl HealthReporter for RecordedHealth {
+        fn report(&self, state: GuestHealthState, detail: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push((state, detail.into()));
+            Ok(())
         }
     }
 
@@ -1133,6 +1182,41 @@ mod tests {
     #[test]
     fn terminal_controls_are_escaped() {
         assert_eq!(terminal_safe("ok\u{1b}[2J\nnext"), "ok\\u{1b}[2J\\nnext");
+    }
+
+    #[test]
+    fn guest_health_is_bounded_and_forwarded_out_of_band() {
+        let reporter = Arc::new(RecordedHealth::default());
+        let mut state = HostState::new(
+            &manifest(Permissions::default()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        )
+        .with_health_reporter(Some(reporter.clone()));
+
+        <HostState as cartridge::api::host::Host>::health_report(
+            &mut state,
+            cartridge::api::host::HealthState::Ready,
+            "ready".into(),
+        );
+        <HostState as cartridge::api::host::Host>::health_report(
+            &mut state,
+            cartridge::api::host::HealthState::Unhealthy,
+            "x".repeat(MAX_HEALTH_DETAIL_BYTES + 1),
+        );
+        for _ in 0..MAX_HEALTH_REPORTS_PER_RUN {
+            <HostState as cartridge::api::host::Host>::health_report(
+                &mut state,
+                cartridge::api::host::HealthState::Heartbeat,
+                String::new(),
+            );
+        }
+
+        let reports = reporter.0.lock().unwrap();
+        assert_eq!(reports.len(), MAX_HEALTH_REPORTS_PER_RUN as usize);
+        assert_eq!(reports[0], (GuestHealthState::Ready, "ready".into()));
+        assert!(state.events.is_empty());
     }
 
     #[test]

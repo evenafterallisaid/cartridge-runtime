@@ -15,6 +15,12 @@ max_restarts = 3
 allow = ["clock", "assets", "storage"]
 args = ["Stack"]
 
+[instances.health]
+startup_timeout_ms = 5000
+readiness_timeout_ms = 10000
+liveness_timeout_ms = 1000
+failure_threshold = 2
+
 [instances.limits]
 fuel = 5000000
 memory_bytes = 33554432

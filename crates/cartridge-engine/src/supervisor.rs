@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    DesiredState, MAX_STACK_RESTARTS, MAX_STACK_TOTAL_REPLICAS, RestartPolicy, StackPlan,
-    is_digest, valid_name, valid_text,
+    DesiredState, MAX_PROBE_FAILURE_THRESHOLD, MAX_STACK_RESTARTS, MAX_STACK_TOTAL_REPLICAS,
+    ProbeSignalKind, RestartPolicy, StackPlan, is_digest, valid_name, valid_text,
 };
 
-pub const SUPERVISOR_STATUS_FORMAT_VERSION: u32 = 1;
+pub const SUPERVISOR_STATUS_FORMAT_VERSION: u32 = 2;
+pub const LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION: u32 = 1;
 pub const MAX_RESTART_BACKOFF_MS: u64 = 30_000;
 const MIN_RESTART_BACKOFF_MS: u64 = 250;
 
@@ -32,6 +33,24 @@ pub enum ReplicaPhase {
     Stopped,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbePhase {
+    Waiting,
+    Ready,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaProbeRuntime {
+    pub phase: ProbePhase,
+    pub last_sequence: u64,
+    pub last_signal_at_ms: Option<u64>,
+    pub ready_at_ms: Option<u64>,
+    pub consecutive_failures: u16,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicaRuntime {
@@ -47,6 +66,8 @@ pub struct ReplicaRuntime {
     pub next_start_at_ms: Option<u64>,
     pub last_exit_code: Option<i32>,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ReplicaProbeRuntime>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,6 +116,16 @@ impl StackRuntimeStatus {
                     next_start_at_ms: None,
                     last_exit_code: None,
                     detail: None,
+                    probe: (instance.desired == DesiredState::Running)
+                        .then_some(instance.health.as_ref())
+                        .flatten()
+                        .map(|_| ReplicaProbeRuntime {
+                            phase: ProbePhase::Waiting,
+                            last_sequence: 0,
+                            last_signal_at_ms: None,
+                            ready_at_ms: None,
+                            consecutive_failures: 0,
+                        }),
                 });
             }
         }
@@ -112,7 +143,11 @@ impl StackRuntimeStatus {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.format_version != SUPERVISOR_STATUS_FORMAT_VERSION
+        if !matches!(
+            self.format_version,
+            LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION | SUPERVISOR_STATUS_FORMAT_VERSION
+        ) || (self.format_version == LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION
+            && self.replicas.iter().any(|replica| replica.probe.is_some()))
             || !valid_name(&self.stack)
             || self.revision == 0
             || !is_digest(&self.generation)
@@ -158,6 +193,7 @@ impl StackRuntimeStatus {
                         || actual.desired != expected.desired
                         || actual.restart != expected.restart
                         || actual.max_restarts != expected.max_restarts
+                        || actual.probe.is_some() != expected.probe.is_some()
                 })
         {
             return Err("runtime status does not match the desired generation".into());
@@ -218,6 +254,15 @@ impl StackRuntimeStatus {
         replica.next_start_at_ms = None;
         replica.last_exit_code = None;
         replica.detail = None;
+        if let Some(probe) = &mut replica.probe {
+            *probe = ReplicaProbeRuntime {
+                phase: ProbePhase::Waiting,
+                last_sequence: 0,
+                last_signal_at_ms: None,
+                ready_at_ms: None,
+                consecutive_failures: 0,
+            };
+        }
         self.observed_at_ms = now_ms;
         self.refresh()?;
         Ok(attempt)
@@ -236,9 +281,113 @@ impl StackRuntimeStatus {
         if replica.phase != ReplicaPhase::Starting || replica.run_id.as_deref() != Some(run_id) {
             return Err("stale or unexpected replica start acknowledgement".into());
         }
+        if replica.probe.is_some() {
+            return Err("probe-gated replica requires an application ready signal".into());
+        }
         replica.phase = ReplicaPhase::Running;
         self.observed_at_ms = now_ms;
         self.refresh()
+    }
+
+    pub fn mark_probe_signal(
+        &mut self,
+        id: &ReplicaId,
+        run_id: &str,
+        sequence: u64,
+        kind: ProbeSignalKind,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if now_ms < self.observed_at_ms {
+            return Err("runtime observation time cannot move backwards".into());
+        }
+        let replica = self.replica_mut(id)?;
+        if !matches!(
+            replica.phase,
+            ReplicaPhase::Starting | ReplicaPhase::Running
+        ) || replica.run_id.as_deref() != Some(run_id)
+        {
+            return Err("stale or unexpected application health signal".into());
+        }
+        let probe = replica
+            .probe
+            .as_mut()
+            .ok_or_else(|| "replica does not require application health signals".to_string())?;
+        if sequence <= probe.last_sequence {
+            return Err("application health signal was replayed or reordered".into());
+        }
+        probe.last_sequence = sequence;
+        probe.last_signal_at_ms = Some(now_ms);
+        match kind {
+            ProbeSignalKind::Started | ProbeSignalKind::Heartbeat => {}
+            ProbeSignalKind::Ready => {
+                probe.phase = ProbePhase::Ready;
+                probe.ready_at_ms = Some(now_ms);
+                probe.consecutive_failures = 0;
+                replica.phase = ReplicaPhase::Running;
+            }
+            ProbeSignalKind::Unhealthy => {
+                probe.phase = ProbePhase::Unhealthy;
+                probe.ready_at_ms = None;
+                probe.consecutive_failures = probe
+                    .consecutive_failures
+                    .checked_add(1)
+                    .ok_or_else(|| "application health failure counter overflow".to_string())?;
+                if probe.consecutive_failures > MAX_PROBE_FAILURE_THRESHOLD {
+                    return Err("application health failure counter exceeded its limit".into());
+                }
+            }
+        }
+        self.observed_at_ms = now_ms;
+        self.refresh()
+    }
+
+    pub fn mark_probe_timeout(
+        &mut self,
+        id: &ReplicaId,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Result<u16, String> {
+        if now_ms < self.observed_at_ms {
+            return Err("runtime observation time cannot move backwards".into());
+        }
+        let replica = self.replica_mut(id)?;
+        if !matches!(
+            replica.phase,
+            ReplicaPhase::Starting | ReplicaPhase::Running
+        ) || replica.run_id.as_deref() != Some(run_id)
+        {
+            return Err("stale or unexpected application health timeout".into());
+        }
+        let probe = replica
+            .probe
+            .as_mut()
+            .ok_or_else(|| "replica does not require application health signals".to_string())?;
+        probe.phase = ProbePhase::Unhealthy;
+        probe.ready_at_ms = None;
+        probe.consecutive_failures = probe
+            .consecutive_failures
+            .checked_add(1)
+            .ok_or_else(|| "application health failure counter overflow".to_string())?;
+        if probe.consecutive_failures > MAX_PROBE_FAILURE_THRESHOLD {
+            return Err("application health failure counter exceeded its limit".into());
+        }
+        let failures = probe.consecutive_failures;
+        self.observed_at_ms = now_ms;
+        self.refresh()?;
+        Ok(failures)
+    }
+
+    #[must_use]
+    pub fn probe_ready(&self, id: &ReplicaId) -> bool {
+        self.replicas
+            .iter()
+            .find(|replica| replica.id == *id)
+            .is_some_and(|replica| {
+                replica
+                    .probe
+                    .as_ref()
+                    .is_none_or(|probe| probe.phase == ProbePhase::Ready)
+            })
     }
 
     pub fn mark_exit(
@@ -334,6 +483,9 @@ fn validate_replica(replica: &ReplicaRuntime) -> Result<(), String> {
     {
         return Err("runtime replica is invalid".into());
     }
+    if let Some(probe) = &replica.probe {
+        validate_probe_runtime(probe, replica.phase)?;
+    }
     let active = matches!(
         replica.phase,
         ReplicaPhase::Starting | ReplicaPhase::Running
@@ -409,6 +561,34 @@ fn validate_replica(replica: &ReplicaRuntime) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_probe_runtime(
+    probe: &ReplicaProbeRuntime,
+    replica_phase: ReplicaPhase,
+) -> Result<(), String> {
+    let pristine = probe.last_sequence == 0
+        && probe.last_signal_at_ms.is_none()
+        && probe.ready_at_ms.is_none()
+        && probe.consecutive_failures == 0
+        && probe.phase == ProbePhase::Waiting;
+    let observed = probe.last_sequence > 0 && probe.last_signal_at_ms.is_some();
+    if (!pristine && !observed)
+        || probe.consecutive_failures > MAX_PROBE_FAILURE_THRESHOLD
+        || (probe.phase == ProbePhase::Ready && probe.consecutive_failures != 0)
+        || (probe.phase == ProbePhase::Ready && probe.ready_at_ms.is_none())
+        || (probe.phase != ProbePhase::Ready && probe.ready_at_ms.is_some())
+        || (probe.phase == ProbePhase::Unhealthy && probe.consecutive_failures == 0)
+        || probe
+            .ready_at_ms
+            .zip(probe.last_signal_at_ms)
+            .is_some_and(|(ready, signal)| ready > signal)
+        || (replica_phase == ReplicaPhase::Running && probe.phase == ProbePhase::Waiting)
+        || (replica_phase == ReplicaPhase::Starting && probe.phase == ProbePhase::Ready)
+    {
+        return Err("runtime application health state is invalid".into());
+    }
+    Ok(())
+}
+
 fn finish_replica(
     replica: &mut ReplicaRuntime,
     success: bool,
@@ -463,7 +643,9 @@ mod tests {
     use cartridge_core::{CompositionLock, LockedPackage, ResolutionPlan, RuntimeLimits};
 
     use super::*;
-    use crate::{PlannedInstance, PlannedSecurity, SandboxPolicy, SecurityProfile};
+    use crate::{
+        HealthProbeSpec, PlannedInstance, PlannedSecurity, SandboxPolicy, SecurityProfile,
+    };
 
     fn plan(policy: RestartPolicy, max_restarts: u16) -> StackPlan {
         let mut value = StackPlan {
@@ -491,6 +673,7 @@ mod tests {
                 args: Vec::new(),
                 secrets: BTreeSet::new(),
                 limits: RuntimeLimits::default(),
+                health: None,
                 composition: CompositionLock::new(
                     LockedPackage {
                         cartridge_id: "dev.test.app".into(),
@@ -602,5 +785,94 @@ mod tests {
         assert_eq!(status.replicas, replicas);
         assert_ne!(status.status_sha256, digest);
         assert!(status.heartbeat(19).is_err());
+    }
+
+    #[test]
+    fn legacy_runtime_status_remains_readable_without_probe_state() {
+        let plan = plan(RestartPolicy::OnFailure, 1);
+        let mut status = StackRuntimeStatus::from_plan(&plan, 1, &"4".repeat(64), 10).unwrap();
+        status.format_version = LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION;
+        status.status_sha256 = status.computed_sha256().unwrap();
+        let bytes = serde_json::to_vec(&status).unwrap();
+
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"probe\""));
+        let decoded: StackRuntimeStatus = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+
+        let mut probed = plan;
+        probed.instances[0].health = Some(HealthProbeSpec::default());
+        probed.plan_sha256 = probed.computed_sha256().unwrap();
+        let mut status = StackRuntimeStatus::from_plan(&probed, 1, &"5".repeat(64), 10).unwrap();
+        status.format_version = LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION;
+        status.status_sha256 = status.computed_sha256().unwrap();
+        assert!(status.validate().is_err());
+    }
+
+    #[test]
+    fn application_signals_gate_readiness_and_reject_replay() {
+        let mut plan = plan(RestartPolicy::OnFailure, 1);
+        plan.instances[0].health = Some(HealthProbeSpec::default());
+        plan.plan_sha256 = plan.computed_sha256().unwrap();
+        let mut status = StackRuntimeStatus::from_plan(&plan, 1, &"5".repeat(64), 1).unwrap();
+        let id = status.eligible_starts(1).pop().unwrap();
+        let run_id = "6".repeat(64);
+
+        status.begin_start(&id, &run_id, 2).unwrap();
+        assert!(status.mark_running(&id, &run_id, 3).is_err());
+        status
+            .mark_probe_signal(&id, &run_id, 1, ProbeSignalKind::Started, 3)
+            .unwrap();
+        assert_eq!(status.replicas[0].phase, ReplicaPhase::Starting);
+        status
+            .mark_probe_signal(&id, &run_id, 2, ProbeSignalKind::Ready, 4)
+            .unwrap();
+        assert_eq!(status.replicas[0].phase, ReplicaPhase::Running);
+        assert!(status.probe_ready(&id));
+        assert!(
+            status
+                .mark_probe_signal(&id, &run_id, 2, ProbeSignalKind::Ready, 5)
+                .is_err()
+        );
+        status
+            .mark_probe_signal(&id, &run_id, 3, ProbeSignalKind::Unhealthy, 5)
+            .unwrap();
+        assert!(!status.probe_ready(&id));
+        assert_eq!(
+            status.replicas[0]
+                .probe
+                .as_ref()
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+    }
+
+    #[test]
+    fn liveness_timeouts_are_bounded_and_health_can_recover() {
+        let mut plan = plan(RestartPolicy::OnFailure, 1);
+        plan.instances[0].health = Some(HealthProbeSpec::default());
+        plan.plan_sha256 = plan.computed_sha256().unwrap();
+        let mut status = StackRuntimeStatus::from_plan(&plan, 1, &"7".repeat(64), 1).unwrap();
+        let id = status.eligible_starts(1).pop().unwrap();
+        let run_id = "8".repeat(64);
+
+        status.begin_start(&id, &run_id, 2).unwrap();
+        status
+            .mark_probe_signal(&id, &run_id, 1, ProbeSignalKind::Ready, 3)
+            .unwrap();
+        assert_eq!(status.mark_probe_timeout(&id, &run_id, 4).unwrap(), 1);
+        assert_eq!(status.mark_probe_timeout(&id, &run_id, 5).unwrap(), 2);
+        status
+            .mark_probe_signal(&id, &run_id, 2, ProbeSignalKind::Ready, 6)
+            .unwrap();
+        assert_eq!(
+            status.replicas[0]
+                .probe
+                .as_ref()
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+        assert!(status.probe_ready(&id));
     }
 }

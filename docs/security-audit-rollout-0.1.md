@@ -6,7 +6,7 @@ Scope: candidate preparation, installed-package verification, desired-state acti
 
 ## Result
 
-No known exploitable issue remains in the implemented whole-generation rollout transaction after this review. This result covers crash-consistent process-health-gated replacement and rollback. It does not certify zero-downtime scheduling or application correctness.
+No known exploitable issue remains in the implemented whole-generation rollout transaction after this review. This document originally covered crash-consistent process-health-gated replacement and rollback. Guest-signalled application readiness and liveness were integrated and reviewed later; zero-downtime scheduling and adversarial application correctness remain outside scope.
 
 ## Findings fixed during implementation
 
@@ -17,7 +17,7 @@ No known exploitable issue remains in the implemented whole-generation rollout t
 | ROLL-03 | high | rollback could reactivate package identities that had changed or disappeared after preparation | the daemon reopens the library and re-verifies every exact package in the retained previous plan before appending rollback |
 | ROLL-04 | medium | unbounded checkpoint history could turn repeated authenticated updates into disk and directory-scan exhaustion | one current document is bounded to two maximum plans plus fixed metadata; terminal history is capped at 256 canonical regular files and 256 MiB per stack, and new updates stop before either limit |
 | ROLL-05 | medium | a stale or cross-stack rollout identifier could otherwise control a newer transaction | every request carries a digest identifier recomputed from stack, time, previous generation, and candidate plan; it must equal the current checkpoint before mutation |
-| ROLL-06 | high | a candidate could briefly reach `running`, commit, and then crash immediately afterward | commit requires generation-fenced ready health; every running replica must also survive a server-enforced two-second stability window, while successfully completed jobs may commit immediately; the final health checksum is bound into the checkpoint |
+| ROLL-06 | high | a candidate could briefly reach `running`, commit, and then crash immediately afterward | commit requires generation-fenced ready health; every running replica must also survive a server-enforced two-second stability window measured from application readiness when configured, while successfully completed ready jobs may commit immediately; the final health checksum is bound into the checkpoint |
 | ROLL-07 | medium | losing the prepare or rollback response could strand a successful mutation as an apparent client failure | automatic update queries the authenticated current checkpoint after either ambiguous response and resumes only when stack, candidate or rollout identity, and the expected phase all match |
 | ROLL-08 | medium | returning the full checkpoint duplicated both plans into control responses, creating frame-size pressure and disclosing unnecessary arguments and policy detail | daemon responses now use a compact independently checksummed status that carries only identities, phases, generations, and health evidence; complete plans remain private in the engine checkpoint |
 
@@ -43,7 +43,7 @@ No known exploitable issue remains in the implemented whole-generation rollout t
 ## Remaining gates
 
 - The current scheduler replaces one complete generation. It does not preserve old and new workers concurrently, enforce `max_surge` or `max_unavailable`, or route canary traffic.
-- Commit uses process readiness. Manifest-defined startup, readiness, and liveness probes are still required before claiming application-health-gated rollout.
+- Commit now uses guest-signalled application readiness when configured and measures stability from the ready transition. Independent command/HTTP probes remain required before claiming adversarial application correctness.
 - Rollback restores desired state and exact package identity, but state-schema compatibility still depends on explicit migration planning and receipts.
 - Per-stack checkpoint history is bounded, but a lower engine-wide disk quota and authenticated pruning policy are still required for large multi-stack installations.
 - Native authority sandboxes and kernel CPU, RSS, I/O, and disk enforcement remain independent release gates.

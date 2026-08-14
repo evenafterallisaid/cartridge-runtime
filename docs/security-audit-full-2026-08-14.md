@@ -6,7 +6,7 @@ Scope: every production Rust crate, the CLI and local daemon, the Tauri command 
 
 ## Result
 
-No known critical or high-severity vulnerability remains in the implemented and reviewed boundaries after this round. The review fixed operator-budget propagation and verification defects, added Windows creation-time exploit mitigations, repaired a CI audit step that did not scan the lockfile it claimed to scan, and moved desktop lifecycle control behind the authenticated daemon boundary.
+No known critical or high-severity vulnerability remains in the implemented and reviewed boundaries after this round. The review fixed operator-budget propagation and verification defects, added Windows creation-time exploit mitigations, repaired a CI audit step that did not scan the lockfile it claimed to scan, moved desktop lifecycle control behind the authenticated daemon boundary, and added bounded encrypted application-health reporting with upgrade-compatible plan and runtime readers.
 
 This result does not make Cartridge safe for arbitrary hostile third-party code. Portable capability and resource controls are substantially implemented, but native OS authority sandboxes, kernel resource controllers, peer-authenticated local IPC transports, and an independently reviewed release boundary remain open gates.
 
@@ -14,7 +14,7 @@ This result does not make Cartridge safe for arbitrary hostile third-party code.
 
 | ID | Severity | Finding | Resolution |
 | --- | --- | --- | --- |
-| FULL-01 | high | stack operators could remove capabilities but could not independently lower package CPU, memory, deadline, storage, graphics, or audio budgets | per-instance ceilings now resolve to exact effective values in plan format 2 and are re-applied at the runtime boundary |
+| FULL-01 | high | stack operators could remove capabilities but could not independently lower package CPU, memory, deadline, storage, graphics, or audio budgets | per-instance ceilings now resolve to exact effective values in the current plan format (format 3 after application-health policy was added) and are re-applied at the runtime boundary |
 | FULL-02 | high | snapshot construction could receive package storage quotas before the operator ceiling was applied | snapshot branches now receive the effective byte, key, and value limits before any state operation |
 | FULL-03 | medium | a holder of the daemon capability could recompute a valid plan digest after raising resource values; launch failed later, but the altered desired state could be journaled | apply and supervisor paths both reopen the exact installed package and reject any planned value that is not a ceiling before mutation or launch |
 | FULL-04 | medium | Windows process-tree ownership did not apply a creation-time exploit-mitigation baseline | compatible DEP, SEHOP, ASLR, heap, handle, extension-point, font, and image-loading policies are now part of atomic child creation |
@@ -22,7 +22,7 @@ This result does not make Cartridge safe for arbitrary hostile third-party code.
 | FULL-06 | medium | CI's second `rustsec/audit-check` invocation used an unsupported `working-directory` input, so it rescanned the root lockfile instead of the Tauri lockfile | CI installs a pinned `cargo-audit`, explicitly scans both lockfiles, audits npm dependencies, and no longer grants the obsolete `checks: write` permission |
 | FULL-07 | high | desktop apply, stop, and remove commands wrote the engine store directly, bypassing daemon serialization, shutdown fencing, and supervisor ownership | both CLI and desktop now use one bounded encrypted authenticated daemon client; desktop mutations have no offline direct-store fallback and the webview never receives control keys |
 
-Detailed resource-governance evidence is in [security-audit-resource-governance-0.1.md](security-audit-resource-governance-0.1.md). The later engine-health and transactional-update additions have focused reviews in [security-audit-engine-health-0.1.md](security-audit-engine-health-0.1.md) and [security-audit-rollout-0.1.md](security-audit-rollout-0.1.md).
+Detailed resource-governance evidence is in [security-audit-resource-governance-0.1.md](security-audit-resource-governance-0.1.md). The later engine-health, transactional-update, and application-probe additions have focused reviews in [security-audit-engine-health-0.1.md](security-audit-engine-health-0.1.md), [security-audit-rollout-0.1.md](security-audit-rollout-0.1.md), and [security-audit-probes-0.1.md](security-audit-probes-0.1.md).
 
 ## Historical exploit regression status
 
@@ -38,7 +38,7 @@ The workspace test suite contains direct regressions for each boundary.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 228 tests passed
+- `cargo test --workspace`: 238 tests passed
 - Tauri `cargo test`: 4 tests passed
 - Tauri `cargo clippy --all-targets -- -D warnings`
 - production frontend TypeScript and Vite build from a clean `npm ci`
@@ -69,15 +69,15 @@ These enter only through Tauri/Wry's Linux GTK3 backend. No supported Tauri upda
 
 ### Untrusted formats
 
-Archive, manifest, stack, plan, engine event, daemon frame, trace, snapshot, capsule, migration receipt, registry, release, media, collaboration, and settings inputs have explicit byte/count/work limits. Security-sensitive structures deny unknown fields, paths are normalized, archive and artifact identities are digest-bound, and durable replacement uses create-new or private atomic staging.
+Archive, manifest, stack, plan, engine event, daemon frame, application-probe envelope, trace, snapshot, capsule, migration receipt, registry, release, media, collaboration, and settings inputs have explicit byte/count/work limits. Security-sensitive structures deny unknown fields, paths are normalized, archive and artifact identities are digest-bound, and durable replacement uses create-new or private atomic staging.
 
 ### Guest execution
 
-Guests receive the WASI 0.2 Component Model surface selected by Cartridge, not ambient directories, sockets, environment, terminal, subprocess, or native device handles. Permissions are intersected with host and stack policy. Fuel, epochs, memory, tables, host resources, mediated I/O work, storage, trace, graphics, audio, and process wall time are bounded.
+Guests receive the WASI 0.2 Component Model surface selected by Cartridge, not ambient directories, sockets, environment, terminal, subprocess, or native device handles. Permissions are intersected with host and stack policy. Fuel, epochs, memory, tables, host resources, mediated I/O work, storage, trace, graphics, audio, health reports, and process wall time are bounded.
 
 ### Desired state and local control
 
-Plans bind exact package identities, permissions, limits, replicas, and composition edges. Apply revalidates installed bytes before journal mutation. Transactional updates retain the exact previous generation, re-verify both activation and rollback packages, fence conflicting mutations, require stable process health, and recover journal/checkpoint crash windows. Journals, rollout checkpoints, compact rollout status, observed status, and daemon frames are integrity checked and bounded. Local control frames are confidential, authenticated, freshness checked, replay rejected, and tied to one daemon generation.
+Plans bind exact package identities, permissions, limits, replicas, optional health policy, and composition edges. Apply revalidates installed bytes before journal mutation. Transactional updates retain the exact previous generation, re-verify both activation and rollback packages, fence conflicting mutations, require stable application readiness when configured, and recover journal/checkpoint crash windows. Journals, rollout checkpoints, compact rollout status, observed status, probe envelopes, and daemon frames are integrity checked and bounded. Local control frames are confidential, authenticated, freshness checked, replay rejected, and tied to one daemon generation.
 
 ### Processes and desktop
 
@@ -89,7 +89,7 @@ Daemon, supervisor, and guest descendants are owned as a tree and carry private 
 - No cgroup, Job Object memory/CPU-rate, macOS resource-policy, disk-I/O, handle-count, or engine-wide disk quota layer yet.
 - An unknown Wasmtime, compiler, webview, native adapter, or operating-system vulnerability can cross the portable boundary.
 - The daemon still uses authenticated loopback TCP rather than named pipes/Unix sockets with kernel peer credentials and ACLs.
-- Rollouts replace a whole generation and rely on process stability; application probes, canary routing, and surge/unavailable rolling windows remain open scheduler gates.
+- Rollouts replace a whole generation. Opt-in guest-signalled application readiness/liveness now gates health and commit stability; independent command/HTTP probes, canary routing, and surge/unavailable rolling windows remain open scheduler gates.
 - Same-user processes with direct filesystem authority remain partly outside the threat boundary.
 - State and traces are integrity protected where documented but are not generally encrypted at rest.
 - Live HTTP, device, GPU, and service-composition adapters require separate adapter-specific sandbox and confused-deputy reviews.

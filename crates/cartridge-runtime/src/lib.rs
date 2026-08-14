@@ -41,6 +41,20 @@ const MAX_GUEST_ERROR_BYTES: usize = 16 * 1024;
 
 pub const MAX_MIGRATION_STEPS_PER_RUN: usize = 64;
 pub const MAX_MIGRATION_TOTAL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+pub const MAX_HEALTH_DETAIL_BYTES: usize = 512;
+pub const MAX_HEALTH_REPORTS_PER_RUN: u32 = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestHealthState {
+    Started,
+    Ready,
+    Heartbeat,
+    Unhealthy,
+}
+
+pub trait HealthReporter: std::fmt::Debug + Send + Sync {
+    fn report(&self, state: GuestHealthState, detail: &str) -> Result<(), String>;
+}
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -56,6 +70,7 @@ pub struct Runtime {
     http_transport: Option<Arc<dyn HttpTransport>>,
     permission_ceiling: Option<Permissions>,
     limit_ceiling: Option<RuntimeLimits>,
+    health_reporter: Option<Arc<dyn HealthReporter>>,
 }
 
 impl Runtime {
@@ -93,6 +108,7 @@ impl Runtime {
             http_transport: None,
             permission_ceiling: None,
             limit_ceiling: None,
+            health_reporter: None,
         })
     }
 
@@ -131,6 +147,12 @@ impl Runtime {
         limits.validate().map_err(|error| anyhow!(error))?;
         self.limit_ceiling = Some(limits);
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_health_reporter(mut self, reporter: Arc<dyn HealthReporter>) -> Self {
+        self.health_reporter = Some(reporter);
+        self
     }
 
     pub fn run_file(&self, path: impl AsRef<Path>, args: &[String]) -> Result<RunReport> {
@@ -207,6 +229,7 @@ impl Runtime {
             http_transport: self.http_transport.clone(),
             permission_ceiling: self.permission_ceiling.clone(),
             limit_ceiling: self.limit_ceiling.clone(),
+            health_reporter: self.health_reporter.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -244,6 +267,7 @@ impl Runtime {
             self.storage.clone(),
             expected_events,
         )
+        .with_health_reporter(self.health_reporter.clone())
         .with_http_transport(self.http_transport.clone())
         .with_media_input(&self.input_events, &self.midi_events)
         .map_err(|error| anyhow!(error))?;

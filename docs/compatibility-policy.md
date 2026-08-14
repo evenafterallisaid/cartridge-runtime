@@ -1,6 +1,6 @@
 # Compatibility policy
 
-The 1.0 candidate freezes the package container at format `1` and the guest API at `cartridge:api@0.4.0`. Versions before that freeze are development formats and do not create a permanent support obligation.
+The repository is still pre-1.0. Package container format `1` and the `cartridge:api@0.4.0` guest API are development formats until the 1.0 freeze; changes before that freeze must still preserve the checked-in compatibility corpus or ship an explicit migration. The additive health-report host function keeps components importing the earlier 0.4 interface subset runnable, while older runtimes are not expected to run newly built health-reporting components.
 
 From the first stable release:
 

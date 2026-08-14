@@ -45,6 +45,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - exact-byte package/release signatures and immutable version publishing
 - create-new outputs, staged commits, finite locks, compare-exchange revisions, backups, and quarantine
 - helper process-tree deadline, minimal environment, parent-death liveness, bounded termination, and a creation-time Windows exploit-mitigation baseline
+- opt-in guest health reports sealed with a random per-run key, bound to the exact run id, strictly sequenced, size capped, receipt-time scheduled, and lease-cleaned before another supervisor starts
 - no production `unsafe` code in the workspace
 
 ## Residual risks and non-goals
@@ -54,6 +55,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - Job Objects and process groups own complete child trees, while private parent-liveness pipes cover hard daemon and supervisor failure. Kernel-uninterruptible processes can still outlive the two-second reap window, and process containment does not reduce the worker's operating-system authority.
 - Portable operator budgets constrain guest-visible and host-mediated work, but they are not kernel CPU-share, resident-memory, file-I/O, or process-count quotas. A native-host escape still has the worker's user-level resource authority until the platform resource layer exists.
 - The daemon protocol is confidential and authenticated, but it does not yet use Unix peer credentials or Windows named-pipe ACLs. A local process without the endpoint capability cannot issue a valid command, though it can still consume the small bounded unauthenticated connection pool until its short authentication deadline.
+- A guest is authoritative about its own semantic readiness and can lie; probes prevent accidental or failed applications from being promoted, not a malicious workload from claiming health. Another process already running as the same user may deny service to the ephemeral probe path, but cannot forge an accepted signal without the per-run key. Native per-worker authority isolation remains the stronger boundary.
 - Rollout checkpoints are mutable recovery state, not the source of desired-state truth. Activation and rollback must be adjacent immutable journal events, active transactions fence other mutations, and any checkpoint/journal divergence outside the two recognized crash windows fails closed.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.

@@ -11,4 +11,4 @@ clock = false
 [runtime]
 fuel = 10000000
 memory_bytes = 67108864
-timeout_ms = 200
+timeout_ms = 2000

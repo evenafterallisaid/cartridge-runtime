@@ -1,5 +1,6 @@
 mod daemon;
 mod health;
+mod probe;
 mod rollout;
 mod supervisor;
 
@@ -13,13 +14,19 @@ pub use health::{
     ENGINE_HEALTH_FORMAT_VERSION, MAX_ENGINE_HEALTH_REPORTS, SUPERVISOR_STALE_AFTER_MS,
     StackHealthReport, StackHealthState, validate_health_reports,
 };
+pub use probe::{
+    ENGINE_PROBE_FORMAT_VERSION, MAX_PROBE_ENVELOPE_BYTES, MAX_PROBE_FAILURE_THRESHOLD,
+    MAX_PROBE_TIMEOUT_MS, MIN_PROBE_TIMEOUT_MS, ProbeChannelKey, ProbeEnvelope, ProbeSignal,
+    ProbeSignalKind,
+};
 pub use rollout::{
     ENGINE_ROLLOUT_FORMAT_VERSION, MAX_ROLLOUT_BYTES, MAX_ROLLOUT_HISTORY,
     MAX_ROLLOUT_HISTORY_BYTES, ROLLOUT_STABILITY_WINDOW_MS, RolloutPhase, RolloutRecord,
     RolloutStatus,
 };
 pub use supervisor::{
-    ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
+    LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION, ProbePhase, ReplicaId, ReplicaPhase,
+    ReplicaProbeRuntime, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
 };
 
 use std::{
@@ -42,7 +49,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const STACK_FORMAT_VERSION: u32 = 1;
-pub const STACK_PLAN_FORMAT_VERSION: u32 = 2;
+pub const STACK_PLAN_FORMAT_VERSION: u32 = 3;
+pub const LEGACY_STACK_PLAN_FORMAT_VERSION: u32 = 2;
 pub const ENGINE_EVENT_FORMAT_VERSION: u32 = 1;
 pub const MAX_STACK_BYTES: u64 = 1024 * 1024;
 pub const MAX_STACK_INSTANCES: usize = 64;
@@ -59,6 +67,7 @@ pub const MAX_ENGINE_STACKS: usize = 1024;
 pub const MAX_ENGINE_EVENT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_ENGINE_EVENT_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RUNTIME_STATUS_BYTES: u64 = 1024 * 1024;
+pub const MAX_STALE_PROBE_FILES: usize = 4096;
 
 const ENGINE_LOCK_ATTEMPTS: usize = 200;
 const ENGINE_LOCK_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
@@ -138,6 +147,48 @@ pub struct InstanceSpec {
     pub secrets: BTreeSet<String>,
     #[serde(default)]
     pub limits: InstanceLimits,
+    #[serde(default)]
+    pub health: Option<HealthProbeSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HealthProbeSpec {
+    pub startup_timeout_ms: u64,
+    pub readiness_timeout_ms: u64,
+    pub liveness_timeout_ms: u64,
+    pub failure_threshold: u16,
+}
+
+impl Default for HealthProbeSpec {
+    fn default() -> Self {
+        Self {
+            startup_timeout_ms: 10_000,
+            readiness_timeout_ms: 30_000,
+            liveness_timeout_ms: 15_000,
+            failure_threshold: 3,
+        }
+    }
+}
+
+impl HealthProbeSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        let timeouts = [
+            self.startup_timeout_ms,
+            self.readiness_timeout_ms,
+            self.liveness_timeout_ms,
+        ];
+        if timeouts
+            .into_iter()
+            .any(|value| !(MIN_PROBE_TIMEOUT_MS..=MAX_PROBE_TIMEOUT_MS).contains(&value))
+            || self.readiness_timeout_ms < self.startup_timeout_ms
+            || self.failure_threshold == 0
+            || self.failure_threshold > MAX_PROBE_FAILURE_THRESHOLD
+        {
+            return Err("application health probe policy is invalid".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +343,8 @@ pub struct PlannedInstance {
     pub args: Vec<String>,
     pub secrets: BTreeSet<String>,
     pub limits: RuntimeLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthProbeSpec>,
     pub composition: CompositionLock,
 }
 
@@ -528,7 +581,14 @@ impl StackPlan {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.format_version != STACK_PLAN_FORMAT_VERSION
+        if !matches!(
+            self.format_version,
+            LEGACY_STACK_PLAN_FORMAT_VERSION | STACK_PLAN_FORMAT_VERSION
+        ) || (self.format_version == LEGACY_STACK_PLAN_FORMAT_VERSION
+            && self
+                .instances
+                .iter()
+                .any(|instance| instance.health.is_some()))
             || !valid_name(&self.stack)
             || self.instances.is_empty()
             || self.instances.len() > MAX_STACK_INSTANCES
@@ -956,6 +1016,66 @@ impl EngineStore {
         Ok(package_state)
     }
 
+    pub fn replica_probe_path(
+        &self,
+        stack: &str,
+        generation: &str,
+        id: &ReplicaId,
+        run_id: &str,
+    ) -> Result<PathBuf, String> {
+        let Some((_revision, current_generation, plan)) = self.desired_plan(stack)? else {
+            return Err("removed stack has no application health channel".into());
+        };
+        let probe_is_planned = plan.instances.iter().any(|instance| {
+            instance.name == id.instance
+                && id.ordinal > 0
+                && id.ordinal <= instance.replicas
+                && instance.desired == DesiredState::Running
+                && instance.health.is_some()
+        });
+        if current_generation != generation
+            || !valid_name(&id.instance)
+            || !is_digest(run_id)
+            || !probe_is_planned
+        {
+            return Err("application health channel does not match the desired generation".into());
+        }
+        let stack_root = self.root.join("stacks").join(stack);
+        ensure_directory(&stack_root)?;
+        let probes = stack_root.join("probes");
+        ensure_directory(&probes)?;
+        let instance = probes.join(&id.instance);
+        ensure_directory(&instance)?;
+        let replica = instance.join(format!("{:04}", id.ordinal));
+        ensure_directory(&replica)?;
+        Ok(replica.join(format!("{run_id}.probe")))
+    }
+
+    pub fn clear_probe_channels(&self, stack: &str) -> Result<usize, String> {
+        if !valid_name(stack) || self.desired_plan(stack)?.is_none() {
+            return Err("stack has no active application health channels".into());
+        }
+        let probes = self.root.join("stacks").join(stack).join("probes");
+        if !probes.exists() {
+            return Ok(0);
+        }
+        let metadata = fs::symlink_metadata(&probes).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("application health channel root is unsafe".into());
+        }
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        collect_probe_entries(&probes, 0, &mut files, &mut directories)?;
+        for path in &files {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        for path in &directories {
+            fs::remove_dir(path).map_err(|error| error.to_string())?;
+        }
+        fs::remove_dir(probes).map_err(|error| error.to_string())?;
+        Ok(files.len())
+    }
+
     pub fn events(&self, stack: &str) -> Result<Vec<EngineEvent>, String> {
         if !valid_name(stack) {
             return Err("stack name is invalid".into());
@@ -1090,6 +1210,9 @@ fn validate_planned_instance(
         .limits
         .validate()
         .map_err(|error| error.to_string())?;
+    if let Some(health) = &instance.health {
+        health.validate()?;
+    }
     let argument_bytes = instance
         .args
         .iter()
@@ -1203,6 +1326,9 @@ fn validate_planned_secrets(secrets: &[PlannedSecret]) -> Result<(), String> {
 
 fn validate_instance(value: &InstanceSpec) -> Result<(), String> {
     value.limits.ceiling()?;
+    if let Some(health) = &value.health {
+        health.validate()?;
+    }
     let argument_bytes = value
         .args
         .iter()
@@ -1286,6 +1412,7 @@ fn plan_instance(
         args: spec.args.clone(),
         secrets: spec.secrets.clone(),
         limits,
+        health: spec.health.clone(),
         composition,
     })
 }
@@ -1559,6 +1686,69 @@ fn read_runtime_status(path: &Path) -> Result<StackRuntimeStatus, String> {
     Ok(status)
 }
 
+fn collect_probe_entries(
+    directory: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+    directories: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "application health channel name is not UTF-8".to_string())?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("application health channel contains a symlink".into());
+        }
+        if metadata.is_dir() {
+            let valid_directory = match depth {
+                0 => valid_name(&name),
+                1 => {
+                    name.len() == 4
+                        && name.bytes().all(|byte| byte.is_ascii_digit())
+                        && name != "0000"
+                }
+                _ => false,
+            };
+            if !valid_directory {
+                return Err("application health channel directory is not canonical".into());
+            }
+            collect_probe_entries(&path, depth + 1, files, directories)?;
+            directories.push(path);
+        } else if metadata.is_file()
+            && depth == 2
+            && metadata.len() <= MAX_PROBE_ENVELOPE_BYTES as u64
+            && valid_probe_file_name(&name)
+        {
+            files.push(path);
+            if files.len() > MAX_STALE_PROBE_FILES {
+                return Err("application health channel cleanup limit exceeded".into());
+            }
+        } else {
+            return Err("application health channel contains an unsafe entry".into());
+        }
+    }
+    Ok(())
+}
+
+fn valid_probe_file_name(name: &str) -> bool {
+    name.strip_suffix(".probe").is_some_and(is_digest)
+        || name
+            .strip_prefix(".probe-report-")
+            .and_then(|value| value.strip_suffix(".tmp"))
+            .is_some_and(|value| {
+                let mut parts = value.split('-');
+                parts.next().is_some_and(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                }) && parts.next().is_some_and(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                }) && parts.next().is_none()
+            })
+}
+
 fn recover_runtime_status(path: &Path) -> Result<(), String> {
     let backup = path.with_extension("json.previous");
     if backup.exists() && !is_regular_file(&backup) {
@@ -1778,6 +1968,7 @@ mod tests {
                 args: vec!["serve".into()],
                 secrets: BTreeSet::from(["api-key".into()]),
                 limits: InstanceLimits::default(),
+                health: None,
             }],
             resources: vec![ResourceSpec {
                 name: "app-state".into(),
@@ -1814,6 +2005,26 @@ mod tests {
             BTreeSet::from([StackCapability::Storage])
         );
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_plan_format_remains_readable_without_probe_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let mut plan = StackPlan::build(&manifest(SandboxPolicy::Required), &library).unwrap();
+        plan.format_version = LEGACY_STACK_PLAN_FORMAT_VERSION;
+        plan.plan_sha256 = plan.computed_sha256().unwrap();
+        let bytes = serde_json::to_vec(&plan).unwrap();
+
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"health\""));
+        let decoded: StackPlan = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+
+        plan.instances[0].health = Some(HealthProbeSpec::default());
+        plan.plan_sha256 = plan.computed_sha256().unwrap();
+        assert!(plan.validate().is_err());
     }
 
     #[test]
@@ -1998,6 +2209,42 @@ mod tests {
             .unwrap();
         let engine = EngineStore::open(engine_root).unwrap();
         assert!(engine.runtime_status("demo-stack").is_err());
+    }
+
+    #[test]
+    fn stale_probe_channels_are_lease_cleanup_bounded_and_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let mut stack = manifest(SandboxPolicy::Required);
+        stack.instances[0].health = Some(HealthProbeSpec::default());
+        let plan = StackPlan::build(&stack, &library).unwrap();
+        let engine_root = directory.path().join("engine");
+        let engine = EngineStore::open(&engine_root).unwrap();
+        engine.apply(&plan, false).unwrap();
+        let (_, generation, _) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        let id = ReplicaId {
+            instance: "app".into(),
+            ordinal: 1,
+        };
+        let path = engine
+            .replica_probe_path("demo-stack", &generation, &id, &"a".repeat(64))
+            .unwrap();
+        fs::write(&path, b"stale encrypted signal").unwrap();
+
+        assert_eq!(engine.clear_probe_channels("demo-stack").unwrap(), 1);
+        assert!(!engine_root.join("stacks/demo-stack/probes").exists());
+
+        let path = engine
+            .replica_probe_path("demo-stack", &generation, &id, &"b".repeat(64))
+            .unwrap();
+        fs::write(&path, b"stale encrypted signal").unwrap();
+        let unexpected = path.parent().unwrap().join("notes.txt");
+        fs::write(&unexpected, b"do not delete").unwrap();
+        assert!(engine.clear_probe_channels("demo-stack").is_err());
+        assert!(path.exists());
+        assert!(unexpected.exists());
     }
 
     #[test]

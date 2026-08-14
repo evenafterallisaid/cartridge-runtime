@@ -1,0 +1,26 @@
+format_version = 1
+name = "probe-liveness-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "silent"
+cartridge = "dev.cartridge.timeout-fixture"
+version = "^0.1"
+replicas = 1
+restart = "never"
+max_restarts = 0
+args = ["ready-then-silent"]
+
+[instances.health]
+startup_timeout_ms = 5000
+readiness_timeout_ms = 6000
+liveness_timeout_ms = 100
+failure_threshold = 2
+
+[instances.limits]
+fuel = 10000000
+memory_bytes = 67108864
+timeout_ms = 2000

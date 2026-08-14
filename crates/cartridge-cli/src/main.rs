@@ -27,10 +27,11 @@ use cartridge_dev::{
     source_fingerprint,
 };
 use cartridge_engine::{
-    DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, PlannedInstance,
-    ROLLOUT_STABILITY_WINDOW_MS, ReplicaId, ReplicaPhase, RolloutPhase, RolloutStatus,
-    SandboxPolicy, StackCapability, StackHealthReport, StackHealthState, StackManifest, StackPlan,
-    StackRuntimeStatus, daemon_request_with_timeout,
+    DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, HealthProbeSpec,
+    MAX_PROBE_ENVELOPE_BYTES, PlannedInstance, ProbeChannelKey, ProbeEnvelope, ProbeSignal,
+    ProbeSignalKind, ROLLOUT_STABILITY_WINDOW_MS, ReplicaId, ReplicaPhase, RolloutPhase,
+    RolloutStatus, SandboxPolicy, StackCapability, StackHealthReport, StackHealthState,
+    StackManifest, StackPlan, StackRuntimeStatus, daemon_request_with_timeout,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -40,9 +41,9 @@ use cartridge_network::HttpFixtures;
 use cartridge_release::{ReleaseArtifact, ReleasePayload, SignedRelease, Updater};
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
-    DirectoryStorage, InputEvent, MAX_MIGRATION_STEPS_PER_RUN, MAX_MIGRATION_TOTAL_TIMEOUT_MS,
-    MediaArtifacts, MidiEvent, Runtime, SnapshotDifference, SnapshotStorage, StorageLimits,
-    StorageSnapshot,
+    DirectoryStorage, GuestHealthState, HealthReporter, InputEvent, MAX_MIGRATION_STEPS_PER_RUN,
+    MAX_MIGRATION_TOTAL_TIMEOUT_MS, MediaArtifacts, MidiEvent, Runtime, SnapshotDifference,
+    SnapshotStorage, StorageLimits, StorageSnapshot,
 };
 use cartridge_trace::{
     ExecutionTrace, MAX_REDACTED_TRACE_DOCUMENT_BYTES, MAX_TRACE_DOCUMENT_BYTES, RedactionProfile,
@@ -69,6 +70,9 @@ const SUPERVISOR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const ENGINE_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLI_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 const WORKER_LIMIT_CEILING_ENV: &str = "CARTRIDGE_LIMIT_CEILING";
+const WORKER_PROBE_PATH_ENV: &str = "CARTRIDGE_PROBE_PATH";
+const WORKER_PROBE_KEY_ENV: &str = "CARTRIDGE_PROBE_KEY";
+const WORKER_PROBE_RUN_ENV: &str = "CARTRIDGE_PROBE_RUN";
 
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
@@ -87,6 +91,108 @@ struct RunCommandOptions<'a> {
     permission_ceiling: Option<&'a Permissions>,
     limit_ceiling: Option<&'a RuntimeLimits>,
     args: &'a [String],
+}
+
+#[derive(Debug)]
+struct FileHealthReporter {
+    path: PathBuf,
+    key: ProbeChannelKey,
+    run_id: String,
+    sequence: AtomicU64,
+}
+
+impl HealthReporter for FileHealthReporter {
+    fn report(&self, state: GuestHealthState, detail: &str) -> std::result::Result<(), String> {
+        let sequence = self
+            .sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or_else(|| "application health signal sequence overflow".to_string())?;
+        let kind = match state {
+            GuestHealthState::Started => ProbeSignalKind::Started,
+            GuestHealthState::Ready => ProbeSignalKind::Ready,
+            GuestHealthState::Heartbeat => ProbeSignalKind::Heartbeat,
+            GuestHealthState::Unhealthy => ProbeSignalKind::Unhealthy,
+        };
+        let signal = ProbeSignal::new(
+            &self.run_id,
+            sequence,
+            current_time_ms().map_err(|error| error.to_string())?,
+            kind,
+            detail,
+        )?;
+        let bytes = ProbeEnvelope::seal(&signal, &self.key)?;
+        write_probe_replace(&self.path, &bytes)
+    }
+}
+
+fn configure_health_reporter(runtime: Runtime) -> Result<Runtime> {
+    let path = std::env::var_os(WORKER_PROBE_PATH_ENV);
+    let key = std::env::var(WORKER_PROBE_KEY_ENV).ok();
+    let run_id = std::env::var(WORKER_PROBE_RUN_ENV).ok();
+    match (path, key, run_id) {
+        (None, None, None) => Ok(runtime),
+        (Some(path), Some(key), Some(run_id)) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() || !valid_daemon_instance(&run_id) {
+                bail!("worker application health channel is invalid");
+            }
+            Ok(runtime.with_health_reporter(Arc::new(FileHealthReporter {
+                path,
+                key: ProbeChannelKey::from_hex(&key).map_err(anyhow::Error::msg)?,
+                run_id,
+                sequence: AtomicU64::new(0),
+            })))
+        }
+        _ => bail!("worker application health channel is incomplete"),
+    }
+}
+
+fn write_probe_replace(path: &Path, bytes: &[u8]) -> std::result::Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_PROBE_ENVELOPE_BYTES {
+        return Err("application health envelope exceeds its byte limit".into());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| "application health path has no parent".to_string())?;
+    let directory_metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err("application health directory is unsafe".into());
+    }
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".probe-report-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let write = file.write_all(bytes);
+    drop(file);
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            let _ = fs::remove_file(&temporary);
+            return Err("application health path is unsafe".into());
+        }
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Parser)]
@@ -1940,7 +2046,7 @@ fn print_health_reports(reports: &[StackHealthReport], json: bool) -> Result<()>
     } else {
         for report in reports {
             println!(
-                "{} {:?} revision={} ready={}/{} waiting={} failed={} observed={}",
+                "{} {:?} revision={} ready={}/{} waiting={} failed={} probes={}/{}/{} observed={}",
                 report.stack,
                 report.state,
                 report.revision,
@@ -1948,6 +2054,9 @@ fn print_health_reports(reports: &[StackHealthReport], json: bool) -> Result<()>
                 report.desired_replicas,
                 report.pending + report.starting + report.backoff,
                 report.failed + report.exhausted,
+                report.probe_ready,
+                report.probe_waiting,
+                report.probe_unhealthy,
                 report
                     .runtime_observed_at_ms
                     .map_or_else(|| "none".into(), |value| value.to_string())
@@ -2584,12 +2693,27 @@ struct StackWorkerTemplate {
     limits: RuntimeLimits,
     harden: bool,
     timeout: Duration,
+    health: Option<HealthProbeSpec>,
 }
 
 struct ActiveStackWorker {
     child: ContainedChild,
     run_id: String,
     deadline: Instant,
+    probe: Option<ActiveProbe>,
+}
+
+#[derive(Debug)]
+struct ActiveProbe {
+    path: PathBuf,
+    key: ProbeChannelKey,
+    policy: HealthProbeSpec,
+    startup_deadline: Instant,
+    readiness_deadline: Instant,
+    next_liveness_check: Option<Instant>,
+    first_signal: bool,
+    ever_ready: bool,
+    envelope_sha256: Option<String>,
 }
 
 #[derive(Default)]
@@ -2599,8 +2723,19 @@ impl ActiveStackWorkers {
     fn terminate_all(&mut self) {
         for worker in self.0.values_mut() {
             let _ = worker.child.terminate(TERMINATION_GRACE);
+            cleanup_probe_file(worker);
         }
         self.0.clear();
+    }
+}
+
+fn cleanup_probe_file(worker: &ActiveStackWorker) {
+    if let Some(probe) = &worker.probe
+        && let Ok(metadata) = fs::symlink_metadata(&probe.path)
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&probe.path);
     }
 }
 
@@ -2638,6 +2773,9 @@ fn supervise_stack(
         .context("stack was removed and has no runnable generation")?;
     let _lease = engine
         .acquire_supervisor_lease(stack)
+        .map_err(anyhow::Error::msg)?;
+    engine
+        .clear_probe_channels(stack)
         .map_err(anyhow::Error::msg)?;
     let library = Library::open(library_root).map_err(anyhow::Error::msg)?;
     plan.verify_installed(&library)
@@ -2693,11 +2831,121 @@ fn supervise_stack(
         let now_ms = current_time_ms()?;
         let ids = active.0.keys().cloned().collect::<Vec<_>>();
         for id in ids {
+            let mut probe_failure = None;
+            let signal = {
+                let worker = active.0.get_mut(&id).context("active worker disappeared")?;
+                poll_worker_probe(worker)
+            };
+            match signal {
+                Ok(Some(signal)) => {
+                    let worker = active.0.get(&id).context("active worker disappeared")?;
+                    status
+                        .mark_probe_signal(
+                            &id,
+                            &worker.run_id,
+                            signal.sequence,
+                            signal.kind,
+                            now_ms,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    let probe = active
+                        .0
+                        .get_mut(&id)
+                        .and_then(|worker| worker.probe.as_mut())
+                        .context("application health channel disappeared")?;
+                    probe.first_signal = true;
+                    if signal.kind == ProbeSignalKind::Ready {
+                        probe.ever_ready = true;
+                    }
+                    if probe.ever_ready {
+                        probe.next_liveness_check = Some(
+                            Instant::now()
+                                + Duration::from_millis(probe.policy.liveness_timeout_ms),
+                        );
+                    }
+                    let failures = status
+                        .replicas
+                        .iter()
+                        .find(|replica| replica.id == id)
+                        .and_then(|replica| replica.probe.as_ref())
+                        .map_or(0, |probe| probe.consecutive_failures);
+                    if failures >= probe.policy.failure_threshold {
+                        probe_failure = Some("application reported unhealthy");
+                    }
+                    changed = true;
+                }
+                Ok(None) => {}
+                Err(_) => probe_failure = Some("application health signal failed authentication"),
+            }
+
+            if probe_failure.is_none() {
+                let now = Instant::now();
+                let probe_state = active
+                    .0
+                    .get(&id)
+                    .and_then(|worker| worker.probe.as_ref())
+                    .map(|probe| {
+                        (
+                            probe.first_signal,
+                            probe.ever_ready,
+                            probe.startup_deadline,
+                            probe.readiness_deadline,
+                            probe.next_liveness_check,
+                            probe.policy.failure_threshold,
+                            probe.policy.liveness_timeout_ms,
+                        )
+                    });
+                if let Some((
+                    first_signal,
+                    ever_ready,
+                    startup_deadline,
+                    readiness_deadline,
+                    next_liveness_check,
+                    failure_threshold,
+                    liveness_timeout_ms,
+                )) = probe_state
+                {
+                    if !first_signal && now >= startup_deadline {
+                        probe_failure = Some("application startup probe timed out");
+                    } else if !ever_ready && now >= readiness_deadline {
+                        probe_failure = Some("application readiness probe timed out");
+                    } else if next_liveness_check.is_some_and(|deadline| now >= deadline) {
+                        let run_id = active
+                            .0
+                            .get(&id)
+                            .context("active worker disappeared")?
+                            .run_id
+                            .clone();
+                        let failures = status
+                            .mark_probe_timeout(&id, &run_id, now_ms)
+                            .map_err(anyhow::Error::msg)?;
+                        let probe = active
+                            .0
+                            .get_mut(&id)
+                            .and_then(|worker| worker.probe.as_mut())
+                            .context("application health channel disappeared")?;
+                        probe.next_liveness_check =
+                            Some(now + Duration::from_millis(liveness_timeout_ms));
+                        changed = true;
+                        if failures >= failure_threshold {
+                            probe_failure = Some("application liveness probe timed out");
+                        }
+                    }
+                }
+            }
+
             let timed_out = active
                 .0
                 .get(&id)
                 .is_some_and(|worker| Instant::now() >= worker.deadline);
-            let outcome = if timed_out {
+            let outcome = if let Some(detail) = probe_failure {
+                let worker = active.0.get_mut(&id).context("active worker disappeared")?;
+                let exit = worker
+                    .child
+                    .terminate(TERMINATION_GRACE)
+                    .context("could not terminate unhealthy worker")?;
+                Some((false, exit.and_then(|status| status.code()), detail))
+            } else if timed_out {
                 let worker = active.0.get_mut(&id).context("active worker disappeared")?;
                 let exit = worker
                     .child
@@ -2709,16 +2957,63 @@ fn supervise_stack(
                     "worker exceeded its supervised deadline",
                 ))
             } else {
-                active
+                let exit = active
                     .0
                     .get_mut(&id)
                     .context("active worker disappeared")?
                     .child
-                    .try_wait()?
-                    .map(|exit| (exit.success(), exit.code(), "worker exited"))
+                    .try_wait()?;
+                if exit.is_some() && !status.probe_ready(&id) {
+                    let late_signal = {
+                        let worker = active.0.get_mut(&id).context("active worker disappeared")?;
+                        poll_worker_probe(worker)
+                    };
+                    if let Ok(Some(signal)) = late_signal {
+                        let observed_at_ms = current_time_ms()?;
+                        let run_id = active
+                            .0
+                            .get(&id)
+                            .context("active worker disappeared")?
+                            .run_id
+                            .clone();
+                        status
+                            .mark_probe_signal(
+                                &id,
+                                &run_id,
+                                signal.sequence,
+                                signal.kind,
+                                observed_at_ms,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                        if let Some(probe) = active
+                            .0
+                            .get_mut(&id)
+                            .and_then(|worker| worker.probe.as_mut())
+                        {
+                            probe.first_signal = true;
+                            if signal.kind == ProbeSignalKind::Ready {
+                                probe.ever_ready = true;
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+                exit.map(|exit| {
+                    let ready = status.probe_ready(&id);
+                    if exit.success() && !ready {
+                        (
+                            false,
+                            exit.code(),
+                            "worker exited before application readiness",
+                        )
+                    } else {
+                        (exit.success(), exit.code(), "worker exited")
+                    }
+                })
             };
             if let Some((success, code, detail)) = outcome {
                 let worker = active.0.remove(&id).context("active worker disappeared")?;
+                cleanup_probe_file(&worker);
                 status
                     .mark_exit(&id, &worker.run_id, success, code, detail, now_ms)
                     .map_err(anyhow::Error::msg)?;
@@ -2762,19 +3057,47 @@ fn supervise_stack(
             let template = templates
                 .get(&id)
                 .context("replica has no verified worker template")?;
-            match spawn_stack_worker(&executable, template) {
+            let probe = if let Some(policy) = &template.health {
+                let path = EngineStore::open(root)
+                    .map_err(anyhow::Error::msg)?
+                    .replica_probe_path(stack, &generation, &id, &run_id)
+                    .map_err(anyhow::Error::msg)?;
+                if path.exists() {
+                    bail!("application health channel already exists for a new worker run");
+                }
+                let started = Instant::now();
+                Some(ActiveProbe {
+                    path,
+                    key: ProbeChannelKey::generate(),
+                    policy: policy.clone(),
+                    startup_deadline: started + Duration::from_millis(policy.startup_timeout_ms),
+                    readiness_deadline: started
+                        + Duration::from_millis(policy.readiness_timeout_ms),
+                    next_liveness_check: None,
+                    first_signal: false,
+                    ever_ready: false,
+                    envelope_sha256: None,
+                })
+            } else {
+                None
+            };
+            match spawn_stack_worker(&executable, template, probe.as_ref(), &run_id) {
                 Ok(child) => {
+                    let has_probe = probe.is_some();
                     active.0.insert(
                         id.clone(),
                         ActiveStackWorker {
                             child,
                             run_id: run_id.clone(),
                             deadline: Instant::now() + WORKER_STARTUP_BUDGET + template.timeout,
+                            probe,
                         },
                     );
-                    status
-                        .mark_running(&id, &run_id, now_ms)
-                        .map_err(anyhow::Error::msg)?;
+                    if !has_probe {
+                        status
+                            .mark_running(&id, &run_id, now_ms)
+                            .map_err(anyhow::Error::msg)?;
+                    }
                 }
                 Err(_) => {
                     status
@@ -2829,6 +3152,7 @@ fn stop_active_workers(
                 .terminate(TERMINATION_GRACE)
                 .context("could not terminate interrupted worker")?
         };
+        cleanup_probe_file(&worker);
         status
             .mark_exit(
                 &id,
@@ -2841,6 +3165,44 @@ fn stop_active_workers(
             .map_err(anyhow::Error::msg)?;
     }
     persist_runtime_status(root, status)
+}
+
+fn poll_worker_probe(
+    worker: &mut ActiveStackWorker,
+) -> std::result::Result<Option<ProbeSignal>, String> {
+    let Some(probe) = &mut worker.probe else {
+        return Ok(None);
+    };
+    let metadata = match fs::symlink_metadata(&probe.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_PROBE_ENVELOPE_BYTES as u64
+    {
+        return Err("application health envelope is not a bounded regular file".into());
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| "application health envelope length overflow".to_string())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    fs::File::open(&probe.path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_PROBE_ENVELOPE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_PROBE_ENVELOPE_BYTES {
+        return Err("application health envelope exceeded its byte limit while reading".into());
+    }
+    let digest = hex::encode(Sha256::digest(&bytes));
+    if probe.envelope_sha256.as_deref() == Some(&digest) {
+        return Ok(None);
+    }
+    let signal = ProbeEnvelope::open(&bytes, &worker.run_id, &probe.key)?;
+    probe.envelope_sha256 = Some(digest);
+    Ok(Some(signal))
 }
 
 fn stack_worker_templates(
@@ -2881,6 +3243,7 @@ fn stack_worker_templates(
                     limits: instance.limits.clone(),
                     harden: plan.security.sandbox != SandboxPolicy::Disabled,
                     timeout: Duration::from_millis(instance.limits.timeout_ms),
+                    health: instance.health.clone(),
                 },
             );
         }
@@ -2901,7 +3264,12 @@ fn stack_permissions(instance: &PlannedInstance) -> Permissions {
     }
 }
 
-fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Result<ContainedChild> {
+fn spawn_stack_worker(
+    executable: &Path,
+    template: &StackWorkerTemplate,
+    probe: Option<&ActiveProbe>,
+    run_id: &str,
+) -> Result<ContainedChild> {
     let mut arguments = vec![
         OsString::from("__worker-run"),
         template.package.as_os_str().to_owned(),
@@ -2923,6 +3291,12 @@ fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Resu
         .harden(template.harden)
         .stdout(OutputMode::Inherit)
         .stderr(OutputMode::Inherit);
+    if let Some(probe) = probe {
+        command
+            .env(WORKER_PROBE_PATH_ENV, &probe.path)
+            .env(WORKER_PROBE_KEY_ENV, probe.key.expose_hex())
+            .env(WORKER_PROBE_RUN_ENV, run_id);
+    }
     spawn_contained(&mut command, true).context("could not start the cartridge worker")
 }
 
@@ -2980,7 +3354,7 @@ fn print_runtime_status(status: &StackRuntimeStatus) {
     );
     for replica in &status.replicas {
         println!(
-            "{}-{} {:?} attempt={}/{}{}",
+            "{}-{} {:?} attempt={}/{}{}{}",
             replica.id.instance,
             replica.id.ordinal,
             replica.phase,
@@ -2989,7 +3363,13 @@ fn print_runtime_status(status: &StackRuntimeStatus) {
             replica
                 .detail
                 .as_deref()
-                .map_or_else(String::new, |detail| format!(" {detail}"))
+                .map_or_else(String::new, |detail| format!(" {detail}")),
+            replica.probe.as_ref().map_or_else(String::new, |probe| {
+                format!(
+                    " probe={:?} failures={}",
+                    probe.phase, probe.consecutive_failures
+                )
+            })
         );
     }
 }
@@ -3029,6 +3409,15 @@ fn print_stack_plan(plan: &StackPlan) {
         );
         println!("    allowed: {}", stack_capability_list(&instance.allowed));
         println!("    denied: {}", stack_capability_list(&instance.denied));
+        if let Some(health) = &instance.health {
+            println!(
+                "    health: guest-signal startup={}ms readiness={}ms liveness={}ms failures={}",
+                health.startup_timeout_ms,
+                health.readiness_timeout_ms,
+                health.liveness_timeout_ms,
+                health.failure_threshold
+            );
+        }
     }
     for warning in &plan.warnings {
         println!("warning: {warning}");
@@ -4774,6 +5163,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         )?;
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
+        let runtime = configure_health_reporter(runtime)?;
         branch = Some(storage);
         runtime.run(archive, options.args)?
     } else {
@@ -4785,6 +5175,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         let runtime = configure_http(runtime, options.http_fixtures)?;
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
+        let runtime = configure_health_reporter(runtime)?;
         runtime.run_file(options.package, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
@@ -5661,6 +6052,34 @@ mod tests {
         assert!(parse_runtime_limits(r#"{"fuel":0}"#).is_err());
         assert!(parse_runtime_limits(r#"{"unknown":1}"#).is_err());
         assert!(parse_runtime_limits(&"x".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn worker_health_reporter_replaces_authenticated_bounded_signals() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.probe");
+        let run_id = "a".repeat(64);
+        let reporter = FileHealthReporter {
+            path: path.clone(),
+            key: ProbeChannelKey::generate(),
+            run_id: run_id.clone(),
+            sequence: AtomicU64::new(0),
+        };
+
+        reporter.report(GuestHealthState::Ready, "ready").unwrap();
+        let first = fs::read(&path).unwrap();
+        let signal = ProbeEnvelope::open(&first, &run_id, &reporter.key).unwrap();
+        assert_eq!(signal.sequence, 1);
+        assert_eq!(signal.kind, ProbeSignalKind::Ready);
+
+        reporter
+            .report(GuestHealthState::Heartbeat, "alive")
+            .unwrap();
+        let second = fs::read(&path).unwrap();
+        let signal = ProbeEnvelope::open(&second, &run_id, &reporter.key).unwrap();
+        assert_eq!(signal.sequence, 2);
+        assert_eq!(signal.kind, ProbeSignalKind::Heartbeat);
+        assert_ne!(first, second);
     }
 
     #[test]

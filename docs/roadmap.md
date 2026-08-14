@@ -1009,7 +1009,8 @@ The next concrete sequence is:
    - [implemented] named state/blob resources, retention intent, quotas, and declared secret slots
    - [implemented] strict/balanced/permissive capability policy with explicit grants and blocks
    - [implemented] add per-instance fuel, linear-memory, wall-time, storage, graphics, and audio ceilings
-   - add service edges, kernel budgets, health checks, jobs, ingress, and rollout policy
+   - [implemented for guest signals] add bounded startup, readiness, and liveness health policy
+   - add service edges, kernel budgets, HTTP/command probes, jobs, ingress, and rollout policy
    - add a semantic plan diff alongside the implemented canonical plan digest
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
@@ -1017,8 +1018,9 @@ The next concrete sequence is:
    - [implemented] rootless daemon ownership, encrypted local requests, bounded replay defense, per-boot liveness fencing, serialized mutations, graceful client/supervisor drain, and crash-resistant process-tree ownership
    - [implemented] checksum-bound supervisor heartbeats, authenticated bounded health aggregation, stale-generation detection, and deadline-bounded readiness waits
    - [implemented] explicit prepare/activate/commit/cancel/rollback phases, bounded archived checkpoints, journal-adjacent crash recovery, and direct-mutation fencing
-   - [implemented at process-health level] deadline-gated automatic update commit with exact previous-generation rollback
-   - add manifest-defined startup, readiness, and liveness probes with bounded schedules, timeouts, output, consecutive-success/failure thresholds, and explicit probe capabilities
+   - [implemented with application readiness] deadline-gated automatic update commit with exact previous-generation rollback
+   - [implemented: guest-signal slice] manifest-defined startup, readiness, and liveness deadlines, bounded encrypted reports, replay fencing, failure thresholds, restart integration, authenticated aggregate health, and rollout gating
+   - add isolated command and scoped HTTP probe runners, success thresholds, jittered schedules, per-probe capability ceilings, and redacted bounded output retention
    - add rollout policy for `max_surge`, `max_unavailable`, minimum ready time, progress deadlines, pause/resume, and per-instance ordering
    - retain old and new generation supervisors concurrently, route only to ready replicas, drain gracefully, and recover ownership after daemon failure
    - add deterministic canary cohorts, metric/trace gates, operator promotion, and automatic abort without widening package authority

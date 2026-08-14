@@ -44,7 +44,7 @@ No known exploitable issue remains in the implemented portable-runtime and foreg
 - Graceful termination kills children. A hard crash or power loss can leave a helper alive until its own runtime deadline; platform job objects and parent-death controls remain required.
 - The checksum journals detect corruption and stale generations; they are not authentication against a malicious process already running as the same OS user.
 - The supervisor is foreground-only. A per-user daemon needs authenticated local IPC, peer-credential checks, replay protection, authorization, liveness leases, and its own review.
-- Service calls, application probes, surge/unavailable rolling updates, ingress, secrets, and native adapters are not implemented and are not covered by this result. Process health and whole-generation transactional rollback were added and reviewed separately after this document.
+- Service calls, independent command/HTTP probes, surge/unavailable rolling updates, ingress, secrets, and native adapters are not implemented and are not covered by this result. Process health, whole-generation transactional rollback, and guest-signalled application probes were added and reviewed separately after this document.
 - Linux desktop production packaging remains blocked on the target-specific Tauri/GTK3 graph's 16 maintenance warnings and `glib` unsoundness advisory. Windows and macOS do not build that GTK dependency path.
 - Fuzz coverage is bounded and internal. Independent review and platform sandbox penetration testing remain release gates.
 

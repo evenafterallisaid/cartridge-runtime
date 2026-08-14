@@ -1,0 +1,25 @@
+format_version = 1
+name = "probe-timeout-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "silent"
+cartridge = "dev.cartridge.timeout-fixture"
+version = "^0.1"
+replicas = 1
+restart = "never"
+max_restarts = 0
+
+[instances.health]
+startup_timeout_ms = 100
+readiness_timeout_ms = 200
+liveness_timeout_ms = 100
+failure_threshold = 1
+
+[instances.limits]
+fuel = 10000000
+memory_bytes = 67108864
+timeout_ms = 1000

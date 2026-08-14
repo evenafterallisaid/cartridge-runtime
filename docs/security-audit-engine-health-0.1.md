@@ -6,7 +6,7 @@ Scope: supervisor heartbeat persistence, health derivation, authenticated health
 
 ## Result
 
-No known exploitable issue remains in the implemented process-health boundary after this review. The feature reports convergence and supervisor freshness; it does not claim that a running process is application-healthy.
+No known exploitable issue remains in the implemented process-health boundary after this review. This document originally covered convergence and supervisor freshness. Opt-in guest-signalled application health was added and reviewed later in `security-audit-probes-0.1.md`.
 
 ## Findings fixed during implementation
 
@@ -24,7 +24,7 @@ No known exploitable issue remains in the implemented process-health boundary af
 - A supervisor heartbeat changes only observation time and document identity; it cannot alter replica phase, restart policy, or run identity.
 - A live phase becomes stale after 20 seconds without a valid heartbeat. Terminal completed and failed results remain terminal rather than aging into stale.
 - Ready means all desired running replicas are either running or completed successfully. Degraded and failed states make the wait command fail early.
-- Application-specific probes are intentionally absent. Process health is not mislabeled as HTTP, service, or semantic health.
+- At the time of this review, application-specific probes were intentionally absent. Later guest-signalled probes preserve process readiness only for plans that do not request application gating.
 
 ## Verification
 
@@ -37,6 +37,6 @@ No known exploitable issue remains in the implemented process-health boundary af
 
 ## Remaining gates
 
-- Manifest-defined startup, readiness, and liveness probes need bounded schedules, output limits, and explicit capability rules.
+- Guest-signalled startup, readiness, and liveness policy now works; isolated command and scoped HTTP probes still need schedules, success thresholds, output policy, and explicit capability ceilings.
 - Safe updates still require prepare, activate, commit, rollback evidence, surge/unavailable ceilings, and crash recovery.
 - Heartbeats prove supervisor observation, not kernel-enforced CPU/RSS health or application correctness.

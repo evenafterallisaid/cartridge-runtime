@@ -8,13 +8,6 @@ interface host {
         error,
     }
 
-    enum health-state {
-        started,
-        ready,
-        heartbeat,
-        unhealthy,
-    }
-
     record storage-mutation {
         key: string,
         value: option<list<u8>>,
@@ -81,7 +74,6 @@ interface host {
     }
 
     log: func(level: log-level, message: string);
-    health-report: func(state: health-state, detail: string);
     wall-clock-ms: func() -> result<u64, string>;
     random-bytes: func(length: u32) -> result<list<u8>, string>;
     read-asset: func(path: string) -> result<list<u8>, string>;
@@ -101,13 +93,8 @@ interface host {
     midi-next: func() -> result<option<list<u8>>, string>;
     http-fetch: func(request: http-request) -> result<http-response, string>;
 }
+
 world cartridge {
     import host;
     export run: func(args: list<string>) -> result<string, string>;
-}
-
-world migratable-cartridge {
-    import host;
-    export run: func(args: list<string>) -> result<string, string>;
-    export migrate: func(name: string, source: u32, target: u32) -> result<_, string>;
 }

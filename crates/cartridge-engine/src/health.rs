@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    EngineStackState, MAX_STACK_INSTANCES, MAX_STACK_TOTAL_REPLICAS, ReplicaPhase,
+    EngineStackState, MAX_STACK_INSTANCES, MAX_STACK_TOTAL_REPLICAS, ProbePhase, ReplicaPhase,
     StackRuntimeStatus, StackStatus, is_digest, valid_name,
 };
 
-pub const ENGINE_HEALTH_FORMAT_VERSION: u32 = 1;
+pub const ENGINE_HEALTH_FORMAT_VERSION: u32 = 2;
 pub const SUPERVISOR_STALE_AFTER_MS: u64 = 20_000;
 pub const MAX_ENGINE_HEALTH_REPORTS: usize = 64;
 
@@ -43,6 +43,9 @@ pub struct StackHealthReport {
     pub failed: u16,
     pub exhausted: u16,
     pub stopped: u16,
+    pub probe_waiting: u16,
+    pub probe_ready: u16,
+    pub probe_unhealthy: u16,
     pub report_sha256: String,
 }
 
@@ -81,6 +84,9 @@ impl StackHealthReport {
             failed: 0,
             exhausted: 0,
             stopped: 0,
+            probe_waiting: 0,
+            probe_ready: 0,
+            probe_unhealthy: 0,
             report_sha256: String::new(),
         };
         if let Some(runtime) = runtime {
@@ -107,6 +113,16 @@ impl StackHealthReport {
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| "health replica count overflow".to_string())?;
+                if let Some(probe) = &replica.probe {
+                    let count = match probe.phase {
+                        ProbePhase::Waiting => &mut report.probe_waiting,
+                        ProbePhase::Ready => &mut report.probe_ready,
+                        ProbePhase::Unhealthy => &mut report.probe_unhealthy,
+                    };
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| "health probe count overflow".to_string())?;
+                }
             }
             if status.state == EngineStackState::Applied && desired_replicas > 0 {
                 report.state = report.derived_applied_state(now_ms, runtime.observed_at_ms);
@@ -127,6 +143,11 @@ impl StackHealthReport {
             .and_then(|value| value.checked_add(self.exhausted))
             .and_then(|value| value.checked_add(self.stopped))
             .ok_or_else(|| "health replica count overflow".to_string())?;
+        let probed = self
+            .probe_waiting
+            .checked_add(self.probe_ready)
+            .and_then(|value| value.checked_add(self.probe_unhealthy))
+            .ok_or_else(|| "health probe count overflow".to_string())?;
         if self.format_version != ENGINE_HEALTH_FORMAT_VERSION
             || !valid_name(&self.stack)
             || self.revision == 0
@@ -134,6 +155,7 @@ impl StackHealthReport {
             || self.desired_replicas > MAX_STACK_TOTAL_REPLICAS
             || self.replicas_total > MAX_STACK_TOTAL_REPLICAS
             || total != self.replicas_total
+            || probed > self.replicas_total
             || self
                 .runtime_observed_at_ms
                 .is_some_and(|value| value == 0 || value > self.observed_at_ms)
@@ -169,6 +191,8 @@ impl StackHealthReport {
         let live = self.running > 0 || waiting > 0;
         if live && now_ms.saturating_sub(runtime_observed_at_ms) > SUPERVISOR_STALE_AFTER_MS {
             StackHealthState::Stale
+        } else if self.probe_unhealthy > 0 {
+            StackHealthState::Degraded
         } else if failures > 0 {
             if successful > 0 || waiting > 0 {
                 StackHealthState::Degraded
@@ -207,20 +231,28 @@ impl StackHealthReport {
             EngineStackState::Applied => match self.state {
                 StackHealthState::Healthy => {
                     failures == 0
+                        && self.probe_unhealthy == 0
+                        && self.probe_waiting == 0
                         && waiting == 0
                         && self.running > 0
                         && self.running + self.succeeded == self.desired_replicas
                 }
                 StackHealthState::Completed => {
                     failures == 0
+                        && self.probe_unhealthy == 0
+                        && self.probe_waiting == 0
                         && waiting == 0
                         && self.running == 0
                         && self.succeeded == self.desired_replicas
                 }
                 StackHealthState::Starting => {
-                    failures == 0 && (waiting > 0 || successful < self.desired_replicas)
+                    failures == 0
+                        && self.probe_unhealthy == 0
+                        && (waiting > 0 || successful < self.desired_replicas)
                 }
-                StackHealthState::Degraded => failures > 0 && (successful > 0 || waiting > 0),
+                StackHealthState::Degraded => {
+                    self.probe_unhealthy > 0 || (failures > 0 && (successful > 0 || waiting > 0))
+                }
                 StackHealthState::Failed => failures > 0 && successful == 0 && waiting == 0,
                 StackHealthState::Stale => self.runtime_observed_at_ms.is_some_and(|observed| {
                     (self.running > 0 || waiting > 0)
@@ -292,8 +324,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        DesiredState, PlannedInstance, PlannedSecurity, RestartPolicy, SandboxPolicy,
-        SecurityProfile, StackPlan,
+        DesiredState, HealthProbeSpec, PlannedInstance, PlannedSecurity, ProbeSignalKind,
+        RestartPolicy, SandboxPolicy, SecurityProfile, StackPlan,
     };
 
     fn plan(replicas: u16) -> StackPlan {
@@ -322,6 +354,7 @@ mod tests {
                 args: Vec::new(),
                 secrets: BTreeSet::new(),
                 limits: RuntimeLimits::default(),
+                health: None,
                 composition: CompositionLock::new(
                     LockedPackage {
                         cartridge_id: "dev.test.web".into(),
@@ -401,6 +434,40 @@ mod tests {
 
         report.running = 1;
         assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn application_readiness_and_unhealthy_signals_drive_stack_health() {
+        let mut plan = plan(1);
+        plan.instances[0].health = Some(HealthProbeSpec::default());
+        plan.plan_sha256 = plan.computed_sha256().unwrap();
+        let desired = status(&plan);
+        let mut runtime = StackRuntimeStatus::from_plan(&plan, 1, &"2".repeat(64), 100).unwrap();
+        let id = runtime.replicas[0].id.clone();
+        let run_id = "9".repeat(64);
+
+        runtime.begin_start(&id, &run_id, 101).unwrap();
+        runtime
+            .mark_probe_signal(&id, &run_id, 1, ProbeSignalKind::Started, 102)
+            .unwrap();
+        let starting = StackHealthReport::from_status(&desired, Some(&runtime), 102).unwrap();
+        assert_eq!(starting.state, StackHealthState::Starting);
+        assert_eq!(starting.probe_waiting, 1);
+
+        runtime
+            .mark_probe_signal(&id, &run_id, 2, ProbeSignalKind::Ready, 103)
+            .unwrap();
+        let healthy = StackHealthReport::from_status(&desired, Some(&runtime), 103).unwrap();
+        assert_eq!(healthy.state, StackHealthState::Healthy);
+        assert_eq!(healthy.probe_ready, 1);
+
+        runtime
+            .mark_probe_signal(&id, &run_id, 3, ProbeSignalKind::Unhealthy, 104)
+            .unwrap();
+        let degraded = StackHealthReport::from_status(&desired, Some(&runtime), 104).unwrap();
+        assert_eq!(degraded.state, StackHealthState::Degraded);
+        assert_eq!(degraded.probe_unhealthy, 1);
+        assert!(!degraded.ready());
     }
 
     #[test]
