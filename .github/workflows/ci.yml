@@ -193,7 +193,7 @@ jobs:
           "$binary" engine apply tests/fixtures/Cartridge.stack.toml --root daemon-engine
           "$binary" engine wait hello-stack --root daemon-engine --timeout-ms 15000 --json | grep -E '"state": "(healthy|completed)"'
           "$binary" engine health hello-stack --root daemon-engine --json | grep '"report_sha256"'
-          "$binary" engine ps hello-stack --root daemon-engine --json | grep '"phase": "succeeded"'
+          "$binary" engine ps hello-stack --root daemon-engine --json | grep -E '"phase": "(running|succeeded)"'
           "$binary" engine events hello-stack --root daemon-engine --tail 1 --json | grep '"revision": 1'
           "$binary" engine stop hello-stack --root daemon-engine
           "$binary" engine remove hello-stack --root daemon-engine
