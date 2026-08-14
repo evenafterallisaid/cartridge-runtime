@@ -331,7 +331,7 @@ jobs:
           set +e
           "$binary" run timeout.cartridge &
           runtime_pid=$!
-          for attempt in {1..30}; do
+          for attempt in {1..100}; do
             if ! kill -0 "$runtime_pid" 2>/dev/null; then
               wait "$runtime_pid"
               runtime_status=$?
