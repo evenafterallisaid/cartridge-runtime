@@ -174,6 +174,8 @@ jobs:
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine
           cargo run -p cartridge-cli -- stack list --root engine
           cargo run -p cartridge-cli -- stack status hello-stack --root engine
+          cargo run -p cartridge-cli -- stack supervise hello-stack --library library --root engine
+          cargo run -p cartridge-cli -- stack ps hello-stack --root engine
           cargo run -p cartridge-cli -- stack events hello-stack --root engine
           cargo run -p cartridge-cli -- stack stop hello-stack --root engine
           cargo run -p cartridge-cli -- stack remove hello-stack --root engine

@@ -994,7 +994,11 @@ The next concrete sequence is:
    - bind every grant to caller, provider identity, interface set, scope, expiry, and approval generation
    - model session, persistent, policy-provided, and revoked edges
    - prove that provider host authority never becomes caller authority
-3. Build the local composition supervisor:
+3. [partially implemented] Build the local composition supervisor:
+   - [implemented] expand exact plans into stable replicas under a single-owner foreground supervisor
+   - [implemented] enforce finite restart budgets, deterministic capped backoff, crash recovery, worker deadlines, and a 32-worker admission ceiling
+   - [implemented] persist checksum-bound, generation-fenced observed state and reject stale run exits
+   - [implemented] enforce reviewed capability ceilings inside the runtime and isolate state by exact package digest
    - activate providers before wiring edges
    - enforce per-call deadlines, cancellation trees, queue limits, and backpressure
    - add restart budgets, circuit breaking, idle suspension, and crash isolation
@@ -1007,8 +1011,9 @@ The next concrete sequence is:
    - add a semantic plan diff alongside the implemented canonical plan digest
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
-   - add prepare/activate/commit phases and recovery checkpoints
-   - add health-gated rollback, restart recovery, and process reconciliation
+   - [implemented] generation-fenced replica expansion, durable observed status, restart recovery, process reconciliation, and one-supervisor leases
+   - add explicit prepare/activate/commit rollout phases and recovery checkpoints
+   - add health-gated rollback and rolling/canary replacement
    - compact long journals through signed checkpoints without losing auditability
 6. Complete the external 1.0 security gates in parallel:
    - platform-native worker sandboxes and kernel resource limits

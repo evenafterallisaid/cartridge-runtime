@@ -1,3 +1,9 @@
+mod supervisor;
+
+pub use supervisor::{
+    ReplicaId, ReplicaPhase, ReplicaRuntime, SUPERVISOR_STATUS_FORMAT_VERSION, StackRuntimeStatus,
+};
+
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -23,6 +29,8 @@ pub const ENGINE_EVENT_FORMAT_VERSION: u32 = 1;
 pub const MAX_STACK_BYTES: u64 = 1024 * 1024;
 pub const MAX_STACK_INSTANCES: usize = 64;
 pub const MAX_STACK_REPLICAS: u16 = 32;
+pub const MAX_STACK_TOTAL_REPLICAS: u16 = 256;
+pub const MAX_STACK_RESTARTS: u16 = 64;
 pub const MAX_STACK_RESOURCES: usize = 128;
 pub const MAX_STACK_SECRETS: usize = 128;
 pub const MAX_STACK_ARGUMENTS: usize = 256;
@@ -30,6 +38,7 @@ pub const MAX_STACK_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_STACK_PLAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ENGINE_EVENTS_PER_STACK: usize = 4096;
 pub const MAX_ENGINE_EVENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_RUNTIME_STATUS_BYTES: u64 = 1024 * 1024;
 
 const ENGINE_LOCK_ATTEMPTS: usize = 200;
 const ENGINE_LOCK_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
@@ -286,6 +295,10 @@ pub struct EngineStore {
     _lock: File,
 }
 
+pub struct SupervisorLease {
+    _lock: File,
+}
+
 impl StackManifest {
     pub fn parse(text: &str) -> Result<Self, String> {
         if text.len() as u64 > MAX_STACK_BYTES {
@@ -329,11 +342,18 @@ impl StackManifest {
             return Err("stack format, name, or collection count is invalid".into());
         }
         let mut instances = BTreeSet::new();
+        let mut total_replicas = 0_u16;
         for instance in &self.instances {
             validate_instance(instance)?;
+            total_replicas = total_replicas
+                .checked_add(instance.replicas)
+                .ok_or_else(|| "stack replica count overflow".to_string())?;
             if !instances.insert(instance.name.as_str()) {
                 return Err("stack instance names must be unique".into());
             }
+        }
+        if total_replicas > MAX_STACK_TOTAL_REPLICAS {
+            return Err("stack exceeds its aggregate replica limit".into());
         }
         let mut resources = BTreeSet::new();
         for resource in &self.resources {
@@ -701,6 +721,131 @@ impl EngineStore {
             .ok_or_else(|| "stack is not known to the engine".into())
     }
 
+    pub fn desired_plan(&self, stack: &str) -> Result<Option<(u64, String, StackPlan)>, String> {
+        let Some(event) = self.latest(stack)? else {
+            return Err("stack is not known to the engine".into());
+        };
+        Ok(event
+            .plan
+            .map(|plan| (event.revision, event.event_sha256, plan)))
+    }
+
+    pub fn runtime_status(&self, stack: &str) -> Result<Option<StackRuntimeStatus>, String> {
+        let Some((revision, generation, plan)) = self.desired_plan(stack)? else {
+            return Ok(None);
+        };
+        let path = self.runtime_status_path(stack)?;
+        recover_runtime_status(&path)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let status = read_runtime_status(&path)?;
+        status.validate_against(&plan, revision, &generation)?;
+        Ok(Some(status))
+    }
+
+    pub fn save_runtime_status(&self, status: &StackRuntimeStatus) -> Result<(), String> {
+        status.validate()?;
+        let Some((revision, generation, plan)) = self.desired_plan(&status.stack)? else {
+            return Err("removed stack cannot retain observed runtime state".into());
+        };
+        status.validate_against(&plan, revision, &generation)?;
+        let bytes = serde_json::to_vec(status).map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
+            return Err("runtime status exceeds its byte limit".into());
+        }
+        let path = self.runtime_status_path(&status.stack)?;
+        recover_runtime_status(&path)?;
+        write_replace_atomic(&path, &bytes)
+    }
+
+    pub fn prepare_runtime_status(
+        &self,
+        stack: &str,
+        now_ms: u64,
+    ) -> Result<StackRuntimeStatus, String> {
+        let Some((revision, generation, plan)) = self.desired_plan(stack)? else {
+            return Err("removed stack has no runtime generation".into());
+        };
+        let path = self.runtime_status_path(stack)?;
+        recover_runtime_status(&path)?;
+        let mut status = if path.exists() {
+            let previous = read_runtime_status(&path)?;
+            if previous
+                .validate_against(&plan, revision, &generation)
+                .is_ok()
+            {
+                previous
+            } else {
+                StackRuntimeStatus::from_plan(&plan, revision, &generation, now_ms)?
+            }
+        } else {
+            StackRuntimeStatus::from_plan(&plan, revision, &generation, now_ms)?
+        };
+        status.recover_interrupted(now_ms)?;
+        self.save_runtime_status(&status)?;
+        Ok(status)
+    }
+
+    pub fn acquire_supervisor_lease(&self, stack: &str) -> Result<SupervisorLease, String> {
+        let Some((_revision, _generation, _plan)) = self.desired_plan(stack)? else {
+            return Err("removed stack cannot be supervised".into());
+        };
+        let stack_root = self.root.join("stacks").join(stack);
+        ensure_directory(&stack_root)?;
+        let path = stack_root.join("supervisor.lock");
+        if path.exists() && !is_regular_file(&path) {
+            return Err("supervisor lock path is not a regular file".into());
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        private_options(&mut options);
+        let lock = options.open(path).map_err(|error| error.to_string())?;
+        match FileExt::try_lock(&lock) {
+            Ok(()) => Ok(SupervisorLease { _lock: lock }),
+            Err(TryLockError::WouldBlock) => Err("stack already has an active supervisor".into()),
+            Err(TryLockError::Error(error)) => Err(error.to_string()),
+        }
+    }
+
+    pub fn replica_state_directory(
+        &self,
+        stack: &str,
+        generation: &str,
+        id: &ReplicaId,
+    ) -> Result<PathBuf, String> {
+        let Some((_revision, current_generation, plan)) = self.desired_plan(stack)? else {
+            return Err("removed stack has no replica state".into());
+        };
+        let planned_instance = plan
+            .instances
+            .iter()
+            .find(|instance| instance.name == id.instance && id.ordinal <= instance.replicas);
+        if current_generation != generation
+            || !valid_name(&id.instance)
+            || id.ordinal == 0
+            || planned_instance.is_none()
+        {
+            return Err("replica state request does not match the desired generation".into());
+        }
+        let package_sha256 = &planned_instance
+            .ok_or_else(|| "replica is not part of the desired generation".to_string())?
+            .package_sha256;
+        let stack_root = self.root.join("stacks").join(stack);
+        ensure_directory(&stack_root)?;
+        let replicas = stack_root.join("replicas");
+        ensure_directory(&replicas)?;
+        let instance = replicas.join(&id.instance);
+        ensure_directory(&instance)?;
+        let replica = instance.join(format!("{:04}", id.ordinal));
+        ensure_directory(&replica)?;
+        let state = replica.join("state");
+        ensure_directory(&state)?;
+        let package_state = state.join(package_sha256);
+        ensure_directory(&package_state)?;
+        Ok(package_state)
+    }
+
     pub fn events(&self, stack: &str) -> Result<Vec<EngineEvent>, String> {
         if !valid_name(stack) {
             return Err("stack name is invalid".into());
@@ -753,6 +898,17 @@ impl EngineStore {
         Ok(events)
     }
 
+    fn runtime_status_path(&self, stack: &str) -> Result<PathBuf, String> {
+        if !valid_name(stack) {
+            return Err("stack name is invalid".into());
+        }
+        let stack_root = self.root.join("stacks").join(stack);
+        if stack_root.exists() {
+            ensure_directory(&stack_root)?;
+        }
+        Ok(stack_root.join("runtime.json"))
+    }
+
     fn append(&self, event: &EngineEvent) -> Result<(), String> {
         event.validate()?;
         let events = self.create_stack_events(&event.stack)?;
@@ -787,14 +943,21 @@ fn validate_planned_instances(
         .collect::<BTreeSet<_>>();
     let mut names = BTreeSet::new();
     let mut previous_name = None;
+    let mut total_replicas = 0_u16;
     for instance in instances {
         validate_planned_instance(instance, profile, &declared_secrets)?;
+        total_replicas = total_replicas
+            .checked_add(instance.replicas)
+            .ok_or_else(|| "stack plan replica count overflow".to_string())?;
         if previous_name.is_some_and(|previous| previous >= instance.name.as_str())
             || !names.insert(instance.name.clone())
         {
             return Err("stack plan instances are not strictly sorted".into());
         }
         previous_name = Some(instance.name.as_str());
+    }
+    if total_replicas > MAX_STACK_TOTAL_REPLICAS {
+        return Err("stack plan exceeds its aggregate replica limit".into());
     }
     Ok(names)
 }
@@ -817,6 +980,7 @@ fn validate_planned_instance(
         || instance.package_bytes > 160 * 1024 * 1024
         || instance.replicas == 0
         || instance.replicas > MAX_STACK_REPLICAS
+        || instance.max_restarts > MAX_STACK_RESTARTS
         || !instance.allowed.is_subset(&instance.requested)
         || !instance.denied.is_subset(&instance.requested)
         || !instance.granted.is_subset(&instance.requested)
@@ -926,6 +1090,7 @@ fn validate_instance(value: &InstanceSpec) -> Result<(), String> {
         || VersionReq::parse(&value.version).is_err()
         || value.replicas == 0
         || value.replicas > MAX_STACK_REPLICAS
+        || value.max_restarts > MAX_STACK_RESTARTS
         || value.args.len() > MAX_STACK_ARGUMENTS
         || argument_bytes > MAX_STACK_ARGUMENT_BYTES
         || value
@@ -1228,6 +1393,91 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(error.to_string());
     }
     fs::remove_file(temporary).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn read_runtime_status(path: &Path) -> Result<StackRuntimeStatus, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_RUNTIME_STATUS_BYTES
+    {
+        return Err("runtime status must be a bounded regular file".into());
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_RUNTIME_STATUS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
+        return Err("runtime status exceeded its byte limit while reading".into());
+    }
+    let status: StackRuntimeStatus =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    status.validate()?;
+    Ok(status)
+}
+
+fn recover_runtime_status(path: &Path) -> Result<(), String> {
+    let backup = path.with_extension("json.previous");
+    if backup.exists() && !is_regular_file(&backup) {
+        return Err("runtime status backup is not a regular file".into());
+    }
+    if path.exists() && !is_regular_file(path) {
+        return Err("runtime status path is not a regular file".into());
+    }
+    if !path.exists() && backup.exists() {
+        read_runtime_status(&backup)?;
+        fs::rename(&backup, path).map_err(|error| error.to_string())?;
+    } else if path.exists() && backup.exists() {
+        read_runtime_status(path)?;
+        fs::remove_file(backup).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_replace_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "runtime status path has no parent".to_string())?;
+    ensure_directory(directory)?;
+    let sequence = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".runtime-status-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    private_options(&mut options);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    drop(file);
+    if path.exists() {
+        if !is_regular_file(path) {
+            let _ = fs::remove_file(&temporary);
+            return Err("runtime status path is not a regular file".into());
+        }
+        let backup = path.with_extension("json.previous");
+        if backup.exists() {
+            let _ = fs::remove_file(&temporary);
+            return Err("runtime status replacement is already in progress".into());
+        }
+        fs::rename(path, &backup).map_err(|error| error.to_string())?;
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::rename(&backup, path);
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        fs::remove_file(backup).map_err(|error| error.to_string())?;
+    } else {
+        fs::rename(temporary, path).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1545,5 +1795,108 @@ mod tests {
         .unwrap();
 
         assert!(engine.status("demo-stack").is_err());
+    }
+
+    #[test]
+    fn observed_runtime_state_is_generation_fenced_and_tamper_evident() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let plan = StackPlan::build(&manifest(SandboxPolicy::Required), &library).unwrap();
+        let engine_root = directory.path().join("engine");
+        let engine = EngineStore::open(&engine_root).unwrap();
+        engine.apply(&plan, false).unwrap();
+        let (revision, generation, desired) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        let mut runtime =
+            StackRuntimeStatus::from_plan(&desired, revision, &generation, 1).unwrap();
+        engine.save_runtime_status(&runtime).unwrap();
+        assert_eq!(
+            engine.runtime_status("demo-stack").unwrap(),
+            Some(runtime.clone())
+        );
+
+        engine.stop("demo-stack").unwrap();
+        assert!(engine.save_runtime_status(&runtime).is_err());
+        assert!(engine.runtime_status("demo-stack").is_err());
+
+        let (revision, generation, stopped) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        runtime = StackRuntimeStatus::from_plan(&stopped, revision, &generation, 2).unwrap();
+        engine.save_runtime_status(&runtime).unwrap();
+        drop(engine);
+        OpenOptions::new()
+            .append(true)
+            .open(engine_root.join("stacks/demo-stack/runtime.json"))
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let engine = EngineStore::open(engine_root).unwrap();
+        assert!(engine.runtime_status("demo-stack").is_err());
+    }
+
+    #[test]
+    fn aggregate_replica_limit_prevents_fork_bomb_plans() {
+        let mut value = manifest(SandboxPolicy::Required);
+        let template = value.instances[0].clone();
+        value.instances.clear();
+        for index in 0..9 {
+            let mut instance = template.clone();
+            instance.name = format!("app-{index}");
+            instance.replicas = MAX_STACK_REPLICAS;
+            value.instances.push(instance);
+        }
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn only_one_supervisor_can_own_a_stack() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+        let plan = StackPlan::build(&manifest(SandboxPolicy::Required), &library).unwrap();
+        let engine = EngineStore::open(directory.path().join("engine")).unwrap();
+        engine.apply(&plan, false).unwrap();
+
+        let lease = engine.acquire_supervisor_lease("demo-stack").unwrap();
+        assert!(engine.acquire_supervisor_lease("demo-stack").is_err());
+        drop(lease);
+        assert!(engine.acquire_supervisor_lease("demo-stack").is_ok());
+    }
+
+    #[test]
+    fn unsigned_package_upgrades_do_not_inherit_replica_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = package(directory.path(), "1.0.0", "storage = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&old).unwrap();
+        let mut source = manifest(SandboxPolicy::Required);
+        source.instances[0].allow = BTreeSet::from([StackCapability::Storage]);
+        let old_plan = StackPlan::build(&source, &library).unwrap();
+        let engine = EngineStore::open(directory.path().join("engine")).unwrap();
+        engine.apply(&old_plan, false).unwrap();
+        let (_, old_generation, _) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        let id = ReplicaId {
+            instance: "app".into(),
+            ordinal: 1,
+        };
+        let old_state = engine
+            .replica_state_directory("demo-stack", &old_generation, &id)
+            .unwrap();
+
+        let new = package(directory.path(), "1.1.0", "storage = true");
+        library.install(&new).unwrap();
+        let new_plan = StackPlan::build(&source, &library).unwrap();
+        engine.apply(&new_plan, false).unwrap();
+        let (_, new_generation, _) = engine.desired_plan("demo-stack").unwrap().unwrap();
+        let new_state = engine
+            .replica_state_directory("demo-stack", &new_generation, &id)
+            .unwrap();
+
+        assert_ne!(old_state, new_state);
+        assert_eq!(
+            new_state.file_name().and_then(|name| name.to_str()),
+            Some(new_plan.instances[0].package_sha256.as_str())
+        );
     }
 }

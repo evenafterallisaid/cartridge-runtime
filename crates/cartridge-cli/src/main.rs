@@ -7,9 +7,9 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode, Stdio},
+    process::{Child, Command as ProcessCommand, ExitCode, Stdio},
     sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,14 +17,17 @@ use std::{
 use anyhow::{Context, Result, bail};
 use cartridge_core::{
     CartridgeArchive, CompositionLock, LockedPackage, MAX_RESOLUTION_CANDIDATES, PackOptions,
-    ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
+    Permissions, ResolutionPlan, negotiate_platform, pack, resolve_dependencies,
 };
 use cartridge_desktop::{Capability, CatalogPackage, LaunchStatus, Library};
 use cartridge_dev::{
     Language, create_project, inspect_project, manifest_schema, profile_project, reload_decision,
     source_fingerprint,
 };
-use cartridge_engine::{EngineStore, StackManifest, StackPlan};
+use cartridge_engine::{
+    EngineStore, PlannedInstance, ReplicaId, ReplicaPhase, StackCapability, StackManifest,
+    StackPlan, StackRuntimeStatus,
+};
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
     read_rotation, read_signature, write_revocation, write_rotation, write_signature,
@@ -52,6 +55,8 @@ const MAX_BLOB_GC_ROOT_ARTIFACTS: usize = 256;
 const MAX_BLOB_GC_REFERENCES: usize = 100_000;
 const MAX_EVENT_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_STABILITY_WALL_TIME: Duration = Duration::from_secs(60 * 60);
+const MAX_SUPERVISOR_WORKERS: usize = 32;
+const DESIRED_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
@@ -67,6 +72,7 @@ struct RunCommandOptions<'a> {
     storage_signature: Option<&'a Path>,
     storage_trust: Option<&'a Path>,
     local_storage_authority: bool,
+    permission_ceiling: Option<&'a Permissions>,
     args: &'a [String],
 }
 
@@ -262,6 +268,8 @@ enum Command {
         http_fixtures: Option<PathBuf>,
         #[arg(long, hide = true)]
         local_storage_authority: bool,
+        #[arg(long, hide = true)]
+        capability_ceiling: Option<u16>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -653,6 +661,16 @@ enum StackCommand {
         #[arg(long)]
         json: bool,
     },
+    /// run one stack generation under the bounded local supervisor
+    Supervise {
+        stack: String,
+        #[arg(long)]
+        library: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// list known stacks and their desired state
     List {
         #[arg(long)]
@@ -662,6 +680,14 @@ enum StackCommand {
     },
     /// inspect one stack's latest desired state
     Status {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// inspect observed replica lifecycle state
+    Ps {
         stack: String,
         #[arg(long)]
         root: PathBuf,
@@ -1072,6 +1098,7 @@ fn run_cli() -> Result<()> {
                 storage_signature: durable_auth.signature.as_deref(),
                 storage_trust: durable_auth.trust.as_deref(),
                 local_storage_authority: false,
+                permission_ceiling: None,
                 args: &args,
             })
         }
@@ -1092,9 +1119,11 @@ fn run_cli() -> Result<()> {
             media_dir,
             http_fixtures,
             local_storage_authority,
+            capability_ceiling,
             args,
         } => {
             require_worker_context()?;
+            let permission_ceiling = capability_ceiling.map(permissions_from_mask).transpose()?;
             if state_dir.is_some() && !local_storage_authority {
                 durable_auth.verify(&package)?;
             }
@@ -1111,6 +1140,7 @@ fn run_cli() -> Result<()> {
                 storage_signature: None,
                 storage_trust: None,
                 local_storage_authority,
+                permission_ceiling: permission_ceiling.as_ref(),
                 args: &args,
             })
         }
@@ -1254,6 +1284,7 @@ fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()
         storage_signature: None,
         storage_trust: None,
         local_storage_authority: false,
+        permission_ceiling: None,
         args,
     });
     let replay = run.and_then(|()| supervised_replay_command(package, &trace, None, args));
@@ -1364,6 +1395,7 @@ fn run_dev_build(
         storage_signature: None,
         storage_trust: None,
         local_storage_authority: true,
+        permission_ceiling: None,
         args: &[],
     });
     fs::remove_file(&package)
@@ -1611,6 +1643,12 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
                 .map_err(anyhow::Error::msg)?;
             print_stack_report(&report, json)
         }
+        StackCommand::Supervise {
+            stack,
+            library,
+            root,
+            json,
+        } => supervise_stack(&stack, &root, &library, json),
         StackCommand::List { root, json } => {
             let statuses = EngineStore::open(root)
                 .map_err(anyhow::Error::msg)?
@@ -1653,6 +1691,20 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
             }
             Ok(())
         }
+        StackCommand::Ps { stack, root, json } => {
+            let runtime = EngineStore::open(root)
+                .map_err(anyhow::Error::msg)?
+                .runtime_status(&stack)
+                .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runtime)?);
+            } else if let Some(runtime) = runtime {
+                print_runtime_status(&runtime);
+            } else {
+                println!("{stack} has no observed runtime state");
+            }
+            Ok(())
+        }
         StackCommand::Stop { stack, root, json } => {
             let report = EngineStore::open(root)
                 .map_err(anyhow::Error::msg)?
@@ -1684,6 +1736,365 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+struct StackWorkerTemplate {
+    package: PathBuf,
+    state: PathBuf,
+    args: Vec<String>,
+    permissions: Permissions,
+    timeout: Duration,
+}
+
+struct ActiveStackWorker {
+    child: Child,
+    run_id: String,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+struct ActiveStackWorkers(BTreeMap<ReplicaId, ActiveStackWorker>);
+
+impl ActiveStackWorkers {
+    fn terminate_all(&mut self) {
+        for worker in self.0.values_mut() {
+            let _ = worker.child.kill();
+            let _ = worker.child.wait();
+        }
+        self.0.clear();
+    }
+}
+
+impl Drop for ActiveStackWorkers {
+    fn drop(&mut self) {
+        self.terminate_all();
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn supervise_stack(stack: &str, root: &Path, library_root: &Path, json: bool) -> Result<()> {
+    let now = current_time_ms()?;
+    let engine = EngineStore::open(root).map_err(anyhow::Error::msg)?;
+    let (revision, generation, plan) = engine
+        .desired_plan(stack)
+        .map_err(anyhow::Error::msg)?
+        .context("stack was removed and has no runnable generation")?;
+    let _lease = engine
+        .acquire_supervisor_lease(stack)
+        .map_err(anyhow::Error::msg)?;
+    let library = Library::open(library_root).map_err(anyhow::Error::msg)?;
+    plan.verify_installed(&library)
+        .map_err(anyhow::Error::msg)?;
+    let mut status = engine
+        .prepare_runtime_status(stack, now)
+        .map_err(anyhow::Error::msg)?;
+    let templates = stack_worker_templates(&engine, &library, &plan, &generation)?;
+    drop(library);
+    drop(engine);
+
+    let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
+    let mut active = ActiveStackWorkers::default();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal = interrupted.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::Release))
+        .context("could not install the supervisor shutdown handler")?;
+    let mut next_desired_check = Instant::now();
+    loop {
+        if interrupted.load(Ordering::Acquire) {
+            stop_active_workers(&mut active, &mut status, root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("{stack} supervisor interrupted");
+                print_runtime_status(&status);
+            }
+            return Ok(());
+        }
+        if Instant::now() >= next_desired_check {
+            if !runtime_generation_is_current(root, stack, revision, &generation)? {
+                active.terminate_all();
+                if !json {
+                    println!("{stack} desired state changed; stopped generation {revision}");
+                }
+                return Ok(());
+            }
+            next_desired_check = Instant::now() + DESIRED_STATE_POLL_INTERVAL;
+        }
+
+        let mut changed = false;
+        let now_ms = current_time_ms()?;
+        let ids = active.0.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            let timed_out = active
+                .0
+                .get(&id)
+                .is_some_and(|worker| Instant::now() >= worker.deadline);
+            let outcome = if timed_out {
+                let worker = active.0.get_mut(&id).context("active worker disappeared")?;
+                worker
+                    .child
+                    .kill()
+                    .context("could not terminate timed-out worker")?;
+                let exit = worker.child.wait()?;
+                Some((
+                    exit.success(),
+                    exit.code(),
+                    "worker exceeded its supervised deadline",
+                ))
+            } else {
+                active
+                    .0
+                    .get_mut(&id)
+                    .context("active worker disappeared")?
+                    .child
+                    .try_wait()?
+                    .map(|exit| (exit.success(), exit.code(), "worker exited"))
+            };
+            if let Some((success, code, detail)) = outcome {
+                let worker = active.0.remove(&id).context("active worker disappeared")?;
+                status
+                    .mark_exit(&id, &worker.run_id, success, code, detail, now_ms)
+                    .map_err(anyhow::Error::msg)?;
+                changed = true;
+            }
+        }
+        if changed {
+            persist_runtime_status(root, &status)?;
+        }
+
+        while active.0.len() < MAX_SUPERVISOR_WORKERS {
+            let Some(id) = status
+                .eligible_starts(now_ms)
+                .into_iter()
+                .find(|id| !active.0.contains_key(id))
+            else {
+                break;
+            };
+            let replica = status
+                .replicas
+                .iter()
+                .find(|replica| replica.id == id)
+                .context("runtime replica disappeared")?;
+            let attempt = replica
+                .attempt
+                .checked_add(1)
+                .context("replica attempt counter overflow")?;
+            let run_id = replica_run_id(&generation, &id, attempt);
+            status
+                .begin_start(&id, &run_id, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            persist_runtime_status(root, &status)?;
+            let template = templates
+                .get(&id)
+                .context("replica has no verified worker template")?;
+            match spawn_stack_worker(&executable, template) {
+                Ok(child) => {
+                    active.0.insert(
+                        id.clone(),
+                        ActiveStackWorker {
+                            child,
+                            run_id: run_id.clone(),
+                            deadline: Instant::now() + WORKER_STARTUP_BUDGET + template.timeout,
+                        },
+                    );
+                    status
+                        .mark_running(&id, &run_id, now_ms)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Err(_) => {
+                    status
+                        .mark_exit(
+                            &id,
+                            &run_id,
+                            false,
+                            None,
+                            "worker process could not be started",
+                            now_ms,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+            persist_runtime_status(root, &status)?;
+        }
+
+        let waiting = status.replicas.iter().any(|replica| {
+            matches!(
+                replica.phase,
+                ReplicaPhase::Pending
+                    | ReplicaPhase::Starting
+                    | ReplicaPhase::Running
+                    | ReplicaPhase::Backoff
+            )
+        });
+        if active.0.is_empty() && !waiting {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_runtime_status(&status);
+            }
+            return Ok(());
+        }
+        thread::sleep(WORKER_POLL_INTERVAL);
+    }
+}
+
+fn stop_active_workers(
+    active: &mut ActiveStackWorkers,
+    status: &mut StackRuntimeStatus,
+    root: &Path,
+) -> Result<()> {
+    let ids = active.0.keys().cloned().collect::<Vec<_>>();
+    for id in ids {
+        let mut worker = active.0.remove(&id).context("active worker disappeared")?;
+        let exit = if let Some(exit) = worker.child.try_wait()? {
+            exit
+        } else {
+            worker
+                .child
+                .kill()
+                .context("could not terminate interrupted worker")?;
+            worker.child.wait()?
+        };
+        status
+            .mark_exit(
+                &id,
+                &worker.run_id,
+                false,
+                exit.code(),
+                "supervisor was interrupted",
+                current_time_ms()?,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
+    persist_runtime_status(root, status)
+}
+
+fn stack_worker_templates(
+    engine: &EngineStore,
+    library: &Library,
+    plan: &StackPlan,
+    generation: &str,
+) -> Result<BTreeMap<ReplicaId, StackWorkerTemplate>> {
+    let mut templates = BTreeMap::new();
+    for instance in &plan.instances {
+        let record = library
+            .catalog_package(&instance.cartridge_id, Some(&instance.version))
+            .map_err(anyhow::Error::msg)?;
+        if record.package_sha256 != instance.package_sha256
+            || record.package_bytes != instance.package_bytes
+        {
+            bail!("installed package no longer matches the desired stack generation");
+        }
+        let archive = CartridgeArchive::open(&record.path)?;
+        for ordinal in 1..=instance.replicas {
+            let id = ReplicaId {
+                instance: instance.name.clone(),
+                ordinal,
+            };
+            let state = engine
+                .replica_state_directory(&plan.stack, generation, &id)
+                .map_err(anyhow::Error::msg)?;
+            templates.insert(
+                id,
+                StackWorkerTemplate {
+                    package: record.path.clone(),
+                    state,
+                    args: instance.args.clone(),
+                    permissions: stack_permissions(instance),
+                    timeout: Duration::from_millis(archive.manifest.runtime.timeout_ms),
+                },
+            );
+        }
+    }
+    Ok(templates)
+}
+
+fn stack_permissions(instance: &PlannedInstance) -> Permissions {
+    Permissions {
+        clock: instance.allowed.contains(&StackCapability::Clock),
+        random: instance.allowed.contains(&StackCapability::Random),
+        assets: instance.allowed.contains(&StackCapability::Assets),
+        storage: instance.allowed.contains(&StackCapability::Storage),
+        graphics: instance.allowed.contains(&StackCapability::Graphics),
+        audio: instance.allowed.contains(&StackCapability::Audio),
+        midi: instance.allowed.contains(&StackCapability::Midi),
+        http: instance.allowed.contains(&StackCapability::Http),
+    }
+}
+
+fn spawn_stack_worker(executable: &Path, template: &StackWorkerTemplate) -> Result<Child> {
+    let mut arguments = vec![
+        OsString::from("__worker-run"),
+        template.package.as_os_str().to_owned(),
+        OsString::from("--state-dir"),
+        template.state.as_os_str().to_owned(),
+        OsString::from("--local-storage-authority"),
+        OsString::from("--capability-ceiling"),
+        OsString::from(permissions_mask(&template.permissions).to_string()),
+    ];
+    push_worker_arguments(&mut arguments, &template.args);
+    ProcessCommand::new(executable)
+        .args(arguments)
+        .env_clear()
+        .env("CARTRIDGE_WORKER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("could not start the cartridge worker")
+}
+
+fn runtime_generation_is_current(
+    root: &Path,
+    stack: &str,
+    revision: u64,
+    generation: &str,
+) -> Result<bool> {
+    Ok(EngineStore::open(root)
+        .map_err(anyhow::Error::msg)?
+        .desired_plan(stack)
+        .map_err(anyhow::Error::msg)?
+        .is_some_and(|(current_revision, current_generation, _)| {
+            current_revision == revision && current_generation == generation
+        }))
+}
+
+fn persist_runtime_status(root: &Path, status: &StackRuntimeStatus) -> Result<()> {
+    EngineStore::open(root)
+        .map_err(anyhow::Error::msg)?
+        .save_runtime_status(status)
+        .map_err(anyhow::Error::msg)
+}
+
+fn replica_run_id(generation: &str, id: &ReplicaId, attempt: u16) -> String {
+    let mut digest = Sha256::new();
+    digest.update(generation.as_bytes());
+    digest.update((id.instance.len() as u64).to_le_bytes());
+    digest.update(id.instance.as_bytes());
+    digest.update(id.ordinal.to_le_bytes());
+    digest.update(attempt.to_le_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn print_runtime_status(status: &StackRuntimeStatus) {
+    println!(
+        "{} generation={} revision={}",
+        status.stack, status.generation, status.revision
+    );
+    for replica in &status.replicas {
+        println!(
+            "{}-{} {:?} attempt={}/{}{}",
+            replica.id.instance,
+            replica.id.ordinal,
+            replica.phase,
+            replica.attempt,
+            replica.max_restarts + 1,
+            replica
+                .detail
+                .as_deref()
+                .map_or_else(String::new, |detail| format!(" {detail}"))
+        );
     }
 }
 
@@ -1781,6 +2192,7 @@ fn library_run_command(
         storage_signature: None,
         storage_trust: None,
         local_storage_authority: true,
+        permission_ceiling: None,
         args,
     });
     let status = if result.is_ok() {
@@ -2959,6 +3371,10 @@ fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
     if options.local_storage_authority {
         worker_args.push(OsString::from("--local-storage-authority"));
     }
+    if let Some(permissions) = options.permission_ceiling {
+        worker_args.push(OsString::from("--capability-ceiling"));
+        worker_args.push(OsString::from(permissions_mask(permissions).to_string()));
+    }
     push_worker_arguments(&mut worker_args, options.args);
     supervise_worker(options.package, &worker_args, None)
 }
@@ -3116,6 +3532,33 @@ fn push_worker_arguments(arguments: &mut Vec<OsString>, values: &[String]) {
     }
     arguments.push(OsString::from("--"));
     arguments.extend(values.iter().map(OsString::from));
+}
+
+fn permissions_mask(permissions: &Permissions) -> u16 {
+    u16::from(permissions.clock)
+        | (u16::from(permissions.random) << 1)
+        | (u16::from(permissions.assets) << 2)
+        | (u16::from(permissions.storage) << 3)
+        | (u16::from(permissions.graphics) << 4)
+        | (u16::from(permissions.audio) << 5)
+        | (u16::from(permissions.midi) << 6)
+        | (u16::from(permissions.http) << 7)
+}
+
+fn permissions_from_mask(mask: u16) -> Result<Permissions> {
+    if mask & !0xff != 0 {
+        bail!("capability ceiling contains unknown bits");
+    }
+    Ok(Permissions {
+        clock: mask & 1 != 0,
+        random: mask & (1 << 1) != 0,
+        assets: mask & (1 << 2) != 0,
+        storage: mask & (1 << 3) != 0,
+        graphics: mask & (1 << 4) != 0,
+        audio: mask & (1 << 5) != 0,
+        midi: mask & (1 << 6) != 0,
+        http: mask & (1 << 7) != 0,
+    })
 }
 
 fn supervise_worker(
@@ -3407,6 +3850,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
                 .with_media_input(input.clone(), midi.clone())?,
             options.http_fixtures,
         )?;
+        let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         branch = Some(storage);
         runtime.run(archive, options.args)?
     } else {
@@ -3416,6 +3860,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         }
         .with_media_input(input, midi)?;
         let runtime = configure_http(runtime, options.http_fixtures)?;
+        let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         runtime.run_file(options.package, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
@@ -3459,6 +3904,13 @@ fn configure_http(runtime: Runtime, fixtures: Option<&Path>) -> Result<Runtime> 
     Ok(runtime.with_http_transport(Arc::new(
         HttpFixtures::read(path).map_err(anyhow::Error::msg)?,
     )))
+}
+
+fn apply_permission_ceiling(runtime: Runtime, ceiling: Option<&Permissions>) -> Runtime {
+    match ceiling {
+        Some(permissions) => runtime.with_permission_ceiling(permissions.clone()),
+        None => runtime,
+    }
 }
 
 fn storage_status_command(package: &Path, state_dir: &Path, json: bool) -> Result<()> {

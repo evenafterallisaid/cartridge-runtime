@@ -21,6 +21,7 @@ cartridge-release = { path = "../cartridge-release" }
 cartridge-runtime = { path = "../cartridge-runtime" }
 cartridge-trace = { path = "../cartridge-trace" }
 clap.workspace = true
+ctrlc.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

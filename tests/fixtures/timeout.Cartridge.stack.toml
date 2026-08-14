@@ -1,0 +1,14 @@
+format_version = 1
+name = "timeout-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "timeout"
+cartridge = "dev.cartridge.timeout-fixture"
+version = "=0.1.0"
+replicas = 1
+restart = "on-failure"
+max_restarts = 2

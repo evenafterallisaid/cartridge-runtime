@@ -1,6 +1,6 @@
 #![no_main]
 
-use cartridge_engine::{EngineEvent, StackManifest, StackPlan};
+use cartridge_engine::{EngineEvent, StackManifest, StackPlan, StackRuntimeStatus};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -12,5 +12,8 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(event) = serde_json::from_slice::<EngineEvent>(data) {
         let _ = event.validate();
+    }
+    if let Ok(status) = serde_json::from_slice::<StackRuntimeStatus>(data) {
+        let _ = status.validate();
     }
 });

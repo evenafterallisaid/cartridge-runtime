@@ -4,7 +4,8 @@ use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use cartridge_core::{
-    CartridgeArchive, MigrationPlan, PackageManifest, StateMigration, negotiate_platform,
+    CartridgeArchive, MigrationPlan, PackageManifest, Permissions, StateMigration,
+    negotiate_platform,
 };
 pub use cartridge_media::{
     AudioDevice, AudioDeviceCatalog, AudioDocument, AudioLimits, AudioNode, AudioParameter,
@@ -53,6 +54,7 @@ pub struct Runtime {
     input_events: Vec<InputEvent>,
     midi_events: Vec<MidiEvent>,
     http_transport: Option<Arc<dyn HttpTransport>>,
+    permission_ceiling: Option<Permissions>,
 }
 
 impl Runtime {
@@ -88,6 +90,7 @@ impl Runtime {
             input_events: Vec::new(),
             midi_events: Vec::new(),
             http_transport: None,
+            permission_ceiling: None,
         })
     }
 
@@ -113,6 +116,12 @@ impl Runtime {
     #[must_use]
     pub fn with_http_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
         self.http_transport = Some(transport);
+        self
+    }
+
+    #[must_use]
+    pub fn with_permission_ceiling(mut self, permissions: Permissions) -> Self {
+        self.permission_ceiling = Some(permissions);
         self
     }
 
@@ -187,6 +196,7 @@ impl Runtime {
             input_events: self.input_events.clone(),
             midi_events: self.midi_events.clone(),
             http_transport: self.http_transport.clone(),
+            permission_ceiling: self.permission_ceiling.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -201,7 +211,8 @@ impl Runtime {
         apply_replay_storage: bool,
     ) -> Result<RunReport> {
         negotiate_platform(&archive.manifest).map_err(|error| anyhow!(error))?;
-        if replay.is_none() && archive.manifest.permissions.storage {
+        let permissions = self.effective_permissions(&archive.manifest.permissions);
+        if replay.is_none() && permissions.storage {
             self.storage.prepare(
                 &archive.manifest.cartridge.id,
                 archive.manifest.state.schema,
@@ -215,8 +226,9 @@ impl Runtime {
         let manifest = archive.manifest;
         let expected_result = replay.as_ref().map(|trace| trace.result.clone());
         let expected_events = replay.map(|trace| trace.events);
-        let mut host = HostState::new(
+        let mut host = HostState::new_with_permissions(
             &manifest,
+            permissions,
             Arc::new(archive.assets),
             self.storage.clone(),
             expected_events,
@@ -305,7 +317,10 @@ impl Runtime {
                 snapshot: source,
             });
         }
-        if !archive.manifest.permissions.storage {
+        if !self
+            .effective_permissions(&archive.manifest.permissions)
+            .storage
+        {
             bail!("state migrations require the storage permission");
         }
 
@@ -359,9 +374,10 @@ impl Runtime {
         step: &StateMigration,
     ) -> Result<MigrationStepReport> {
         let linker = self.linker()?;
+        let permissions = self.effective_permissions(&manifest.permissions);
         let mut store = Store::new(
             &self.engine,
-            HostState::new(manifest, assets, storage, None),
+            HostState::new_with_permissions(manifest, permissions, assets, storage, None),
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(manifest.runtime.fuel)?;
@@ -399,6 +415,22 @@ impl Runtime {
             fuel_consumed: manifest.runtime.fuel.saturating_sub(fuel_remaining),
             event_count: state.events.len(),
         })
+    }
+
+    fn effective_permissions(&self, requested: &Permissions) -> Permissions {
+        let Some(ceiling) = &self.permission_ceiling else {
+            return requested.clone();
+        };
+        Permissions {
+            clock: requested.clock && ceiling.clock,
+            random: requested.random && ceiling.random,
+            assets: requested.assets && ceiling.assets,
+            storage: requested.storage && ceiling.storage,
+            graphics: requested.graphics && ceiling.graphics,
+            audio: requested.audio && ceiling.audio,
+            midi: requested.midi && ceiling.midi,
+            http: requested.http && ceiling.http,
+        }
     }
 
     fn linker(&self) -> Result<Linker<HostState>> {
@@ -612,5 +644,29 @@ mod tests {
             validate_migration_budget(&migration_manifest(300_000), &migration_plan(3)).is_err()
         );
         validate_migration_budget(&migration_manifest(300_000), &migration_plan(2)).unwrap();
+    }
+
+    #[test]
+    fn permission_ceiling_can_only_remove_requested_authority() {
+        let requested = Permissions {
+            clock: true,
+            random: true,
+            storage: true,
+            http: true,
+            ..Permissions::default()
+        };
+        let ceiling = Permissions {
+            clock: true,
+            graphics: true,
+            ..Permissions::default()
+        };
+        let runtime = Runtime::new().unwrap().with_permission_ceiling(ceiling);
+        let effective = runtime.effective_permissions(&requested);
+
+        assert!(effective.clock);
+        assert!(!effective.random);
+        assert!(!effective.storage);
+        assert!(!effective.http);
+        assert!(!effective.graphics);
     }
 }

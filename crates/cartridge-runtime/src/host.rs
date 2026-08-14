@@ -71,8 +71,25 @@ pub(crate) struct HostState {
 }
 
 impl HostState {
+    #[cfg(test)]
     pub(crate) fn new(
         manifest: &PackageManifest,
+        assets: impl Into<Arc<BTreeMap<String, Vec<u8>>>>,
+        storage: Arc<dyn StorageBackend>,
+        replay_events: Option<Vec<TraceEvent>>,
+    ) -> Self {
+        Self::new_with_permissions(
+            manifest,
+            manifest.permissions.clone(),
+            assets,
+            storage,
+            replay_events,
+        )
+    }
+
+    pub(crate) fn new_with_permissions(
+        manifest: &PackageManifest,
+        permissions: Permissions,
         assets: impl Into<Arc<BTreeMap<String, Vec<u8>>>>,
         storage: Arc<dyn StorageBackend>,
         replay_events: Option<Vec<TraceEvent>>,
@@ -81,10 +98,10 @@ impl HostState {
         wasi.allow_tcp(false)
             .allow_udp(false)
             .allow_ip_name_lookup(false);
-        if !manifest.permissions.clock {
+        if !permissions.clock {
             wasi.wall_clock(FrozenWallClock);
         }
-        if !manifest.permissions.random {
+        if !permissions.random {
             wasi.secure_random(StdRng::seed_from_u64(0))
                 .insecure_random(StdRng::seed_from_u64(1))
                 .insecure_random_seed(0);
@@ -111,7 +128,7 @@ impl HostState {
             table,
             wasi,
             limits,
-            permissions: manifest.permissions.clone(),
+            permissions,
             assets: assets.into(),
             storage,
             storage_namespace: manifest.cartridge.id.clone(),
@@ -1189,6 +1206,25 @@ mod tests {
         assert_eq!(result.unwrap_err(), "random capability was not granted");
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].capability, "random");
+    }
+
+    #[test]
+    fn host_permission_ceiling_revokes_manifest_authority() {
+        let requested = Permissions {
+            clock: true,
+            random: true,
+            ..Permissions::default()
+        };
+        let mut state = HostState::new_with_permissions(
+            &manifest(requested),
+            Permissions::default(),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        );
+
+        assert!(cartridge::api::host::Host::wall_clock_ms(&mut state).is_err());
+        assert!(cartridge::api::host::Host::random_bytes(&mut state, 8).is_err());
     }
 
     #[test]
