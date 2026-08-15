@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DesiredState, EngineStackState, EngineStore, MAX_STACK_INSTANCES, MAX_STACK_REPLICAS,
-    MAX_STACK_TOTAL_REPLICAS, MAX_STACK_TOTAL_SURGE_REPLICAS, RollingUpdatePolicy, RolloutPhase,
-    RolloutRecord, is_digest, is_regular_file, valid_name, write_replace_atomic,
+    MAX_STACK_TOTAL_REPLICAS, MAX_STACK_TOTAL_SURGE_REPLICAS, ProbePhase,
+    ROLLOUT_STABILITY_WINDOW_MS, ReplicaPhase, RollingAction, RollingObservation,
+    RollingUpdatePolicy, RollingWaitReason, RolloutPhase, RolloutRecord, StackRuntimeStatus,
+    is_digest, is_regular_file, sync_parent_directory, valid_name, write_replace_atomic,
 };
 
 pub const ENGINE_ROLLOUT_PROGRESS_FORMAT_VERSION: u32 = 1;
@@ -55,7 +57,9 @@ pub struct RolloutProgress {
     pub rollout_id: String,
     pub stack: String,
     pub phase: RolloutExecutionPhase,
+    pub previous_revision: Option<u64>,
     pub previous_generation: Option<String>,
+    pub candidate_revision: u64,
     pub candidate_generation: String,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
@@ -63,6 +67,12 @@ pub struct RolloutProgress {
     pub action_sequence: u64,
     pub instances: Vec<RolloutInstanceProgress>,
     pub progress_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolloutProgressAction {
+    pub instance: Option<String>,
+    pub action: RollingAction,
 }
 
 impl RolloutProgress {
@@ -129,7 +139,11 @@ impl RolloutProgress {
             rollout_id: record.rollout_id.clone(),
             stack: record.stack.clone(),
             phase: RolloutExecutionPhase::Rolling,
+            previous_revision: record.previous_revision,
             previous_generation: record.previous_generation.clone(),
+            candidate_revision: record
+                .activated_revision
+                .ok_or_else(|| "activated rollout has no candidate revision".to_string())?,
             candidate_generation,
             started_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -146,10 +160,15 @@ impl RolloutProgress {
         if self.format_version != ENGINE_ROLLOUT_PROGRESS_FORMAT_VERSION
             || !is_digest(&self.rollout_id)
             || !valid_name(&self.stack)
+            || !matches!(
+                (self.previous_revision, self.previous_generation.as_deref()),
+                (None, None) | (Some(1..), Some(_))
+            )
             || self
                 .previous_generation
                 .as_ref()
                 .is_some_and(|generation| !is_digest(generation))
+            || self.candidate_revision == 0
             || !is_digest(&self.candidate_generation)
             || self.started_at_ms == 0
             || self.updated_at_ms < self.started_at_ms
@@ -256,10 +275,12 @@ impl RolloutProgress {
                     | RolloutExecutionPhase::RollingBack
             ) | (
                 RolloutExecutionPhase::Paused,
-                RolloutExecutionPhase::Rolling | RolloutExecutionPhase::RollingBack
+                RolloutExecutionPhase::Rolling
+                    | RolloutExecutionPhase::Completing
+                    | RolloutExecutionPhase::RollingBack
             ) | (
                 RolloutExecutionPhase::Completing,
-                RolloutExecutionPhase::Completed
+                RolloutExecutionPhase::Completed | RolloutExecutionPhase::RollingBack
             ) | (
                 RolloutExecutionPhase::RollingBack,
                 RolloutExecutionPhase::RolledBack
@@ -276,6 +297,177 @@ impl RolloutProgress {
         self.ensure_time(now_ms)?;
         self.updated_at_ms = now_ms;
         self.refresh()
+    }
+
+    pub fn acknowledge_drained(
+        &mut self,
+        previous: Option<&StackRuntimeStatus>,
+        now_ms: u64,
+    ) -> Result<usize, String> {
+        self.ensure_mutable(now_ms)?;
+        self.validate_runtime(
+            previous,
+            self.previous_revision,
+            self.previous_generation.as_deref(),
+        )?;
+        let Some(previous) = previous else {
+            return Ok(0);
+        };
+        let mut removed = 0_usize;
+        for instance in &mut self.instances {
+            instance.previous_draining.retain(|ordinal, _| {
+                let drained = previous.replicas.iter().any(|replica| {
+                    replica.id.instance == instance.name
+                        && replica.id.ordinal == *ordinal
+                        && replica.phase == ReplicaPhase::Stopped
+                });
+                if drained {
+                    removed += 1;
+                }
+                !drained
+            });
+        }
+        if removed > 0 {
+            self.mark_progress(now_ms)?;
+        }
+        Ok(removed)
+    }
+
+    pub fn next_action(
+        &self,
+        previous: Option<&StackRuntimeStatus>,
+        candidate: Option<&StackRuntimeStatus>,
+        now_ms: u64,
+    ) -> Result<RolloutProgressAction, String> {
+        self.validate()?;
+        self.ensure_time(now_ms)?;
+        if self.phase != RolloutExecutionPhase::Rolling {
+            return Err("rollout execution is not accepting scheduler decisions".into());
+        }
+        self.validate_runtime(
+            previous,
+            self.previous_revision,
+            self.previous_generation.as_deref(),
+        )?;
+        self.validate_runtime(
+            candidate,
+            Some(self.candidate_revision),
+            Some(&self.candidate_generation),
+        )?;
+        if previous.is_none()
+            && self
+                .instances
+                .iter()
+                .any(|instance| instance.previous_replicas > 0)
+        {
+            return Ok(RolloutProgressAction {
+                instance: None,
+                action: RollingAction::Wait {
+                    reason: RollingWaitReason::AvailabilityBudget,
+                },
+            });
+        }
+        let drains_pending = self
+            .instances
+            .iter()
+            .any(|instance| !instance.previous_draining.is_empty());
+        let observations = self
+            .instances
+            .iter()
+            .map(|instance| self.instance_observation(instance, previous, candidate, now_ms))
+            .collect::<Result<Vec<_>, String>>()?;
+        let start_capacity = self.stack_start_capacity(&observations)?;
+        let mut first_action = None;
+        let mut first_wait = None;
+        for (instance, observation) in self.instances.iter().zip(observations) {
+            let action = observation.next(&instance.policy)?;
+            match action {
+                RollingAction::Complete => {}
+                RollingAction::Rollback { .. } => {
+                    return Ok(RolloutProgressAction {
+                        instance: Some(instance.name.clone()),
+                        action,
+                    });
+                }
+                RollingAction::Wait { .. } => {
+                    first_wait.get_or_insert_with(|| RolloutProgressAction {
+                        instance: Some(instance.name.clone()),
+                        action,
+                    });
+                }
+                RollingAction::StartCandidate { mut ordinals } => {
+                    ordinals.truncate(start_capacity);
+                    if ordinals.is_empty() {
+                        first_wait.get_or_insert_with(|| RolloutProgressAction {
+                            instance: Some(instance.name.clone()),
+                            action: RollingAction::Wait {
+                                reason: RollingWaitReason::AvailabilityBudget,
+                            },
+                        });
+                        continue;
+                    }
+                    first_action.get_or_insert_with(|| RolloutProgressAction {
+                        instance: Some(instance.name.clone()),
+                        action: RollingAction::StartCandidate { ordinals },
+                    });
+                }
+                RollingAction::DrainPrevious { .. } => {
+                    first_action.get_or_insert_with(|| RolloutProgressAction {
+                        instance: Some(instance.name.clone()),
+                        action,
+                    });
+                }
+            }
+        }
+        if drains_pending {
+            return Ok(RolloutProgressAction {
+                instance: None,
+                action: RollingAction::Wait {
+                    reason: RollingWaitReason::AvailabilityBudget,
+                },
+            });
+        }
+        Ok(first_action
+            .or(first_wait)
+            .unwrap_or(RolloutProgressAction {
+                instance: None,
+                action: RollingAction::Complete,
+            }))
+    }
+
+    fn stack_start_capacity(&self, observations: &[RollingObservation]) -> Result<usize, String> {
+        let active = observations
+            .iter()
+            .try_fold(0_usize, |total, observation| {
+                total
+                    .checked_add(observation.previous_active.len())
+                    .and_then(|value| value.checked_add(observation.candidate_active.len()))
+                    .ok_or_else(|| "rollout active replica count overflow".to_string())
+            })?;
+        let previous = self
+            .instances
+            .iter()
+            .map(|instance| instance.previous_replicas)
+            .sum::<u16>();
+        let candidate = self
+            .instances
+            .iter()
+            .map(|instance| instance.candidate_replicas)
+            .sum::<u16>();
+        let surge = self
+            .instances
+            .iter()
+            .map(|instance| instance.policy.max_surge)
+            .sum::<u16>();
+        let active_limit = usize::from(previous.max(candidate))
+            .checked_add(usize::from(surge))
+            .ok_or_else(|| "rollout active replica limit overflow".to_string())?;
+        if active > active_limit
+            || active_limit > usize::from(super::MAX_STACK_TOTAL_ACTIVE_REPLICAS)
+        {
+            return Err("rollout exceeds its stack-wide active replica limit".into());
+        }
+        Ok(active_limit - active)
     }
 
     fn ensure_mutable(&self, now_ms: u64) -> Result<(), String> {
@@ -308,6 +500,113 @@ impl RolloutProgress {
         self.updated_at_ms = now_ms;
         self.last_progress_at_ms = now_ms;
         self.refresh()
+    }
+
+    fn validate_runtime(
+        &self,
+        status: Option<&StackRuntimeStatus>,
+        revision: Option<u64>,
+        generation: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(status) = status else {
+            return Ok(());
+        };
+        status.validate()?;
+        if status.stack != self.stack
+            || Some(status.revision) != revision
+            || Some(status.generation.as_str()) != generation
+        {
+            return Err("rollout runtime observation has the wrong generation".into());
+        }
+        Ok(())
+    }
+
+    fn instance_observation(
+        &self,
+        progress: &RolloutInstanceProgress,
+        previous: Option<&StackRuntimeStatus>,
+        candidate: Option<&StackRuntimeStatus>,
+        now_ms: u64,
+    ) -> Result<RollingObservation, String> {
+        let mut observation = RollingObservation {
+            previous_replicas: progress.previous_replicas,
+            candidate_replicas: progress.candidate_replicas,
+            candidate_active: progress.candidate_enabled.clone(),
+            elapsed_since_progress_ms: now_ms.saturating_sub(self.last_progress_at_ms),
+            ..RollingObservation::default()
+        };
+        if let Some(previous) = previous {
+            for replica in previous
+                .replicas
+                .iter()
+                .filter(|replica| replica.id.instance == progress.name)
+            {
+                if matches!(
+                    replica.phase,
+                    ReplicaPhase::Pending
+                        | ReplicaPhase::Starting
+                        | ReplicaPhase::Running
+                        | ReplicaPhase::Backoff
+                ) {
+                    observation.previous_active.insert(replica.id.ordinal);
+                }
+                if replica.phase == ReplicaPhase::Running && replica_ready(replica) {
+                    observation.previous_ready.insert(replica.id.ordinal);
+                }
+            }
+        }
+        if let Some(candidate) = candidate {
+            for replica in candidate
+                .replicas
+                .iter()
+                .filter(|replica| replica.id.instance == progress.name)
+            {
+                let enabled = progress.candidate_enabled.contains(&replica.id.ordinal);
+                if !enabled
+                    && matches!(
+                        replica.phase,
+                        ReplicaPhase::Starting
+                            | ReplicaPhase::Running
+                            | ReplicaPhase::Backoff
+                            | ReplicaPhase::Succeeded
+                    )
+                {
+                    return Err("candidate replica ran without scheduler authority".into());
+                }
+                if !enabled {
+                    continue;
+                }
+                if matches!(
+                    replica.phase,
+                    ReplicaPhase::Failed | ReplicaPhase::Exhausted | ReplicaPhase::Stopped
+                ) {
+                    observation.candidate_active.remove(&replica.id.ordinal);
+                    observation.candidate_terminal.insert(replica.id.ordinal);
+                    continue;
+                }
+                if replica.phase == ReplicaPhase::Succeeded {
+                    observation.candidate_ready.insert(replica.id.ordinal);
+                    observation.candidate_available.insert(replica.id.ordinal);
+                } else if replica.phase == ReplicaPhase::Running && replica_ready(replica) {
+                    observation.candidate_ready.insert(replica.id.ordinal);
+                    let ready_at = replica
+                        .probe
+                        .as_ref()
+                        .and_then(|probe| probe.ready_at_ms)
+                        .or(replica.started_at_ms)
+                        .ok_or_else(|| "ready candidate has no readiness timestamp".to_string())?;
+                    if now_ms.saturating_sub(ready_at)
+                        >= progress
+                            .policy
+                            .min_ready_ms
+                            .max(ROLLOUT_STABILITY_WINDOW_MS)
+                    {
+                        observation.candidate_available.insert(replica.id.ordinal);
+                    }
+                }
+            }
+        }
+        Ok(observation)
     }
 
     fn refresh(&mut self) -> Result<(), String> {
@@ -353,6 +652,13 @@ impl RolloutInstanceProgress {
         }
         Ok(())
     }
+}
+
+fn replica_ready(replica: &super::ReplicaRuntime) -> bool {
+    replica
+        .probe
+        .as_ref()
+        .is_none_or(|probe| probe.phase == ProbePhase::Ready)
 }
 
 impl EngineStore {
@@ -410,6 +716,24 @@ impl EngineStore {
         write_progress_file(&path, progress)
     }
 
+    pub(super) fn remove_terminal_rollout_progress(
+        &self,
+        rollout: &RolloutRecord,
+    ) -> Result<(), String> {
+        if !rollout.terminal() {
+            return Err("active rollout progress cannot be removed".into());
+        }
+        let path = self.rollout_progress_path(&rollout.stack)?;
+        recover_progress_file(&path)?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let progress = read_progress_file(&path)?;
+        validate_progress_against_rollout(&progress, rollout)?;
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        sync_parent_directory(&path)
+    }
+
     fn rollout_progress_path(&self, stack: &str) -> Result<PathBuf, String> {
         if !valid_name(stack) {
             return Err("stack name is invalid".into());
@@ -429,7 +753,9 @@ fn validate_progress_against_rollout(
     rollout.validate()?;
     if progress.rollout_id != rollout.rollout_id
         || progress.stack != rollout.stack
+        || progress.previous_revision != rollout.previous_revision
         || progress.previous_generation != rollout.previous_generation
+        || Some(progress.candidate_revision) != rollout.activated_revision
         || Some(progress.candidate_generation.as_str()) != rollout.activated_generation.as_deref()
     {
         return Err("rollout progress does not match its transaction checkpoint".into());
@@ -480,9 +806,11 @@ fn recover_progress_file(path: &Path) -> Result<(), String> {
     if !path.exists() && backup.exists() {
         read_progress_file(&backup)?;
         fs::rename(&backup, path).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     } else if path.exists() && backup.exists() {
         read_progress_file(path)?;
         fs::remove_file(backup).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     }
     Ok(())
 }
@@ -625,5 +953,195 @@ mod tests {
         assert_eq!(engine.rollout_progress("demo").unwrap(), Some(progress));
         assert!(path.exists());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn runtime_observations_drive_bounded_start_drain_and_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let rollout = activated_rollout(&engine);
+        let mut progress = engine
+            .begin_rollout_progress("demo", &rollout.rollout_id, 12)
+            .unwrap();
+        let mut previous = StackRuntimeStatus::from_plan(
+            rollout.previous_plan.as_ref().unwrap(),
+            rollout.previous_revision.unwrap(),
+            rollout.previous_generation.as_deref().unwrap(),
+            12,
+        )
+        .unwrap();
+        let mut candidate = StackRuntimeStatus::from_plan(
+            &rollout.candidate_plan,
+            rollout.activated_revision.unwrap(),
+            rollout.activated_generation.as_deref().unwrap(),
+            12,
+        )
+        .unwrap();
+
+        let decision = progress
+            .next_action(Some(&previous), Some(&candidate), 12)
+            .unwrap();
+        assert_eq!(
+            decision,
+            RolloutProgressAction {
+                instance: Some("app".into()),
+                action: RollingAction::StartCandidate {
+                    ordinals: vec![1, 2]
+                }
+            }
+        );
+        progress.enable_candidate("app", &[1, 2], 13).unwrap();
+        for ordinal in 1..=2 {
+            let id = super::super::ReplicaId {
+                instance: "app".into(),
+                ordinal,
+            };
+            let run_id = format!("{ordinal:064x}");
+            candidate.begin_start(&id, &run_id, 14).unwrap();
+            candidate.mark_running(&id, &run_id, 14).unwrap();
+        }
+        let decision = progress
+            .next_action(Some(&previous), Some(&candidate), 2_014)
+            .unwrap();
+        assert_eq!(
+            decision.action,
+            RollingAction::DrainPrevious {
+                ordinals: vec![1, 2],
+                timeout_ms: 30_000
+            }
+        );
+        progress
+            .request_previous_drain("app", &[1, 2], 2_014)
+            .unwrap();
+        for ordinal in 1..=2 {
+            previous
+                .mark_drained(
+                    &super::super::ReplicaId {
+                        instance: "app".into(),
+                        ordinal,
+                    },
+                    None,
+                    2_015,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            progress
+                .acknowledge_drained(Some(&previous), 2_015)
+                .unwrap(),
+            2
+        );
+        assert!(progress.instances[0].previous_draining.is_empty());
+    }
+
+    #[test]
+    fn terminal_candidate_rolls_back_before_other_instance_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let rollout = activated_rollout(&engine);
+        let mut progress = engine
+            .begin_rollout_progress("demo", &rollout.rollout_id, 12)
+            .unwrap();
+        progress.enable_candidate("app", &[1], 13).unwrap();
+        let previous = StackRuntimeStatus::from_plan(
+            rollout.previous_plan.as_ref().unwrap(),
+            rollout.previous_revision.unwrap(),
+            rollout.previous_generation.as_deref().unwrap(),
+            13,
+        )
+        .unwrap();
+        let mut candidate = StackRuntimeStatus::from_plan(
+            &rollout.candidate_plan,
+            rollout.activated_revision.unwrap(),
+            rollout.activated_generation.as_deref().unwrap(),
+            13,
+        )
+        .unwrap();
+        let id = super::super::ReplicaId {
+            instance: "app".into(),
+            ordinal: 1,
+        };
+        let mut now_ms = 14;
+        for attempt in 1..=3 {
+            let run_id = format!("{attempt:064x}");
+            candidate.begin_start(&id, &run_id, now_ms).unwrap();
+            candidate
+                .mark_exit(&id, &run_id, false, Some(1), "failed", now_ms + 1)
+                .unwrap();
+            now_ms = candidate
+                .replicas
+                .iter()
+                .find(|replica| replica.id == id)
+                .and_then(|replica| replica.next_start_at_ms)
+                .unwrap_or(now_ms + 2);
+        }
+        assert!(matches!(
+            progress
+                .next_action(Some(&previous), Some(&candidate), now_ms)
+                .unwrap()
+                .action,
+            RollingAction::Rollback { .. }
+        ));
+    }
+
+    #[test]
+    fn a_new_transaction_removes_only_matching_terminal_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let rollout = activated_rollout(&engine);
+        engine
+            .begin_rollout_progress("demo", &rollout.rollout_id, 12)
+            .unwrap();
+        engine
+            .rollback_rollout("demo", &rollout.rollout_id, 13)
+            .unwrap();
+        let next = engine
+            .prepare_rollout(&plan("demo", 'c', 2), false, 14)
+            .unwrap();
+
+        assert_eq!(next.phase, RolloutPhase::Prepared);
+        assert!(engine.rollout_progress("demo").unwrap().is_none());
+    }
+
+    #[test]
+    fn disjoint_topologies_share_one_stack_wide_surge_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let mut previous_plan = plan("demo", 'a', MAX_STACK_REPLICAS);
+        previous_plan.instances[0].name = "old-app".into();
+        previous_plan.plan_sha256 = previous_plan.computed_sha256().unwrap();
+        let mut candidate_plan = plan("demo", 'b', MAX_STACK_REPLICAS);
+        candidate_plan.instances[0].name = "new-app".into();
+        candidate_plan.plan_sha256 = candidate_plan.computed_sha256().unwrap();
+        engine.apply(&previous_plan, false).unwrap();
+        let prepared = engine.prepare_rollout(&candidate_plan, false, 10).unwrap();
+        let rollout = engine
+            .activate_rollout("demo", &prepared.rollout_id, 11)
+            .unwrap();
+        let progress = engine
+            .begin_rollout_progress("demo", &rollout.rollout_id, 12)
+            .unwrap();
+        let previous = StackRuntimeStatus::from_plan(
+            &previous_plan,
+            rollout.previous_revision.unwrap(),
+            rollout.previous_generation.as_deref().unwrap(),
+            12,
+        )
+        .unwrap();
+        let candidate = StackRuntimeStatus::from_plan(
+            &candidate_plan,
+            rollout.activated_revision.unwrap(),
+            rollout.activated_generation.as_deref().unwrap(),
+            12,
+        )
+        .unwrap();
+
+        let decision = progress
+            .next_action(Some(&previous), Some(&candidate), 12)
+            .unwrap();
+        let RollingAction::StartCandidate { ordinals } = decision.action else {
+            panic!("expected a bounded candidate start")
+        };
+        assert_eq!(ordinals, vec![1, 2]);
     }
 }

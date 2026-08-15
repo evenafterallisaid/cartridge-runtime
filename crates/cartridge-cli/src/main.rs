@@ -27,11 +27,11 @@ use cartridge_dev::{
     source_fingerprint,
 };
 use cartridge_engine::{
-    DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, HealthProbeSpec,
-    MAX_PROBE_ENVELOPE_BYTES, PlannedInstance, ProbeChannelKey, ProbeEnvelope, ProbeSignal,
-    ProbeSignalKind, ROLLOUT_STABILITY_WINDOW_MS, ReplicaId, ReplicaPhase, RolloutPhase,
-    RolloutStatus, SandboxPolicy, StackCapability, StackHealthReport, StackHealthState,
-    StackManifest, StackPlan, StackRuntimeStatus, daemon_request_with_timeout,
+    DaemonEndpoint, DaemonLease, DaemonRequest, DaemonResponse, EngineStore, GenerationRole,
+    HealthProbeSpec, MAX_PROBE_ENVELOPE_BYTES, PlannedInstance, ProbeChannelKey, ProbeEnvelope,
+    ProbeSignal, ProbeSignalKind, ROLLOUT_STABILITY_WINDOW_MS, ReplicaId, ReplicaPhase,
+    RolloutPhase, RolloutStatus, SandboxPolicy, StackCapability, StackHealthReport,
+    StackHealthState, StackManifest, StackPlan, StackRuntimeStatus, daemon_request_with_timeout,
 };
 use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
@@ -77,6 +77,8 @@ const WORKER_PROBE_RUN_ENV: &str = "CARTRIDGE_PROBE_RUN";
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
     package: &'a Path,
+    expected_package_sha256: Option<&'a str>,
+    expected_package_bytes: Option<u64>,
     trace: Option<&'a Path>,
     state_dir: Option<&'a Path>,
     from_snapshot: Option<&'a Path>,
@@ -374,6 +376,10 @@ enum Command {
     #[command(name = "__worker-run", hide = true)]
     WorkerRun {
         package: PathBuf,
+        #[arg(long, hide = true)]
+        expected_package_sha256: Option<String>,
+        #[arg(long, hide = true)]
+        expected_package_bytes: Option<u64>,
         #[arg(long)]
         trace: Option<PathBuf>,
         #[arg(long, conflicts_with = "from_snapshot")]
@@ -795,9 +801,11 @@ enum StackCommand {
         #[arg(
             long,
             default_value_t = DEFAULT_SUPERVISOR_WORKERS,
-            value_parser = clap::value_parser!(u16).range(1..=256)
+            value_parser = clap::value_parser!(u16).range(1..=320)
         )]
         max_workers: u16,
+        #[arg(long, hide = true)]
+        generation: Option<String>,
         #[arg(long, hide = true)]
         daemon_instance: Option<String>,
         #[arg(long)]
@@ -1437,6 +1445,8 @@ fn run_cli() -> Result<()> {
             }
             supervised_run_command(RunCommandOptions {
                 package: &package,
+                expected_package_sha256: None,
+                expected_package_bytes: None,
                 trace: trace.as_deref(),
                 state_dir: state_dir.as_deref(),
                 from_snapshot: from_snapshot.as_deref(),
@@ -1461,6 +1471,8 @@ fn run_cli() -> Result<()> {
         } => supervised_replay_command(&package, &trace, media_dir.as_deref(), &args),
         Command::WorkerRun {
             package,
+            expected_package_sha256,
+            expected_package_bytes,
             trace,
             state_dir,
             from_snapshot,
@@ -1474,6 +1486,10 @@ fn run_cli() -> Result<()> {
             args,
         } => {
             require_worker_context()?;
+            let expected_package_sha256 = expected_package_sha256
+                .context("worker package digest authorization is missing")?;
+            let expected_package_bytes =
+                expected_package_bytes.context("worker package length authorization is missing")?;
             let permission_ceiling = capability_ceiling.map(permissions_from_mask).transpose()?;
             let limit_ceiling = std::env::var(WORKER_LIMIT_CEILING_ENV)
                 .ok()
@@ -1486,6 +1502,8 @@ fn run_cli() -> Result<()> {
             }
             run_command(RunCommandOptions {
                 package: &package,
+                expected_package_sha256: Some(&expected_package_sha256),
+                expected_package_bytes: Some(expected_package_bytes),
                 trace: trace.as_deref(),
                 state_dir: state_dir.as_deref(),
                 from_snapshot: from_snapshot.as_deref(),
@@ -2208,6 +2226,8 @@ fn conformance_command(package: &Path, json: bool, args: &[String]) -> Result<()
     let trace = directory.join("run.trace.json");
     let run = supervised_run_command(RunCommandOptions {
         package,
+        expected_package_sha256: None,
+        expected_package_bytes: None,
         trace: Some(&trace),
         state_dir: None,
         from_snapshot: None,
@@ -2320,6 +2340,8 @@ fn run_dev_build(
         .filter(|_| manifest.permissions.storage);
     let result = supervised_run_command(RunCommandOptions {
         package: &package,
+        expected_package_sha256: None,
+        expected_package_bytes: None,
         trace: None,
         state_dir: state.as_deref(),
         from_snapshot: None,
@@ -2585,6 +2607,7 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
             library,
             root,
             max_workers,
+            generation,
             daemon_instance,
             json,
         } => supervise_stack(
@@ -2592,6 +2615,7 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
             &root,
             &library,
             usize::from(max_workers),
+            generation.as_deref(),
             daemon_instance.as_deref(),
             json,
         ),
@@ -2687,6 +2711,8 @@ fn run_stack_command(command: StackCommand) -> Result<()> {
 
 struct StackWorkerTemplate {
     package: PathBuf,
+    package_sha256: String,
+    package_bytes: u64,
     state: PathBuf,
     args: Vec<String>,
     permissions: Permissions,
@@ -2718,6 +2744,12 @@ struct ActiveProbe {
 
 #[derive(Default)]
 struct ActiveStackWorkers(BTreeMap<ReplicaId, ActiveStackWorker>);
+
+struct GenerationControls {
+    role: GenerationRole,
+    candidate_enabled: BTreeSet<ReplicaId>,
+    previous_draining: BTreeMap<ReplicaId, u64>,
+}
 
 impl ActiveStackWorkers {
     fn terminate_all(&mut self) {
@@ -2751,6 +2783,7 @@ fn supervise_stack(
     root: &Path,
     library_root: &Path,
     max_workers: usize,
+    requested_generation: Option<&str>,
     daemon_instance: Option<&str>,
     json: bool,
 ) -> Result<()> {
@@ -2769,21 +2802,35 @@ fn supervise_stack(
     }
     let now = current_time_ms()?;
     let engine = EngineStore::open(root).map_err(anyhow::Error::msg)?;
-    let (revision, generation, plan) = engine
-        .desired_plan(stack)
-        .map_err(anyhow::Error::msg)?
-        .context("stack was removed and has no runnable generation")?;
+    let target = if let Some(generation) = requested_generation {
+        engine
+            .generation_target(stack, generation)
+            .map_err(anyhow::Error::msg)?
+            .context("requested runtime generation is not authorized")?
+    } else {
+        let (_, generation, _) = engine
+            .desired_plan(stack)
+            .map_err(anyhow::Error::msg)?
+            .context("stack was removed and has no runnable generation")?;
+        engine
+            .generation_target(stack, &generation)
+            .map_err(anyhow::Error::msg)?
+            .context("desired runtime generation is not authorized")?
+    };
+    let revision = target.revision;
+    let generation = target.generation;
+    let plan = target.plan;
     let _lease = engine
-        .acquire_supervisor_lease(stack)
+        .acquire_generation_supervisor_lease(stack, &generation)
         .map_err(anyhow::Error::msg)?;
     engine
-        .clear_probe_channels(stack)
+        .clear_probe_channels_for_generation(stack, &generation)
         .map_err(anyhow::Error::msg)?;
     let library = Library::open(library_root).map_err(anyhow::Error::msg)?;
     plan.verify_installed(&library)
         .map_err(anyhow::Error::msg)?;
     let mut status = engine
-        .prepare_runtime_status(stack, now)
+        .prepare_runtime_status_for_generation(stack, &generation, now)
         .map_err(anyhow::Error::msg)?;
     let templates = stack_worker_templates(&engine, &library, &plan, &generation)?;
     drop(library);
@@ -2791,6 +2838,7 @@ fn supervise_stack(
 
     let executable = std::env::current_exe().context("could not locate the cartridge worker")?;
     let mut active = ActiveStackWorkers::default();
+    let mut controls = generation_controls(root, stack, &generation)?;
     let interrupted = Arc::new(AtomicBool::new(false));
     let signal = interrupted.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Release))
@@ -2810,7 +2858,7 @@ fn supervise_stack(
         }
         if Instant::now() >= next_desired_check {
             let generation_is_current =
-                runtime_generation_is_current(root, stack, revision, &generation)?;
+                runtime_generation_is_authorized(root, stack, revision, &generation)?;
             let daemon_is_current = daemon_instance
                 .map(|instance| daemon_owner_is_active(root, instance))
                 .transpose()?
@@ -2826,11 +2874,20 @@ fn supervise_stack(
                 }
                 return Ok(());
             }
+            controls = generation_controls(root, stack, &generation)?;
             next_desired_check = Instant::now() + DESIRED_STATE_POLL_INTERVAL;
         }
 
         let mut changed = false;
         let now_ms = current_time_ms()?;
+        if apply_rollout_drains(
+            &mut active,
+            &mut status,
+            &controls.previous_draining,
+            now_ms,
+        )? {
+            persist_runtime_status(root, &status)?;
+        }
         let ids = active.0.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             let mut probe_failure = None;
@@ -3035,11 +3092,12 @@ fn supervise_stack(
         }
 
         while active.0.len() < max_workers {
-            let Some(id) = status
-                .eligible_starts(now_ms)
-                .into_iter()
-                .find(|id| !active.0.contains_key(id))
-            else {
+            let Some(id) = status.eligible_starts(now_ms).into_iter().find(|id| {
+                !active.0.contains_key(id)
+                    && !controls.previous_draining.contains_key(id)
+                    && (controls.role != GenerationRole::RolloutCandidate
+                        || controls.candidate_enabled.contains(id))
+            }) else {
                 break;
             };
             let replica = status
@@ -3169,6 +3227,103 @@ fn stop_active_workers(
     persist_runtime_status(root, status)
 }
 
+fn generation_controls(root: &Path, stack: &str, generation: &str) -> Result<GenerationControls> {
+    let engine = EngineStore::open(root).map_err(anyhow::Error::msg)?;
+    let target = engine
+        .generation_target(stack, generation)
+        .map_err(anyhow::Error::msg)?
+        .context("runtime generation is no longer authorized")?;
+    let mut controls = GenerationControls {
+        role: target.role,
+        candidate_enabled: BTreeSet::new(),
+        previous_draining: BTreeMap::new(),
+    };
+    if target.role == GenerationRole::Desired {
+        return Ok(controls);
+    }
+    let progress = engine.rollout_progress(stack).map_err(anyhow::Error::msg)?;
+    let Some(progress) = progress else {
+        return Ok(controls);
+    };
+    if target.rollout_id.as_deref() != Some(progress.rollout_id.as_str()) {
+        bail!("runtime generation rollout identity changed");
+    }
+    for instance in progress.instances {
+        if target.role == GenerationRole::RolloutCandidate {
+            controls
+                .candidate_enabled
+                .extend(
+                    instance
+                        .candidate_enabled
+                        .into_iter()
+                        .map(|ordinal| ReplicaId {
+                            instance: instance.name.clone(),
+                            ordinal,
+                        }),
+                );
+        } else {
+            controls
+                .previous_draining
+                .extend(
+                    instance
+                        .previous_draining
+                        .into_iter()
+                        .map(|(ordinal, intent)| {
+                            (
+                                ReplicaId {
+                                    instance: instance.name.clone(),
+                                    ordinal,
+                                },
+                                intent.deadline_at_ms,
+                            )
+                        }),
+                );
+        }
+    }
+    Ok(controls)
+}
+
+fn apply_rollout_drains(
+    active: &mut ActiveStackWorkers,
+    status: &mut StackRuntimeStatus,
+    draining: &BTreeMap<ReplicaId, u64>,
+    now_ms: u64,
+) -> Result<bool> {
+    let mut changed = false;
+    for (id, deadline_at_ms) in draining {
+        let observed_at_ms = current_time_ms()?.max(now_ms);
+        if status
+            .replicas
+            .iter()
+            .find(|replica| replica.id == *id)
+            .is_some_and(|replica| replica.phase == ReplicaPhase::Stopped)
+        {
+            continue;
+        }
+        if let Some(mut worker) = active.0.remove(id) {
+            let grace_ms = deadline_at_ms
+                .saturating_sub(observed_at_ms)
+                .min(u64::try_from(TERMINATION_GRACE.as_millis()).unwrap_or(u64::MAX));
+            if worker.child.try_wait()?.is_none() {
+                worker
+                    .child
+                    .terminate(Duration::from_millis(grace_ms))
+                    .context("could not drain rollout worker")?;
+            }
+            cleanup_probe_file(&worker);
+            status
+                .mark_drained(id, Some(&worker.run_id), observed_at_ms)
+                .map_err(anyhow::Error::msg)?;
+        } else {
+            status
+                .mark_drained(id, None, observed_at_ms)
+                .map_err(anyhow::Error::msg)?;
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn poll_worker_probe(
     worker: &mut ActiveStackWorker,
 ) -> std::result::Result<Option<ProbeSignal>, String> {
@@ -3239,6 +3394,8 @@ fn stack_worker_templates(
                 id,
                 StackWorkerTemplate {
                     package: record.path.clone(),
+                    package_sha256: record.package_sha256.clone(),
+                    package_bytes: record.package_bytes,
                     state,
                     args: instance.args.clone(),
                     permissions: stack_permissions(instance),
@@ -3275,6 +3432,10 @@ fn spawn_stack_worker(
     let mut arguments = vec![
         OsString::from("__worker-run"),
         template.package.as_os_str().to_owned(),
+        OsString::from("--expected-package-sha256"),
+        OsString::from(&template.package_sha256),
+        OsString::from("--expected-package-bytes"),
+        OsString::from(template.package_bytes.to_string()),
         OsString::from("--state-dir"),
         template.state.as_os_str().to_owned(),
         OsString::from("--local-storage-authority"),
@@ -3302,7 +3463,7 @@ fn spawn_stack_worker(
     spawn_contained(&mut command, true).context("could not start the cartridge worker")
 }
 
-fn runtime_generation_is_current(
+fn runtime_generation_is_authorized(
     root: &Path,
     stack: &str,
     revision: u64,
@@ -3310,11 +3471,9 @@ fn runtime_generation_is_current(
 ) -> Result<bool> {
     Ok(EngineStore::open(root)
         .map_err(anyhow::Error::msg)?
-        .desired_plan(stack)
+        .generation_target(stack, generation)
         .map_err(anyhow::Error::msg)?
-        .is_some_and(|(current_revision, current_generation, _)| {
-            current_revision == revision && current_generation == generation
-        }))
+        .is_some_and(|target| target.revision == revision && target.generation == generation))
 }
 
 fn daemon_owner_is_active(root: &Path, instance: &str) -> Result<bool> {
@@ -3335,7 +3494,7 @@ fn valid_daemon_instance(value: &str) -> bool {
 fn persist_runtime_status(root: &Path, status: &StackRuntimeStatus) -> Result<()> {
     EngineStore::open(root)
         .map_err(anyhow::Error::msg)?
-        .save_runtime_status(status)
+        .save_runtime_status_for_generation(status)
         .map_err(anyhow::Error::msg)
 }
 
@@ -3486,6 +3645,8 @@ fn library_run_command(
     let state = root.join("state");
     let result = supervised_run_command(RunCommandOptions {
         package: &package,
+        expected_package_sha256: None,
+        expected_package_bytes: None,
         trace,
         state_dir: Some(&state),
         from_snapshot: None,
@@ -4652,9 +4813,19 @@ fn hex_array(value: &str) -> Result<[u8; 32]> {
 }
 
 fn supervised_run_command(options: RunCommandOptions<'_>) -> Result<()> {
+    let archive = CartridgeArchive::open(options.package).with_context(|| {
+        format!(
+            "could not validate {} before execution",
+            options.package.display()
+        )
+    })?;
     let mut worker_args = vec![
         OsString::from("__worker-run"),
         options.package.as_os_str().to_owned(),
+        OsString::from("--expected-package-sha256"),
+        OsString::from(&archive.package_sha256),
+        OsString::from("--expected-package-bytes"),
+        OsString::from(archive.package_bytes.to_string()),
     ];
     push_path_option(&mut worker_args, "--trace", options.trace);
     push_path_option(&mut worker_args, "--state-dir", options.state_dir);
@@ -5146,12 +5317,18 @@ fn read_bounded_json(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
+    let archive = CartridgeArchive::open(options.package)
+        .with_context(|| format!("could not inspect {}", options.package.display()))?;
+    verify_worker_package_identity(
+        &archive.package_sha256,
+        archive.package_bytes,
+        options.expected_package_sha256,
+        options.expected_package_bytes,
+    )?;
     let input: Vec<InputEvent> = read_optional_event_file(options.input, "input")?;
     let midi: Vec<MidiEvent> = read_optional_event_file(options.midi, "MIDI")?;
     let mut branch = None;
     let report = if let Some(path) = options.from_snapshot {
-        let archive = CartridgeArchive::open(options.package)
-            .with_context(|| format!("could not inspect {}", options.package.display()))?;
         let snapshot = StorageSnapshot::read(path)
             .with_context(|| format!("could not read snapshot {}", path.display()))?;
         let effective_limits = options.limit_ceiling.map_or_else(
@@ -5187,7 +5364,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
         let runtime = configure_health_reporter(runtime)?;
-        runtime.run_file(options.package, options.args)?
+        runtime.run(archive, options.args)?
     };
     println!("{}", terminal_safe(&report.output));
     eprintln!("fuel consumed: {}", report.fuel_consumed);
@@ -5219,6 +5396,24 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
             summary.bytes,
             path.display()
         );
+    }
+    Ok(())
+}
+
+fn verify_worker_package_identity(
+    actual_sha256: &str,
+    actual_bytes: u64,
+    expected_sha256: Option<&str>,
+    expected_bytes: Option<u64>,
+) -> Result<()> {
+    match (expected_sha256, expected_bytes) {
+        (Some(expected_sha256), Some(expected_bytes)) => {
+            if actual_sha256 != expected_sha256 || actual_bytes != expected_bytes {
+                bail!("package changed after the worker was authorized");
+            }
+        }
+        (None, None) => {}
+        _ => bail!("worker package identity is incomplete"),
     }
     Ok(())
 }
@@ -6048,6 +6243,14 @@ fn print_resolution(plan: &ResolutionPlan) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_package_identity_fails_closed() {
+        assert!(verify_worker_package_identity("aa", 12, Some("aa"), Some(12)).is_ok());
+        assert!(verify_worker_package_identity("aa", 12, Some("bb"), Some(12)).is_err());
+        assert!(verify_worker_package_identity("aa", 12, Some("aa"), Some(13)).is_err());
+        assert!(verify_worker_package_identity("aa", 12, Some("aa"), None).is_err());
+    }
 
     #[test]
     fn hidden_worker_limit_ceiling_is_strict_and_bounded() {

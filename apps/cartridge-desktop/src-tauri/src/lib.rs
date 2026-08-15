@@ -422,6 +422,22 @@ fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
     pending
         .persist(path)
         .map_err(|error| format!("could not commit desktop settings: {}", error.error))?;
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "desktop settings path has no parent".to_string())?;
+    fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync desktop settings directory: {error}"))
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_: &Path) -> Result<(), String> {
     Ok(())
 }
 

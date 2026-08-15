@@ -68,7 +68,8 @@ impl RollingUpdatePolicy {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RollingObservation {
-    pub replicas: u16,
+    pub previous_replicas: u16,
+    pub candidate_replicas: u16,
     pub previous_active: BTreeSet<u16>,
     pub previous_ready: BTreeSet<u16>,
     pub candidate_active: BTreeSet<u16>,
@@ -102,19 +103,34 @@ pub enum RollingAction {
 
 impl RollingObservation {
     pub fn validate(&self, policy: &RollingUpdatePolicy) -> Result<(), String> {
-        policy.validate(self.replicas)?;
-        let valid_ordinal = |ordinal: &u16| *ordinal > 0 && *ordinal <= self.replicas;
-        let sets = [
-            &self.previous_active,
-            &self.previous_ready,
-            &self.candidate_active,
-            &self.candidate_ready,
-            &self.candidate_available,
-            &self.candidate_terminal,
-        ];
-        if sets
-            .into_iter()
-            .any(|values| values.iter().any(|ordinal| !valid_ordinal(ordinal)))
+        let policy_replicas = self.previous_replicas.max(self.candidate_replicas);
+        policy.validate(policy_replicas)?;
+        let valid_previous = |ordinal: &u16| *ordinal > 0 && *ordinal <= self.previous_replicas;
+        let valid_candidate = |ordinal: &u16| *ordinal > 0 && *ordinal <= self.candidate_replicas;
+        if self
+            .previous_active
+            .iter()
+            .any(|value| !valid_previous(value))
+            || self
+                .previous_ready
+                .iter()
+                .any(|value| !valid_previous(value))
+            || self
+                .candidate_active
+                .iter()
+                .any(|value| !valid_candidate(value))
+            || self
+                .candidate_ready
+                .iter()
+                .any(|value| !valid_candidate(value))
+            || self
+                .candidate_available
+                .iter()
+                .any(|value| !valid_candidate(value))
+            || self
+                .candidate_terminal
+                .iter()
+                .any(|value| !valid_candidate(value))
             || !self.previous_ready.is_subset(&self.previous_active)
             || !self.candidate_ready.is_subset(&self.candidate_active)
             || !self.candidate_available.is_subset(&self.candidate_ready)
@@ -127,7 +143,7 @@ impl RollingObservation {
             .len()
             .checked_add(self.candidate_active.len())
             .ok_or_else(|| "rolling update active count overflow".to_string())?;
-        let limit = usize::from(self.replicas)
+        let limit = usize::from(policy_replicas)
             .checked_add(usize::from(policy.max_surge))
             .ok_or_else(|| "rolling update surge count overflow".to_string())?;
         if active > limit {
@@ -143,7 +159,7 @@ impl RollingObservation {
                 reason: RollingRollbackReason::CandidateFailed,
             });
         }
-        let desired = usize::from(self.replicas);
+        let desired = usize::from(self.candidate_replicas);
         if self.previous_active.is_empty() && self.candidate_available.len() == desired {
             return Ok(RollingAction::Complete);
         }
@@ -173,16 +189,17 @@ impl RollingObservation {
     }
 
     fn start_action(&self, policy: &RollingUpdatePolicy) -> Option<RollingAction> {
-        let desired = usize::from(self.replicas);
+        let desired = usize::from(self.candidate_replicas);
         let active = self.previous_active.len() + self.candidate_active.len();
-        let capacity = desired + usize::from(policy.max_surge);
+        let capacity = usize::from(self.previous_replicas.max(self.candidate_replicas))
+            + usize::from(policy.max_surge);
         let count = desired
             .saturating_sub(self.candidate_active.len())
             .min(capacity.saturating_sub(active));
         if count == 0 {
             return None;
         }
-        let ordinals = (1..=self.replicas)
+        let ordinals = (1..=self.candidate_replicas)
             .filter(|ordinal| {
                 !self.candidate_active.contains(ordinal)
                     && !self.candidate_terminal.contains(ordinal)
@@ -196,7 +213,7 @@ impl RollingObservation {
         if self.previous_active.is_empty() {
             return None;
         }
-        let desired = usize::from(self.replicas);
+        let desired = usize::from(self.candidate_replicas);
         let minimum_available = desired.saturating_sub(usize::from(policy.max_unavailable));
         let available = self.previous_ready.len() + self.candidate_available.len();
         let ready_budget = available.saturating_sub(minimum_available);
@@ -228,7 +245,8 @@ mod tests {
     fn initial(replicas: u16) -> RollingObservation {
         let previous = (1..=replicas).collect::<BTreeSet<_>>();
         RollingObservation {
-            replicas,
+            previous_replicas: replicas,
+            candidate_replicas: replicas,
             previous_active: previous.clone(),
             previous_ready: previous,
             ..RollingObservation::default()
@@ -343,7 +361,8 @@ mod tests {
     fn only_fully_available_candidate_generations_complete() {
         let policy = RollingUpdatePolicy::default();
         let mut state = RollingObservation {
-            replicas: 2,
+            previous_replicas: 0,
+            candidate_replicas: 2,
             candidate_active: ordinals(&[1, 2]),
             candidate_ready: ordinals(&[1, 2]),
             candidate_available: ordinals(&[1, 2]),
@@ -402,7 +421,8 @@ mod tests {
                                                 continue;
                                             }
                                             let state = RollingObservation {
-                                                replicas,
+                                                previous_replicas: replicas,
+                                                candidate_replicas: replicas,
                                                 previous_active: previous_active.clone(),
                                                 previous_ready: previous_ready.clone(),
                                                 candidate_active: candidate_active.clone(),
@@ -436,7 +456,10 @@ mod tests {
                 );
                 assert!(
                     state.previous_active.len() + state.candidate_active.len() + ordinals.len()
-                        <= usize::from(state.replicas + policy.max_surge)
+                        <= usize::from(
+                            state.previous_replicas.max(state.candidate_replicas)
+                                + policy.max_surge
+                        )
                 );
             }
             RollingAction::DrainPrevious { ordinals, .. } => {
@@ -451,18 +474,83 @@ mod tests {
                     .filter(|ordinal| state.previous_ready.contains(ordinal))
                     .count();
                 let after_available = before_available - ready_drained;
-                let minimum = usize::from(state.replicas.saturating_sub(policy.max_unavailable));
+                let minimum = usize::from(
+                    state
+                        .candidate_replicas
+                        .saturating_sub(policy.max_unavailable),
+                );
                 assert!(after_available >= minimum || after_available == before_available);
             }
             RollingAction::Complete => {
                 assert!(state.previous_active.is_empty());
-                assert_eq!(state.candidate_available.len(), usize::from(state.replicas));
+                assert_eq!(
+                    state.candidate_available.len(),
+                    usize::from(state.candidate_replicas)
+                );
             }
             RollingAction::Wait { .. } => {}
             RollingAction::Rollback { .. } => {
                 panic!("a live, non-expired candidate rolled back")
             }
         }
+    }
+
+    #[test]
+    fn topology_changes_start_and_drain_only_valid_ordinals() {
+        let policy = RollingUpdatePolicy::default();
+        let scale_up = RollingObservation {
+            previous_replicas: 1,
+            candidate_replicas: 3,
+            previous_active: ordinals(&[1]),
+            previous_ready: ordinals(&[1]),
+            ..RollingObservation::default()
+        };
+        assert_eq!(
+            scale_up.next(&policy).unwrap(),
+            RollingAction::StartCandidate {
+                ordinals: vec![1, 2, 3]
+            }
+        );
+
+        let scale_down = RollingObservation {
+            previous_replicas: 3,
+            candidate_replicas: 1,
+            previous_active: ordinals(&[1, 2, 3]),
+            previous_ready: ordinals(&[1, 2, 3]),
+            ..RollingObservation::default()
+        };
+        assert_eq!(
+            scale_down.next(&policy).unwrap(),
+            RollingAction::StartCandidate { ordinals: vec![1] }
+        );
+        let scale_down_ready = RollingObservation {
+            candidate_active: ordinals(&[1]),
+            candidate_ready: ordinals(&[1]),
+            candidate_available: ordinals(&[1]),
+            ..scale_down
+        };
+        assert_eq!(
+            scale_down_ready.next(&policy).unwrap(),
+            RollingAction::DrainPrevious {
+                ordinals: vec![1, 2, 3],
+                timeout_ms: policy.drain_timeout_ms
+            }
+        );
+
+        let removal = RollingObservation {
+            previous_replicas: 2,
+            candidate_replicas: 0,
+            previous_active: ordinals(&[1, 2]),
+            previous_ready: ordinals(&[1, 2]),
+            ..RollingObservation::default()
+        };
+        assert_eq!(
+            removal.next(&policy).unwrap(),
+            RollingAction::DrainPrevious {
+                ordinals: vec![1, 2],
+                timeout_ms: policy.drain_timeout_ms
+            }
+        );
     }
 
     fn from_mask(mask: u16, replicas: u16) -> BTreeSet<u16> {

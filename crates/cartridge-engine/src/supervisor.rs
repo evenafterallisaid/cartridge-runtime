@@ -415,6 +415,37 @@ impl StackRuntimeStatus {
         self.refresh()
     }
 
+    pub fn mark_drained(
+        &mut self,
+        id: &ReplicaId,
+        run_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if now_ms < self.observed_at_ms {
+            return Err("runtime observation time cannot move backwards".into());
+        }
+        let replica = self.replica_mut(id)?;
+        let active = matches!(
+            replica.phase,
+            ReplicaPhase::Starting | ReplicaPhase::Running
+        );
+        if replica.desired != DesiredState::Running
+            || replica.phase == ReplicaPhase::Stopped
+            || active != run_id.is_some()
+            || active && replica.run_id.as_deref() != run_id
+        {
+            return Err("stale or unexpected replica drain".into());
+        }
+        replica.phase = ReplicaPhase::Stopped;
+        replica.run_id = None;
+        replica.finished_at_ms = Some(now_ms);
+        replica.next_start_at_ms = None;
+        replica.last_exit_code = None;
+        replica.detail = Some("drained by rollout".into());
+        self.observed_at_ms = now_ms;
+        self.refresh()
+    }
+
     pub fn recover_interrupted(&mut self, now_ms: u64) -> Result<usize, String> {
         if now_ms < self.observed_at_ms {
             return Err("runtime observation time cannot move backwards".into());
@@ -493,6 +524,23 @@ fn validate_replica(replica: &ReplicaRuntime) -> Result<(), String> {
     let waiting = replica.phase == ReplicaPhase::Backoff;
     let pending = replica.phase == ReplicaPhase::Pending;
     let stopped = replica.phase == ReplicaPhase::Stopped;
+    let planned_stopped = stopped
+        && replica.desired == DesiredState::Stopped
+        && replica.attempt == 0
+        && replica.run_id.is_none()
+        && replica.started_at_ms.is_none()
+        && replica.finished_at_ms.is_none()
+        && replica.next_start_at_ms.is_none()
+        && replica.last_exit_code.is_none()
+        && replica.detail.is_none();
+    let drained = stopped
+        && replica.desired == DesiredState::Running
+        && replica.run_id.is_none()
+        && replica.finished_at_ms.is_some()
+        && replica.next_start_at_ms.is_none()
+        && replica.last_exit_code.is_none()
+        && replica.detail.as_deref() == Some("drained by rollout")
+        && (replica.attempt == 0) == replica.started_at_ms.is_none();
     let terminal = matches!(
         replica.phase,
         ReplicaPhase::Succeeded | ReplicaPhase::Failed | ReplicaPhase::Exhausted
@@ -529,16 +577,8 @@ fn validate_replica(replica: &ReplicaRuntime) -> Result<(), String> {
                 || replica.next_start_at_ms.is_some()
                 || replica.last_exit_code.is_some()
                 || replica.detail.is_some()))
-        || (stopped
-            && (replica.desired != DesiredState::Stopped
-                || replica.attempt != 0
-                || replica.run_id.is_some()
-                || replica.started_at_ms.is_some()
-                || replica.finished_at_ms.is_some()
-                || replica.next_start_at_ms.is_some()
-                || replica.last_exit_code.is_some()
-                || replica.detail.is_some()))
-        || (replica.desired == DesiredState::Stopped && !stopped)
+        || (stopped && !planned_stopped && !drained)
+        || (replica.desired == DesiredState::Stopped && !planned_stopped)
         || (terminal
             && (replica.attempt == 0
                 || replica.started_at_ms.is_none()

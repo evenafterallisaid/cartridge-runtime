@@ -83,29 +83,40 @@ impl DeveloperKey {
 
     pub fn read(path: &Path) -> Result<Self, String> {
         let mut document: DeveloperKeyFile = read_json(path, 16 * 1024)?;
-        if document.format_version != SIGNATURE_FORMAT_VERSION || document.algorithm != "ed25519" {
-            return Err("unsupported developer key format".into());
-        }
-        let mut secret = decode_array::<32>(&document.secret_key, "secret key")?;
-        let signing = SigningKey::from_bytes(&secret);
-        secret.zeroize();
+        let result = (|| {
+            if document.format_version != SIGNATURE_FORMAT_VERSION
+                || document.algorithm != "ed25519"
+            {
+                return Err("unsupported developer key format".into());
+            }
+            let mut secret = decode_array::<32>(&document.secret_key, "secret key")?;
+            let signing = SigningKey::from_bytes(&secret);
+            secret.zeroize();
+            let key = Self { signing };
+            if key.key_id() != document.key_id
+                || hex::encode(key.public_key()) != document.public_key
+            {
+                return Err("developer key identity does not match its secret".into());
+            }
+            Ok(key)
+        })();
         document.secret_key.zeroize();
-        let key = Self { signing };
-        if key.key_id() != document.key_id || hex::encode(key.public_key()) != document.public_key {
-            return Err("developer key identity does not match its secret".into());
-        }
-        Ok(key)
+        result
     }
 
     pub fn write_new(&self, path: &Path) -> Result<(), String> {
-        let document = DeveloperKeyFile {
+        let mut secret = self.signing.to_bytes();
+        let mut document = DeveloperKeyFile {
             format_version: SIGNATURE_FORMAT_VERSION,
             algorithm: "ed25519".into(),
             key_id: self.key_id(),
             public_key: hex::encode(self.public_key()),
-            secret_key: hex::encode(self.signing.to_bytes()),
+            secret_key: hex::encode(secret),
         };
-        write_private_json_new(path, &document)
+        secret.zeroize();
+        let result = write_private_json_new(path, &document);
+        document.secret_key.zeroize();
+        result
     }
 
     #[must_use]
@@ -947,10 +958,15 @@ fn key_id(public: &[u8; 32]) -> String {
 }
 
 fn decode_array<const N: usize>(value: &str, label: &str) -> Result<[u8; N], String> {
-    let bytes = hex::decode(value).map_err(|_| format!("{label} is not hexadecimal"))?;
-    bytes
-        .try_into()
-        .map_err(|_| format!("{label} has the wrong length"))
+    let mut bytes = hex::decode(value).map_err(|_| format!("{label} is not hexadecimal"))?;
+    if bytes.len() != N {
+        bytes.zeroize();
+        return Err(format!("{label} has the wrong length"));
+    }
+    let mut output = [0_u8; N];
+    output.copy_from_slice(&bytes);
+    bytes.zeroize();
+    Ok(output)
 }
 
 fn validate_digest(value: &str, label: &str) -> Result<(), String> {
@@ -999,8 +1015,11 @@ fn now_ms() -> Result<u64, String> {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    if fs::metadata(path).map_err(|error| error.to_string())?.len() > limit {
-        return Err(format!("file exceeds the {limit}-byte limit"));
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
+        return Err(format!(
+            "file must be regular and within the {limit}-byte limit"
+        ));
     }
     let mut bytes = Vec::new();
     File::open(path)
@@ -1017,7 +1036,10 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path, limit: u64) -> Result<T, String> {
-    serde_json::from_slice(&read_bounded(path, limit)?).map_err(|error| error.to_string())
+    let mut bytes = read_bounded(path, limit)?;
+    let result = serde_json::from_slice(&bytes).map_err(|error| error.to_string());
+    bytes.zeroize();
+    result
 }
 
 fn write_json_new(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1032,18 +1054,34 @@ fn write_json_new(path: &Path, value: &impl Serialize) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    sync_parent_directory(path)
 }
 
 fn write_private_json_new(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    write_json_new(path, value)?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_IDENTITY_DOCUMENT_BYTES {
+        bytes.zeroize();
+        return Err("identity document exceeds its size limit".into());
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| error.to_string())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    let result = options
+        .open(path)
+        .map_err(|error| error.to_string())
+        .and_then(|mut file| {
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| error.to_string())
+        });
+    bytes.zeroize();
+    result?;
+    sync_parent_directory(path)
 }
 
 fn atomic_json_replace(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1071,7 +1109,7 @@ fn atomic_json_replace(path: &Path, value: &impl Serialize) -> Result<(), String
     if backup.exists() {
         fs::remove_file(backup).map_err(|error| error.to_string())?;
     }
-    Ok(())
+    sync_parent_directory(path)
 }
 
 fn recover_registry_index(path: &Path) -> Result<(), String> {
@@ -1115,7 +1153,24 @@ fn write_bytes_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    sync_parent_directory(destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "durable identity path has no parent".to_string())?;
+    File::open(directory)
+        .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn acquire_lock(file: &File) -> Result<(), String> {

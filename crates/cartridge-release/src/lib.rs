@@ -677,6 +677,22 @@ fn atomic_json_replace(path: &Path, value: &impl Serialize) -> Result<(), String
     } else {
         fs::rename(temporary, path).map_err(|error| error.to_string())?;
     }
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "durable release path has no parent".to_string())?;
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_: &Path) -> Result<(), String> {
     Ok(())
 }
 

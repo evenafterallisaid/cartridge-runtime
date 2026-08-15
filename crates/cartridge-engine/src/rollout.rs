@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use super::{
     EngineEvent, EngineEventKind, EngineStackState, EngineStore, MAX_ENGINE_STACKS,
     MAX_STACK_PLAN_BYTES, SandboxPolicy, StackHealthState, StackPlan, ensure_directory,
-    exact_suffix, is_digest, is_regular_file, next_event, valid_name, write_new_atomic,
-    write_replace_atomic,
+    exact_suffix, is_digest, is_regular_file, next_event, sync_parent_directory, valid_name,
+    write_new_atomic, write_replace_atomic,
 };
 
 pub const ENGINE_ROLLOUT_FORMAT_VERSION: u32 = 1;
@@ -408,6 +408,7 @@ impl EngineStore {
             {
                 return Ok(current);
             }
+            self.remove_terminal_rollout_progress(&current)?;
             self.archive_rollout(&current)?;
         }
         let previous = self.latest(&plan.stack)?;
@@ -502,7 +503,8 @@ impl EngineStore {
                         now_ms.saturating_sub(started) >= ROLLOUT_STABILITY_WINDOW_MS
                     })
                 }
-                super::ReplicaPhase::Succeeded | super::ReplicaPhase::Stopped => true,
+                super::ReplicaPhase::Succeeded => true,
+                super::ReplicaPhase::Stopped => replica.desired == super::DesiredState::Stopped,
                 _ => false,
             });
             if !stable {
@@ -833,9 +835,11 @@ fn recover_rollout_file(path: &Path) -> Result<(), String> {
     if !path.exists() && backup.exists() {
         read_rollout_file(&backup)?;
         fs::rename(&backup, path).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     } else if path.exists() && backup.exists() {
         read_rollout_file(path)?;
         fs::remove_file(backup).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     }
     Ok(())
 }

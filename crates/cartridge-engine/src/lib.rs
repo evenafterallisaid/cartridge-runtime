@@ -1027,6 +1027,13 @@ impl EngineStore {
         let Some((revision, generation, plan)) = self.desired_plan(stack)? else {
             return Ok(None);
         };
+        let generation_path = self.generation_runtime_status_path(stack, &generation)?;
+        recover_runtime_status(&generation_path)?;
+        if generation_path.exists() {
+            let status = read_runtime_status(&generation_path)?;
+            status.validate_against(&plan, revision, &generation)?;
+            return Ok(Some(status));
+        }
         let path = self.runtime_status_path(stack)?;
         recover_runtime_status(&path)?;
         if !path.exists() {
@@ -1169,12 +1176,31 @@ impl EngineStore {
                 )?
             }
         } else {
-            StackRuntimeStatus::from_plan(
-                &target.plan,
-                target.revision,
-                &target.generation,
-                now_ms,
-            )?
+            let legacy_path = self.runtime_status_path(stack)?;
+            recover_runtime_status(&legacy_path)?;
+            if legacy_path.exists() {
+                let legacy = read_runtime_status(&legacy_path)?;
+                if legacy
+                    .validate_against(&target.plan, target.revision, &target.generation)
+                    .is_ok()
+                {
+                    legacy
+                } else {
+                    StackRuntimeStatus::from_plan(
+                        &target.plan,
+                        target.revision,
+                        &target.generation,
+                        now_ms,
+                    )?
+                }
+            } else {
+                StackRuntimeStatus::from_plan(
+                    &target.plan,
+                    target.revision,
+                    &target.generation,
+                    now_ms,
+                )?
+            }
         };
         status.recover_interrupted(now_ms)?;
         self.save_runtime_status_for_generation(&status)?;
@@ -1957,7 +1983,7 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(error.to_string());
     }
     fs::remove_file(temporary).map_err(|error| error.to_string())?;
-    Ok(())
+    sync_parent_directory(path)
 }
 
 fn read_runtime_status(path: &Path) -> Result<StackRuntimeStatus, String> {
@@ -2057,9 +2083,11 @@ fn recover_runtime_status(path: &Path) -> Result<(), String> {
     if !path.exists() && backup.exists() {
         read_runtime_status(&backup)?;
         fs::rename(&backup, path).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     } else if path.exists() && backup.exists() {
         read_runtime_status(path)?;
         fs::remove_file(backup).map_err(|error| error.to_string())?;
+        sync_parent_directory(path)?;
     }
     Ok(())
 }
@@ -2105,6 +2133,22 @@ fn write_replace_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     } else {
         fs::rename(temporary, path).map_err(|error| error.to_string())?;
     }
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "durable file path has no parent".to_string())?;
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_: &Path) -> Result<(), String> {
     Ok(())
 }
 

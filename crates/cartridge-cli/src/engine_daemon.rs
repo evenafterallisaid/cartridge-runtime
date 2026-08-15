@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -14,8 +14,8 @@ use cartridge_desktop::Library;
 use cartridge_engine::{
     DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse,
     EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
-    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_ACTIVE_REPLICAS, ReplicaPhase, StackPlan,
-    daemon_request,
+    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_ACTIVE_REPLICAS, ReplicaPhase, RollingAction,
+    RolloutExecutionPhase, RolloutPhase, RolloutProgress, RolloutRecord, StackPlan, daemon_request,
 };
 
 use crate::process_control::{
@@ -62,8 +62,13 @@ struct ReplayCache(BTreeMap<String, u64>);
 
 struct ManagedSupervisor {
     child: ContainedChild,
-    generation: String,
     started_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SupervisorKey {
+    stack: String,
+    generation: String,
 }
 
 struct SupervisorRetry {
@@ -162,6 +167,7 @@ pub fn serve(options: &ServeOptions<'_>) -> Result<()> {
         while !stopping.load(Ordering::Acquire) {
             accept_clients(&listener, &state, &active_clients)?;
             if Instant::now() >= next_reconcile {
+                reconcile_rollouts(&state)?;
                 reconcile_supervisors(&state, &executable, &mut supervisors, &mut retries)?;
                 next_reconcile = Instant::now() + RECONCILE_INTERVAL;
             }
@@ -493,25 +499,244 @@ fn drain_clients(active: &AtomicUsize) -> Result<()> {
     Ok(())
 }
 
+fn reconcile_rollouts(state: &DaemonState) -> Result<()> {
+    let _mutation = lock_mutation(state)?;
+    let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+    let now_ms = current_time_ms()?;
+    for status in engine.list().map_err(anyhow::Error::msg)? {
+        let Some(record) = engine.rollout(&status.stack).map_err(anyhow::Error::msg)? else {
+            continue;
+        };
+        let progress = engine
+            .rollout_progress(&status.stack)
+            .map_err(anyhow::Error::msg)?;
+        let mut progress = if let Some(progress) = progress {
+            progress
+        } else if record.phase == RolloutPhase::Activated {
+            engine
+                .begin_rollout_progress(
+                    &status.stack,
+                    &record.rollout_id,
+                    now_ms.max(record.updated_at_ms),
+                )
+                .map_err(anyhow::Error::msg)?
+        } else {
+            continue;
+        };
+        let rollout_now_ms = now_ms.max(record.updated_at_ms).max(progress.updated_at_ms);
+        if reconcile_rollout_phase(
+            state,
+            &engine,
+            &status.stack,
+            &record,
+            &mut progress,
+            rollout_now_ms,
+        )? {
+            continue;
+        }
+        advance_active_rollout(
+            &engine,
+            &status.stack,
+            &record,
+            &mut progress,
+            rollout_now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_rollout_phase(
+    state: &DaemonState,
+    engine: &EngineStore,
+    stack: &str,
+    record: &RolloutRecord,
+    progress: &mut RolloutProgress,
+    now_ms: u64,
+) -> Result<bool> {
+    if record.phase == RolloutPhase::Committed {
+        if matches!(
+            progress.phase,
+            RolloutExecutionPhase::Rolling | RolloutExecutionPhase::Paused
+        ) {
+            progress
+                .set_phase(RolloutExecutionPhase::Completing, now_ms)
+                .map_err(anyhow::Error::msg)?;
+        }
+        if progress.phase == RolloutExecutionPhase::Completing {
+            progress
+                .set_phase(RolloutExecutionPhase::Completed, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .save_rollout_progress(progress)
+                .map_err(anyhow::Error::msg)?;
+        }
+        return Ok(true);
+    }
+    if matches!(
+        record.phase,
+        RolloutPhase::RolledBack | RolloutPhase::Cancelled
+    ) {
+        if matches!(
+            progress.phase,
+            RolloutExecutionPhase::Rolling
+                | RolloutExecutionPhase::Paused
+                | RolloutExecutionPhase::Completing
+        ) {
+            progress
+                .set_phase(RolloutExecutionPhase::RollingBack, now_ms)
+                .map_err(anyhow::Error::msg)?;
+        }
+        if progress.phase == RolloutExecutionPhase::RollingBack {
+            progress
+                .set_phase(RolloutExecutionPhase::RolledBack, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .save_rollout_progress(progress)
+                .map_err(anyhow::Error::msg)?;
+        }
+        return Ok(true);
+    }
+    if record.phase != RolloutPhase::Activated {
+        return Ok(true);
+    }
+    if progress.phase == RolloutExecutionPhase::Completing {
+        let health = engine.health(stack, now_ms).map_err(anyhow::Error::msg)?;
+        let stopped_candidate = health.state == cartridge_engine::StackHealthState::Stopped
+            && record
+                .candidate_plan
+                .instances
+                .iter()
+                .all(|instance| instance.desired == cartridge_engine::DesiredState::Stopped);
+        if health.ready() || stopped_candidate {
+            engine
+                .commit_rollout(stack, &record.rollout_id, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            progress
+                .set_phase(RolloutExecutionPhase::Completed, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .save_rollout_progress(progress)
+                .map_err(anyhow::Error::msg)?;
+        } else if rollout_progress_expired(progress, now_ms) {
+            progress
+                .set_phase(RolloutExecutionPhase::RollingBack, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .save_rollout_progress(progress)
+                .map_err(anyhow::Error::msg)?;
+        }
+        return Ok(true);
+    }
+    if progress.phase == RolloutExecutionPhase::RollingBack {
+        verify_rollback_target(record, &state.library)?;
+        engine
+            .rollback_rollout(stack, &record.rollout_id, now_ms)
+            .map_err(anyhow::Error::msg)?;
+        progress
+            .set_phase(RolloutExecutionPhase::RolledBack, now_ms)
+            .map_err(anyhow::Error::msg)?;
+        engine
+            .save_rollout_progress(progress)
+            .map_err(anyhow::Error::msg)?;
+        return Ok(true);
+    }
+    Ok(progress.phase != RolloutExecutionPhase::Rolling)
+}
+
+fn advance_active_rollout(
+    engine: &EngineStore,
+    stack: &str,
+    record: &RolloutRecord,
+    progress: &mut RolloutProgress,
+    now_ms: u64,
+) -> Result<()> {
+    let previous = record
+        .previous_generation
+        .as_deref()
+        .map(|generation| engine.runtime_status_for_generation(stack, generation))
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .flatten();
+    let candidate = engine
+        .runtime_status_for_generation(stack, &progress.candidate_generation)
+        .map_err(anyhow::Error::msg)?;
+    if progress
+        .acknowledge_drained(previous.as_ref(), now_ms)
+        .map_err(anyhow::Error::msg)?
+        > 0
+    {
+        engine
+            .save_rollout_progress(progress)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let decision = progress
+        .next_action(previous.as_ref(), candidate.as_ref(), now_ms)
+        .map_err(anyhow::Error::msg)?;
+    match decision.action {
+        RollingAction::StartCandidate { ordinals } => {
+            let instance = decision.instance.context("rollout start has no instance")?;
+            progress
+                .enable_candidate(&instance, &ordinals, now_ms)
+                .map_err(anyhow::Error::msg)?;
+        }
+        RollingAction::DrainPrevious { ordinals, .. } => {
+            let instance = decision.instance.context("rollout drain has no instance")?;
+            progress
+                .request_previous_drain(&instance, &ordinals, now_ms)
+                .map_err(anyhow::Error::msg)?;
+        }
+        RollingAction::Complete => progress
+            .set_phase(RolloutExecutionPhase::Completing, now_ms)
+            .map_err(anyhow::Error::msg)?,
+        RollingAction::Rollback { .. } => progress
+            .set_phase(RolloutExecutionPhase::RollingBack, now_ms)
+            .map_err(anyhow::Error::msg)?,
+        RollingAction::Wait { .. } => return Ok(()),
+    }
+    engine
+        .save_rollout_progress(progress)
+        .map_err(anyhow::Error::msg)
+}
+
+fn rollout_progress_expired(progress: &cartridge_engine::RolloutProgress, now_ms: u64) -> bool {
+    let deadline_ms = progress
+        .instances
+        .iter()
+        .map(|instance| instance.policy.progress_deadline_ms)
+        .max()
+        .unwrap_or(0);
+    now_ms.saturating_sub(progress.last_progress_at_ms) >= deadline_ms
+}
+
+fn verify_rollback_target(record: &cartridge_engine::RolloutRecord, library: &Path) -> Result<()> {
+    if let Some(previous) = &record.previous_plan {
+        let library = Library::open(library).map_err(anyhow::Error::msg)?;
+        previous
+            .verify_installed(&library)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 fn reconcile_supervisors(
     state: &DaemonState,
     executable: &Path,
-    supervisors: &mut BTreeMap<String, ManagedSupervisor>,
-    retries: &mut BTreeMap<String, SupervisorRetry>,
+    supervisors: &mut BTreeMap<SupervisorKey, ManagedSupervisor>,
+    retries: &mut BTreeMap<SupervisorKey, SupervisorRetry>,
 ) -> Result<()> {
     let finished = supervisors
         .iter_mut()
-        .filter_map(|(stack, supervisor)| match supervisor.child.try_wait() {
+        .filter_map(|(key, supervisor)| match supervisor.child.try_wait() {
             Ok(Some(_)) | Err(_) => Some((
-                stack.clone(),
+                key.clone(),
                 supervisor.started_at.elapsed() >= SUPERVISOR_STABLE_WINDOW,
             )),
             Ok(None) => None,
         })
         .collect::<Vec<_>>();
-    for (stack, stable) in finished {
-        supervisors.remove(&stack);
-        schedule_supervisor_retry(retries, &stack, stable);
+    for (key, stable) in finished {
+        supervisors.remove(&key);
+        schedule_supervisor_retry(retries, &key, stable);
     }
     state
         .active_supervisors
@@ -519,61 +744,64 @@ fn reconcile_supervisors(
 
     let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
     let statuses = engine.list().map_err(anyhow::Error::msg)?;
+    let mut authorized = BTreeSet::new();
     for status in statuses {
         if status.state != EngineStackState::Applied {
-            retries.remove(&status.stack);
+            retries.retain(|key, _| key.stack != status.stack);
             continue;
         }
-        let Some((_revision, generation, _plan)) = engine
-            .desired_plan(&status.stack)
-            .map_err(anyhow::Error::msg)?
-        else {
-            continue;
-        };
-        if let Some(supervisor) = supervisors.get(&status.stack) {
-            if supervisor.generation == generation {
+        let targets = engine
+            .generation_targets(&status.stack)
+            .map_err(anyhow::Error::msg)?;
+        for target in targets {
+            let key = SupervisorKey {
+                stack: status.stack.clone(),
+                generation: target.generation.clone(),
+            };
+            authorized.insert(key.clone());
+            if supervisors.contains_key(&key) {
                 continue;
             }
-            continue;
+            if supervisors.len() >= usize::from(state.max_supervisors)
+                || retries
+                    .get(&key)
+                    .is_some_and(|retry| Instant::now() < retry.deadline)
+            {
+                continue;
+            }
+            let should_run = engine
+                .runtime_status_for_generation(&status.stack, &target.generation)
+                .map_err(anyhow::Error::msg)?
+                .is_none_or(|runtime| {
+                    runtime.replicas.iter().any(|replica| {
+                        matches!(
+                            replica.phase,
+                            ReplicaPhase::Pending
+                                | ReplicaPhase::Starting
+                                | ReplicaPhase::Running
+                                | ReplicaPhase::Backoff
+                        )
+                    })
+                });
+            if !should_run {
+                retries.remove(&key);
+                continue;
+            }
+            let Ok(child) = spawn_supervisor(state, executable, &status.stack, &target.generation)
+            else {
+                schedule_supervisor_retry(retries, &key, false);
+                continue;
+            };
+            supervisors.insert(
+                key,
+                ManagedSupervisor {
+                    child,
+                    started_at: Instant::now(),
+                },
+            );
         }
-        if supervisors.len() >= usize::from(state.max_supervisors)
-            || retries
-                .get(&status.stack)
-                .is_some_and(|retry| Instant::now() < retry.deadline)
-        {
-            continue;
-        }
-        let should_run = engine
-            .runtime_status(&status.stack)
-            .map_err(anyhow::Error::msg)?
-            .is_none_or(|runtime| {
-                runtime.replicas.iter().any(|replica| {
-                    matches!(
-                        replica.phase,
-                        ReplicaPhase::Pending
-                            | ReplicaPhase::Starting
-                            | ReplicaPhase::Running
-                            | ReplicaPhase::Backoff
-                    )
-                })
-            });
-        if !should_run {
-            retries.remove(&status.stack);
-            continue;
-        }
-        let Ok(child) = spawn_supervisor(state, executable, &status.stack) else {
-            schedule_supervisor_retry(retries, &status.stack, false);
-            continue;
-        };
-        supervisors.insert(
-            status.stack.clone(),
-            ManagedSupervisor {
-                child,
-                generation,
-                started_at: Instant::now(),
-            },
-        );
     }
+    retries.retain(|key, _| authorized.contains(key));
     state
         .active_supervisors
         .store(supervisors.len(), Ordering::Release);
@@ -581,15 +809,15 @@ fn reconcile_supervisors(
 }
 
 fn schedule_supervisor_retry(
-    retries: &mut BTreeMap<String, SupervisorRetry>,
-    stack: &str,
+    retries: &mut BTreeMap<SupervisorKey, SupervisorRetry>,
+    key: &SupervisorKey,
     stable: bool,
 ) {
     let attempts = if stable {
         1
     } else {
         retries
-            .get(stack)
+            .get(key)
             .map_or(1, |retry| retry.attempts.saturating_add(1))
     };
     let multiplier = 1_u32 << u32::from(attempts.saturating_sub(1).min(7));
@@ -597,7 +825,7 @@ fn schedule_supervisor_retry(
         .saturating_mul(multiplier)
         .min(MAX_SUPERVISOR_RETRY_DELAY);
     retries.insert(
-        stack.into(),
+        key.clone(),
         SupervisorRetry {
             attempts,
             deadline: Instant::now() + delay,
@@ -605,7 +833,12 @@ fn schedule_supervisor_retry(
     );
 }
 
-fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Result<ContainedChild> {
+fn spawn_supervisor(
+    state: &DaemonState,
+    executable: &Path,
+    stack: &str,
+    generation: &str,
+) -> Result<ContainedChild> {
     let mut command = ContainedCommand::new(executable);
     command
         .arg("stack")
@@ -617,6 +850,8 @@ fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Resu
         .arg(&state.root)
         .arg("--max-workers")
         .arg(state.workers_per_stack.to_string())
+        .arg("--generation")
+        .arg(generation)
         .arg("--daemon-instance")
         .arg(state.codec.instance_id())
         .arg("--json")
@@ -625,7 +860,7 @@ fn spawn_supervisor(state: &DaemonState, executable: &Path, stack: &str) -> Resu
     spawn_contained(&mut command, true).context("could not start a stack supervisor")
 }
 
-fn stop_supervisors(supervisors: &mut BTreeMap<String, ManagedSupervisor>) {
+fn stop_supervisors(supervisors: &mut BTreeMap<SupervisorKey, ManagedSupervisor>) {
     let deadline = Instant::now() + SHUTDOWN_GRACE;
     while !supervisors.is_empty() && Instant::now() < deadline {
         supervisors.retain(|_, supervisor| supervisor.child.try_wait().ok().flatten().is_none());
@@ -697,7 +932,92 @@ fn safe_error(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    use cartridge_core::{PackOptions, pack};
+    use cartridge_engine::{
+        DesiredState, InstanceLimits, InstanceSpec, RestartPolicy, RollingUpdatePolicy,
+        STACK_FORMAT_VERSION, SandboxPolicy, SecurityProfile, StackManifest, StackSecurity,
+    };
+
     use super::*;
+
+    fn package(root: &Path, version: &str) -> PathBuf {
+        let manifest = root.join(format!("{version}.Cartridge.toml"));
+        let component = root.join("component.wasm");
+        let output = root.join(format!("demo-{version}.cartridge"));
+        fs::write(
+            &manifest,
+            format!(
+                "format_version = 1\n[cartridge]\nid = \"dev.test.daemon-rollout\"\nname = \"Daemon Rollout\"\nversion = \"{version}\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(&component, b"\0asm\x01\0\0\0").unwrap();
+        pack(&PackOptions {
+            manifest,
+            component,
+            assets: None,
+            output: output.clone(),
+        })
+        .unwrap();
+        output
+    }
+
+    fn manifest(version: &str) -> StackManifest {
+        StackManifest {
+            format_version: STACK_FORMAT_VERSION,
+            name: "daemon-rollout".into(),
+            security: StackSecurity {
+                profile: SecurityProfile::Strict,
+                sandbox: SandboxPolicy::Required,
+            },
+            instances: vec![InstanceSpec {
+                name: "app".into(),
+                cartridge: "dev.test.daemon-rollout".into(),
+                version: version.into(),
+                replicas: 2,
+                desired: DesiredState::Running,
+                restart: RestartPolicy::OnFailure,
+                max_restarts: 2,
+                allow: BTreeSet::new(),
+                deny: BTreeSet::new(),
+                args: Vec::new(),
+                secrets: BTreeSet::new(),
+                limits: InstanceLimits::default(),
+                health: None,
+                update: RollingUpdatePolicy::default(),
+            }],
+            resources: Vec::new(),
+            secrets: Vec::new(),
+        }
+    }
+
+    fn running_status(
+        plan: &StackPlan,
+        revision: u64,
+        generation: &str,
+        started_at_ms: u64,
+    ) -> cartridge_engine::StackRuntimeStatus {
+        let mut status = cartridge_engine::StackRuntimeStatus::from_plan(
+            plan,
+            revision,
+            generation,
+            started_at_ms,
+        )
+        .unwrap();
+        for ordinal in 1..=2 {
+            let id = cartridge_engine::ReplicaId {
+                instance: "app".into(),
+                ordinal,
+            };
+            let run_id = format!("{ordinal:064x}");
+            status.begin_start(&id, &run_id, started_at_ms).unwrap();
+            status.mark_running(&id, &run_id, started_at_ms).unwrap();
+        }
+        status
+    }
 
     #[test]
     fn replay_cache_rejects_duplicates_and_stale_requests() {
@@ -728,19 +1048,167 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn daemon_coordinator_rolls_two_replicas_without_exceeding_surge() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("engine");
+        let library_root = directory.path().join("library");
+        let mut library = Library::open(&library_root).unwrap();
+        library
+            .install(&package(directory.path(), "1.0.0"))
+            .unwrap();
+        library
+            .install(&package(directory.path(), "1.1.0"))
+            .unwrap();
+        let old = StackPlan::build(&manifest("=1.0.0"), &library).unwrap();
+        let candidate = StackPlan::build(&manifest("=1.1.0"), &library).unwrap();
+        drop(library);
+
+        let engine = EngineStore::open(&root).unwrap();
+        engine.apply(&old, false).unwrap();
+        let (old_revision, old_generation, _) =
+            engine.desired_plan("daemon-rollout").unwrap().unwrap();
+        let prepared = engine.prepare_rollout(&candidate, false, 10).unwrap();
+        let activated = engine
+            .activate_rollout("daemon-rollout", &prepared.rollout_id, 11)
+            .unwrap();
+        let candidate_revision = activated.activated_revision.unwrap();
+        let candidate_generation = activated.activated_generation.as_deref().unwrap();
+        let now_ms = current_time_ms().unwrap();
+        let ready_at_ms = now_ms - 2_100;
+        let old_status = running_status(&old, old_revision, &old_generation, ready_at_ms);
+        engine
+            .save_runtime_status_for_generation(&old_status)
+            .unwrap();
+        let candidate_status = cartridge_engine::StackRuntimeStatus::from_plan(
+            &candidate,
+            candidate_revision,
+            candidate_generation,
+            ready_at_ms,
+        )
+        .unwrap();
+        engine
+            .save_runtime_status_for_generation(&candidate_status)
+            .unwrap();
+        drop(engine);
+
+        let state = DaemonState {
+            root: root.clone(),
+            library: library_root,
+            codec: Arc::new(DaemonCodec::generate()),
+            started_at_ms: now_ms,
+            max_supervisors: 4,
+            workers_per_stack: 4,
+            stopping: Arc::new(AtomicBool::new(false)),
+            replay: Mutex::new(ReplayCache::default()),
+            mutations: Mutex::new(()),
+            active_supervisors: Arc::new(AtomicUsize::new(0)),
+        };
+
+        reconcile_rollouts(&state).unwrap();
+        let engine = EngineStore::open(&root).unwrap();
+        let mut progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
+        assert_eq!(progress.instances[0].candidate_enabled, BTreeSet::from([1]));
+
+        let mut candidate_status = engine
+            .runtime_status_for_generation("daemon-rollout", candidate_generation)
+            .unwrap()
+            .unwrap();
+        start_replica(&mut candidate_status, 1, ready_at_ms);
+        engine
+            .save_runtime_status_for_generation(&candidate_status)
+            .unwrap();
+        drop(engine);
+        reconcile_rollouts(&state).unwrap();
+        let engine = EngineStore::open(&root).unwrap();
+        progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
+        assert_eq!(progress.instances[0].previous_draining.len(), 1);
+
+        let mut old_status = engine
+            .runtime_status_for_generation("daemon-rollout", &old_generation)
+            .unwrap()
+            .unwrap();
+        drain_replica(&mut old_status, 1, now_ms);
+        engine
+            .save_runtime_status_for_generation(&old_status)
+            .unwrap();
+        drop(engine);
+        reconcile_rollouts(&state).unwrap();
+        let engine = EngineStore::open(&root).unwrap();
+        progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
+        assert_eq!(
+            progress.instances[0].candidate_enabled,
+            BTreeSet::from([1, 2])
+        );
+
+        start_replica(&mut candidate_status, 2, ready_at_ms);
+        candidate_status.heartbeat(now_ms).unwrap();
+        engine
+            .save_runtime_status_for_generation(&candidate_status)
+            .unwrap();
+        drop(engine);
+        reconcile_rollouts(&state).unwrap();
+        let engine = EngineStore::open(&root).unwrap();
+        progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
+        assert_eq!(progress.instances[0].previous_draining.len(), 1);
+
+        drain_replica(&mut old_status, 2, now_ms);
+        engine
+            .save_runtime_status_for_generation(&old_status)
+            .unwrap();
+        drop(engine);
+        reconcile_rollouts(&state).unwrap();
+        reconcile_rollouts(&state).unwrap();
+
+        let engine = EngineStore::open(&root).unwrap();
+        let record = engine.rollout("daemon-rollout").unwrap().unwrap();
+        let progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
+        assert_eq!(record.phase, RolloutPhase::Committed);
+        assert_eq!(progress.phase, RolloutExecutionPhase::Completed);
+    }
+
+    #[test]
     fn supervisor_process_retries_back_off_and_reset_after_stability() {
         let mut retries = BTreeMap::new();
+        let key = SupervisorKey {
+            stack: "demo".into(),
+            generation: "a".repeat(64),
+        };
         for expected in 1..=20 {
-            schedule_supervisor_retry(&mut retries, "demo", false);
-            assert_eq!(retries["demo"].attempts, expected);
+            schedule_supervisor_retry(&mut retries, &key, false);
+            assert_eq!(retries[&key].attempts, expected);
             assert!(
-                retries["demo"]
+                retries[&key]
                     .deadline
                     .saturating_duration_since(Instant::now())
                     <= MAX_SUPERVISOR_RETRY_DELAY
             );
         }
-        schedule_supervisor_retry(&mut retries, "demo", true);
-        assert_eq!(retries["demo"].attempts, 1);
+        schedule_supervisor_retry(&mut retries, &key, true);
+        assert_eq!(retries[&key].attempts, 1);
+    }
+
+    fn start_replica(status: &mut cartridge_engine::StackRuntimeStatus, ordinal: u16, now_ms: u64) {
+        let id = cartridge_engine::ReplicaId {
+            instance: "app".into(),
+            ordinal,
+        };
+        let run_id = format!("{:064x}", ordinal + 10);
+        status.begin_start(&id, &run_id, now_ms).unwrap();
+        status.mark_running(&id, &run_id, now_ms).unwrap();
+    }
+
+    fn drain_replica(status: &mut cartridge_engine::StackRuntimeStatus, ordinal: u16, now_ms: u64) {
+        let id = cartridge_engine::ReplicaId {
+            instance: "app".into(),
+            ordinal,
+        };
+        let run_id = status
+            .replicas
+            .iter()
+            .find(|replica| replica.id == id)
+            .and_then(|replica| replica.run_id.clone())
+            .unwrap();
+        status.mark_drained(&id, Some(&run_id), now_ms).unwrap();
     }
 }

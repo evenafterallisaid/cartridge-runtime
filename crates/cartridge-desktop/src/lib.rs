@@ -1009,9 +1009,14 @@ fn recover_library_document(root: &Path, document: &Path) -> Result<(), String> 
 fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let sequence = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("json.{}-{sequence}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temporary)
         .map_err(|error| error.to_string())?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
@@ -1034,6 +1039,22 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
     } else {
         fs::rename(temporary, path).map_err(|error| error.to_string())?;
     }
+    sync_parent_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "durable library path has no parent".to_string())?;
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_: &Path) -> Result<(), String> {
     Ok(())
 }
 
