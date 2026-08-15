@@ -1023,8 +1023,10 @@ The next concrete sequence is:
    - [implemented: guest-signal slice] manifest-defined startup, readiness, and liveness deadlines, bounded encrypted reports, replay fencing, failure thresholds, restart integration, authenticated aggregate health, and rollout gating
    - add isolated command and scoped HTTP probe runners, success thresholds, jittered schedules, per-probe capability ceilings, and redacted bounded output retention
    - [implemented: scheduler core] enforce `max_surge`, `max_unavailable`, minimum ready time, progress deadlines, start-first/stop-first ordering, deterministic ordinal selection, and fail-closed observation validation; pause/resume remains
-   - persist scheduler observations and progress timestamps in crash-recoverable rollout checkpoints
-   - retain old and new generation supervisors concurrently, route only to ready replicas, drain gracefully, and recover ownership after daemon failure
+   - [implemented: execution-state foundation] persist bounded checksummed topology, per-ordinal start/drain intent, monotonic action sequences, and progress timestamps in crash-recoverable rollout checkpoints
+   - [implemented: ownership foundation] authorize exact old and candidate generations concurrently with separate supervisor leases, runtime status, probe roots, and generation-keyed mutable state
+   - translate scheduler actions into daemon-owned candidate starts and graceful previous-generation drains, then recover in-flight ownership after daemon failure
+   - route only to ready replicas and remove a generation from routing before its drain deadline begins
    - add deterministic canary cohorts, metric/trace gates, operator promotion, and automatic abort without widening package authority
    - require migration compatibility or a verified rollback receipt before updating stateful instances whose schema changes
    - compact long journals through signed checkpoints without losing auditability

@@ -1003,6 +1003,150 @@ mod tests {
         );
     }
 
+    fn same_package_rollout(engine: &EngineStore) -> (StackPlan, StackPlan, String, RolloutRecord) {
+        let mut old = plan("demo", 'a');
+        old.instances[0].health = Some(crate::HealthProbeSpec::default());
+        old.plan_sha256 = old.computed_sha256().unwrap();
+        engine.apply(&old, false).unwrap();
+        let (_, old_generation, _) = engine.desired_plan("demo").unwrap().unwrap();
+
+        let mut candidate = old.clone();
+        candidate.instances[0].args.push("next".into());
+        candidate.plan_sha256 = candidate.computed_sha256().unwrap();
+        let prepared = engine.prepare_rollout(&candidate, false, 40).unwrap();
+        let activated = engine
+            .activate_rollout("demo", &prepared.rollout_id, 41)
+            .unwrap();
+        (old, candidate, old_generation, activated)
+    }
+
+    #[test]
+    fn activated_generations_isolate_leases_state_and_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let (_old, _candidate, old_generation, activated) = same_package_rollout(&engine);
+        let candidate_generation = activated.activated_generation.as_deref().unwrap();
+
+        let targets = engine.generation_targets("demo").unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|target| {
+            target.generation == old_generation
+                && target.role == crate::GenerationRole::RolloutPrevious
+                && target.rollout_id.as_deref() == Some(activated.rollout_id.as_str())
+        }));
+        assert!(targets.iter().any(|target| {
+            target.generation == candidate_generation
+                && target.role == crate::GenerationRole::RolloutCandidate
+                && target.rollout_id.as_deref() == Some(activated.rollout_id.as_str())
+        }));
+
+        let _old_lease = engine
+            .acquire_generation_supervisor_lease("demo", &old_generation)
+            .unwrap();
+        let _candidate_lease = engine
+            .acquire_generation_supervisor_lease("demo", candidate_generation)
+            .unwrap();
+        assert!(
+            engine
+                .acquire_generation_supervisor_lease("demo", &old_generation)
+                .is_err()
+        );
+
+        let id = crate::ReplicaId {
+            instance: "app".into(),
+            ordinal: 1,
+        };
+        let old_state = engine
+            .replica_state_directory("demo", &old_generation, &id)
+            .unwrap();
+        let candidate_state = engine
+            .replica_state_directory("demo", candidate_generation, &id)
+            .unwrap();
+        assert_ne!(old_state, candidate_state);
+
+        let old_probe = engine
+            .replica_probe_path("demo", &old_generation, &id, &"1".repeat(64))
+            .unwrap();
+        let candidate_probe = engine
+            .replica_probe_path("demo", candidate_generation, &id, &"2".repeat(64))
+            .unwrap();
+        fs::write(&old_probe, b"old").unwrap();
+        fs::write(&candidate_probe, b"candidate").unwrap();
+        assert_eq!(
+            engine
+                .clear_probe_channels_for_generation("demo", candidate_generation)
+                .unwrap(),
+            1
+        );
+        assert!(old_probe.exists());
+        assert!(!candidate_probe.exists());
+    }
+
+    #[test]
+    fn activated_generation_status_is_fenced_and_terminal_authority_expires() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = EngineStore::open(directory.path()).unwrap();
+        let (old, candidate, old_generation, activated) = same_package_rollout(&engine);
+        let old_revision = activated.previous_revision.unwrap();
+        let candidate_revision = activated.activated_revision.unwrap();
+        let candidate_generation = activated.activated_generation.as_deref().unwrap();
+        let old_runtime =
+            crate::StackRuntimeStatus::from_plan(&old, old_revision, &old_generation, 42).unwrap();
+        let candidate_runtime = crate::StackRuntimeStatus::from_plan(
+            &candidate,
+            candidate_revision,
+            candidate_generation,
+            42,
+        )
+        .unwrap();
+        engine
+            .save_runtime_status_for_generation(&old_runtime)
+            .unwrap();
+        engine
+            .save_runtime_status_for_generation(&candidate_runtime)
+            .unwrap();
+        assert_eq!(
+            engine
+                .runtime_status_for_generation("demo", &old_generation)
+                .unwrap(),
+            Some(old_runtime)
+        );
+        assert_eq!(
+            engine
+                .runtime_status_for_generation("demo", candidate_generation)
+                .unwrap(),
+            Some(candidate_runtime)
+        );
+        let cross_generation = crate::StackRuntimeStatus::from_plan(
+            &candidate,
+            candidate_revision,
+            &old_generation,
+            43,
+        )
+        .unwrap();
+        assert!(
+            engine
+                .save_runtime_status_for_generation(&cross_generation)
+                .is_err()
+        );
+
+        engine
+            .rollback_rollout("demo", &activated.rollout_id, 44)
+            .unwrap();
+        assert!(
+            engine
+                .generation_target("demo", &old_generation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .generation_target("demo", candidate_generation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn rollout_recovers_crashes_between_journal_and_checkpoint_writes() {
         let directory = tempfile::tempdir().unwrap();

@@ -28,4 +28,8 @@ Given a valid observation, it returns one deterministic action:
 - complete only after every previous replica is gone and every candidate is available;
 - roll back after a terminal candidate or the progress deadline.
 
-The policy and decision engine are implemented. Live `engine update` still activates one complete desired generation because concurrent old/candidate supervisor ownership, durable per-ordinal progress, ready-only routing, and graceful service draining are not wired yet. Until those pieces land, the rolling policy is reviewed and plan-bound scheduling intent rather than a claim of zero-downtime execution.
+The policy and decision engine are implemented. Activated transactions can also create a bounded, checksummed execution checkpoint that records topology changes, enabled candidate ordinals, drain deadlines, monotonic action sequences, and progress timestamps. Interrupted checkpoint replacement recovers from a validated previous copy.
+
+Old and candidate generations now have independently validated targets, supervisor leases, observed runtime files, health-channel roots, and mutable-state directories. That prevents concurrent generations from sharing authority or state even when they use the same package digest. Authority for both targets exists only while the exact rollout checkpoint remains activated.
+
+Live `engine update` still activates one complete desired generation because the daemon does not yet translate scheduler decisions into candidate starts and graceful previous-generation drains. Ready-only routing is also not wired. Until those pieces land, the rolling policy and durable execution state are foundations rather than a claim of zero-downtime execution.

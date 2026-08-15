@@ -3,6 +3,7 @@ mod health;
 mod probe;
 mod rolling;
 mod rollout;
+mod rollout_progress;
 mod supervisor;
 
 pub use daemon::{
@@ -29,6 +30,10 @@ pub use rollout::{
     ENGINE_ROLLOUT_FORMAT_VERSION, MAX_ROLLOUT_BYTES, MAX_ROLLOUT_HISTORY,
     MAX_ROLLOUT_HISTORY_BYTES, ROLLOUT_STABILITY_WINDOW_MS, RolloutPhase, RolloutRecord,
     RolloutStatus,
+};
+pub use rollout_progress::{
+    DrainIntent, ENGINE_ROLLOUT_PROGRESS_FORMAT_VERSION, MAX_ROLLOUT_PROGRESS_BYTES,
+    RolloutExecutionPhase, RolloutInstanceProgress, RolloutProgress,
 };
 pub use supervisor::{
     LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION, ProbePhase, ReplicaId, ReplicaPhase,
@@ -64,6 +69,8 @@ pub const MAX_STACK_INSTANCES: usize = 64;
 pub const MAX_STACK_REPLICAS: u16 = 32;
 pub const MAX_STACK_TOTAL_REPLICAS: u16 = 256;
 pub const MAX_STACK_TOTAL_SURGE_REPLICAS: u16 = 64;
+pub const MAX_STACK_TOTAL_ACTIVE_REPLICAS: u16 =
+    MAX_STACK_TOTAL_REPLICAS + MAX_STACK_TOTAL_SURGE_REPLICAS;
 pub const MAX_STACK_RESTARTS: u16 = 64;
 pub const MAX_STACK_RESOURCES: usize = 128;
 pub const MAX_STACK_SECRETS: usize = 128;
@@ -432,6 +439,46 @@ pub struct EngineStore {
 
 pub struct SupervisorLease {
     _lock: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GenerationRole {
+    Desired,
+    RolloutCandidate,
+    RolloutPrevious,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GenerationTarget {
+    pub stack: String,
+    pub revision: u64,
+    pub generation: String,
+    pub role: GenerationRole,
+    pub rollout_id: Option<String>,
+    pub plan: StackPlan,
+}
+
+impl GenerationTarget {
+    pub fn validate(&self) -> Result<(), String> {
+        self.plan.validate()?;
+        let rollout_identity_valid = match self.role {
+            GenerationRole::Desired => self.rollout_id.is_none(),
+            GenerationRole::RolloutCandidate | GenerationRole::RolloutPrevious => self
+                .rollout_id
+                .as_ref()
+                .is_some_and(|value| is_digest(value)),
+        };
+        if !valid_name(&self.stack)
+            || self.revision == 0
+            || !is_digest(&self.generation)
+            || self.plan.stack != self.stack
+            || !rollout_identity_valid
+        {
+            return Err("generation target is invalid".into());
+        }
+        Ok(())
+    }
 }
 
 impl StackManifest {
@@ -898,6 +945,84 @@ impl EngineStore {
             .map(|plan| (event.revision, event.event_sha256, plan)))
     }
 
+    pub fn generation_target(
+        &self,
+        stack: &str,
+        generation: &str,
+    ) -> Result<Option<GenerationTarget>, String> {
+        if !valid_name(stack) || !is_digest(generation) {
+            return Err("runtime generation identity is invalid".into());
+        }
+        let desired = self.desired_plan(stack)?;
+        let rollout = self.rollout(stack)?;
+        if let Some((revision, current_generation, plan)) = desired
+            && current_generation == generation
+        {
+            let active_rollout = rollout.as_ref().filter(|record| {
+                record.phase == RolloutPhase::Activated
+                    && record.activated_generation.as_deref() == Some(generation)
+            });
+            let target = GenerationTarget {
+                stack: stack.into(),
+                revision,
+                generation: current_generation,
+                role: if active_rollout.is_some() {
+                    GenerationRole::RolloutCandidate
+                } else {
+                    GenerationRole::Desired
+                },
+                rollout_id: active_rollout.map(|record| record.rollout_id.clone()),
+                plan,
+            };
+            target.validate()?;
+            return Ok(Some(target));
+        }
+        let Some(record) = rollout.filter(|record| {
+            record.phase == RolloutPhase::Activated
+                && record.previous_state == Some(EngineStackState::Applied)
+                && record.previous_generation.as_deref() == Some(generation)
+        }) else {
+            return Ok(None);
+        };
+        let target = GenerationTarget {
+            stack: stack.into(),
+            revision: record
+                .previous_revision
+                .ok_or_else(|| "rollout previous revision is missing".to_string())?,
+            generation: generation.into(),
+            role: GenerationRole::RolloutPrevious,
+            rollout_id: Some(record.rollout_id),
+            plan: record
+                .previous_plan
+                .ok_or_else(|| "rollout previous plan is missing".to_string())?,
+        };
+        target.validate()?;
+        Ok(Some(target))
+    }
+
+    pub fn generation_targets(&self, stack: &str) -> Result<Vec<GenerationTarget>, String> {
+        if !valid_name(stack) {
+            return Err("stack name is invalid".into());
+        }
+        let mut generations = Vec::new();
+        if let Some((_revision, generation, _plan)) = self.desired_plan(stack)?
+            && let Some(target) = self.generation_target(stack, &generation)?
+        {
+            generations.push(target);
+        }
+        if let Some(record) = self.rollout(stack)?
+            && record.phase == RolloutPhase::Activated
+            && record.previous_state == Some(EngineStackState::Applied)
+            && let Some(generation) = record.previous_generation.as_deref()
+            && let Some(target) = self.generation_target(stack, generation)?
+        {
+            generations.push(target);
+        }
+        generations.sort_by(|left, right| left.generation.cmp(&right.generation));
+        generations.dedup_by(|left, right| left.generation == right.generation);
+        Ok(generations)
+    }
+
     pub fn runtime_status(&self, stack: &str) -> Result<Option<StackRuntimeStatus>, String> {
         let Some((revision, generation, plan)) = self.desired_plan(stack)? else {
             return Ok(None);
@@ -981,6 +1106,81 @@ impl EngineStore {
         Ok(status)
     }
 
+    pub fn runtime_status_for_generation(
+        &self,
+        stack: &str,
+        generation: &str,
+    ) -> Result<Option<StackRuntimeStatus>, String> {
+        let Some(target) = self.generation_target(stack, generation)? else {
+            return Ok(None);
+        };
+        let path = self.generation_runtime_status_path(stack, generation)?;
+        recover_runtime_status(&path)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let status = read_runtime_status(&path)?;
+        status.validate_against(&target.plan, target.revision, target.generation.as_str())?;
+        Ok(Some(status))
+    }
+
+    pub fn save_runtime_status_for_generation(
+        &self,
+        status: &StackRuntimeStatus,
+    ) -> Result<(), String> {
+        status.validate()?;
+        let target = self
+            .generation_target(&status.stack, &status.generation)?
+            .ok_or_else(|| "runtime status generation is no longer authorized".to_string())?;
+        status.validate_against(&target.plan, target.revision, target.generation.as_str())?;
+        let bytes = serde_json::to_vec(status).map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_RUNTIME_STATUS_BYTES {
+            return Err("runtime status exceeds its byte limit".into());
+        }
+        let path = self.generation_runtime_status_path(&status.stack, &status.generation)?;
+        recover_runtime_status(&path)?;
+        write_replace_atomic(&path, &bytes)
+    }
+
+    pub fn prepare_runtime_status_for_generation(
+        &self,
+        stack: &str,
+        generation: &str,
+        now_ms: u64,
+    ) -> Result<StackRuntimeStatus, String> {
+        let target = self
+            .generation_target(stack, generation)?
+            .ok_or_else(|| "runtime generation is no longer authorized".to_string())?;
+        let path = self.generation_runtime_status_path(stack, generation)?;
+        recover_runtime_status(&path)?;
+        let mut status = if path.exists() {
+            let previous = read_runtime_status(&path)?;
+            if previous
+                .validate_against(&target.plan, target.revision, &target.generation)
+                .is_ok()
+            {
+                previous
+            } else {
+                StackRuntimeStatus::from_plan(
+                    &target.plan,
+                    target.revision,
+                    &target.generation,
+                    now_ms,
+                )?
+            }
+        } else {
+            StackRuntimeStatus::from_plan(
+                &target.plan,
+                target.revision,
+                &target.generation,
+                now_ms,
+            )?
+        };
+        status.recover_interrupted(now_ms)?;
+        self.save_runtime_status_for_generation(&status)?;
+        Ok(status)
+    }
+
     pub fn acquire_supervisor_lease(&self, stack: &str) -> Result<SupervisorLease, String> {
         let Some((_revision, _generation, _plan)) = self.desired_plan(stack)? else {
             return Err("removed stack cannot be supervised".into());
@@ -1002,28 +1202,52 @@ impl EngineStore {
         }
     }
 
+    pub fn acquire_generation_supervisor_lease(
+        &self,
+        stack: &str,
+        generation: &str,
+    ) -> Result<SupervisorLease, String> {
+        if self.generation_target(stack, generation)?.is_none() {
+            return Err("runtime generation cannot be supervised".into());
+        }
+        let directory = self.root.join("stacks").join(stack).join("supervisors");
+        ensure_directory(&directory)?;
+        let path = directory.join(format!("{generation}.lock"));
+        if path.exists() && !is_regular_file(&path) {
+            return Err("generation supervisor lock path is not a regular file".into());
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        private_options(&mut options);
+        let lock = options.open(path).map_err(|error| error.to_string())?;
+        match FileExt::try_lock(&lock) {
+            Ok(()) => Ok(SupervisorLease { _lock: lock }),
+            Err(TryLockError::WouldBlock) => {
+                Err("generation already has an active supervisor".into())
+            }
+            Err(TryLockError::Error(error)) => Err(error.to_string()),
+        }
+    }
+
     pub fn replica_state_directory(
         &self,
         stack: &str,
         generation: &str,
         id: &ReplicaId,
     ) -> Result<PathBuf, String> {
-        let Some((_revision, current_generation, plan)) = self.desired_plan(stack)? else {
-            return Err("removed stack has no replica state".into());
-        };
-        let planned_instance = plan
+        let target = self
+            .generation_target(stack, generation)?
+            .ok_or_else(|| "runtime generation has no replica state authority".to_string())?;
+        let planned_instance = target
+            .plan
             .instances
             .iter()
             .find(|instance| instance.name == id.instance && id.ordinal <= instance.replicas);
-        if current_generation != generation
-            || !valid_name(&id.instance)
-            || id.ordinal == 0
-            || planned_instance.is_none()
-        {
-            return Err("replica state request does not match the desired generation".into());
+        if !valid_name(&id.instance) || id.ordinal == 0 || planned_instance.is_none() {
+            return Err("replica state request does not match its generation target".into());
         }
         let package_sha256 = &planned_instance
-            .ok_or_else(|| "replica is not part of the desired generation".to_string())?
+            .ok_or_else(|| "replica is not part of the generation target".to_string())?
             .package_sha256;
         let stack_root = self.root.join("stacks").join(stack);
         ensure_directory(&stack_root)?;
@@ -1033,7 +1257,11 @@ impl EngineStore {
         ensure_directory(&instance)?;
         let replica = instance.join(format!("{:04}", id.ordinal));
         ensure_directory(&replica)?;
-        let state = replica.join("state");
+        let generations = replica.join("generations");
+        ensure_directory(&generations)?;
+        let generation = generations.join(generation);
+        ensure_directory(&generation)?;
+        let state = generation.join("state");
         ensure_directory(&state)?;
         let package_state = state.join(package_sha256);
         ensure_directory(&package_state)?;
@@ -1047,28 +1275,26 @@ impl EngineStore {
         id: &ReplicaId,
         run_id: &str,
     ) -> Result<PathBuf, String> {
-        let Some((_revision, current_generation, plan)) = self.desired_plan(stack)? else {
-            return Err("removed stack has no application health channel".into());
-        };
-        let probe_is_planned = plan.instances.iter().any(|instance| {
+        let target = self
+            .generation_target(stack, generation)?
+            .ok_or_else(|| "runtime generation has no health-channel authority".to_string())?;
+        let probe_is_planned = target.plan.instances.iter().any(|instance| {
             instance.name == id.instance
                 && id.ordinal > 0
                 && id.ordinal <= instance.replicas
                 && instance.desired == DesiredState::Running
                 && instance.health.is_some()
         });
-        if current_generation != generation
-            || !valid_name(&id.instance)
-            || !is_digest(run_id)
-            || !probe_is_planned
-        {
+        if !valid_name(&id.instance) || !is_digest(run_id) || !probe_is_planned {
             return Err("application health channel does not match the desired generation".into());
         }
         let stack_root = self.root.join("stacks").join(stack);
         ensure_directory(&stack_root)?;
         let probes = stack_root.join("probes");
         ensure_directory(&probes)?;
-        let instance = probes.join(&id.instance);
+        let generation = probes.join(generation);
+        ensure_directory(&generation)?;
+        let instance = generation.join(&id.instance);
         ensure_directory(&instance)?;
         let replica = instance.join(format!("{:04}", id.ordinal));
         ensure_directory(&replica)?;
@@ -1077,16 +1303,35 @@ impl EngineStore {
     }
 
     pub fn clear_probe_channels(&self, stack: &str) -> Result<usize, String> {
-        if !valid_name(stack) || self.desired_plan(stack)?.is_none() {
+        let Some((_revision, generation, _plan)) = self.desired_plan(stack)? else {
             return Err("stack has no active application health channels".into());
+        };
+        self.clear_probe_channels_for_generation(stack, &generation)
+    }
+
+    pub fn clear_probe_channels_for_generation(
+        &self,
+        stack: &str,
+        generation: &str,
+    ) -> Result<usize, String> {
+        if self.generation_target(stack, generation)?.is_none() {
+            return Err("runtime generation has no health-channel authority".into());
         }
-        let probes = self.root.join("stacks").join(stack).join("probes");
+        let probes_root = self.root.join("stacks").join(stack).join("probes");
+        if !probes_root.exists() {
+            return Ok(0);
+        }
+        let metadata = fs::symlink_metadata(&probes_root).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("application health channel root is unsafe".into());
+        }
+        let probes = probes_root.join(generation);
         if !probes.exists() {
             return Ok(0);
         }
         let metadata = fs::symlink_metadata(&probes).map_err(|error| error.to_string())?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err("application health channel root is unsafe".into());
+            return Err("application health generation root is unsafe".into());
         }
         let mut files = Vec::new();
         let mut directories = Vec::new();
@@ -1097,7 +1342,14 @@ impl EngineStore {
         for path in &directories {
             fs::remove_dir(path).map_err(|error| error.to_string())?;
         }
-        fs::remove_dir(probes).map_err(|error| error.to_string())?;
+        fs::remove_dir(&probes).map_err(|error| error.to_string())?;
+        if fs::read_dir(&probes_root)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_none()
+        {
+            fs::remove_dir(probes_root).map_err(|error| error.to_string())?;
+        }
         Ok(files.len())
     }
 
@@ -1165,6 +1417,19 @@ impl EngineStore {
             ensure_directory(&stack_root)?;
         }
         Ok(stack_root.join("runtime.json"))
+    }
+
+    fn generation_runtime_status_path(
+        &self,
+        stack: &str,
+        generation: &str,
+    ) -> Result<PathBuf, String> {
+        if !valid_name(stack) || !is_digest(generation) {
+            return Err("runtime generation identity is invalid".into());
+        }
+        let directory = self.root.join("stacks").join(stack).join("runtime");
+        ensure_directory(&directory)?;
+        Ok(directory.join(format!("{generation}.json")))
     }
 
     fn append(&self, event: &EngineEvent) -> Result<(), String> {

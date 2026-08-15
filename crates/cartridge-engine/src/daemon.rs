@@ -256,7 +256,7 @@ impl DaemonInfo {
             || self.max_supervisors == 0
             || self.max_supervisors > MAX_DAEMON_SUPERVISORS
             || self.workers_per_stack == 0
-            || self.workers_per_stack > super::MAX_STACK_TOTAL_REPLICAS
+            || self.workers_per_stack > super::MAX_STACK_TOTAL_ACTIVE_REPLICAS
             || self.applied_stacks > self.known_stacks
         {
             return Err("daemon information is invalid".into());

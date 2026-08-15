@@ -2754,7 +2754,9 @@ fn supervise_stack(
     daemon_instance: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    if max_workers == 0 || max_workers > 256 {
+    if max_workers == 0
+        || max_workers > usize::from(cartridge_engine::MAX_STACK_TOTAL_ACTIVE_REPLICAS)
+    {
         bail!("supervisor worker limit is invalid");
     }
     if let Some(instance) = daemon_instance

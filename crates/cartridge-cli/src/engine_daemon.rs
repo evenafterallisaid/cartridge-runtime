@@ -14,7 +14,8 @@ use cartridge_desktop::Library;
 use cartridge_engine::{
     DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse,
     EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
-    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_REPLICAS, ReplicaPhase, StackPlan, daemon_request,
+    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_ACTIVE_REPLICAS, ReplicaPhase, StackPlan,
+    daemon_request,
 };
 
 use crate::process_control::{
@@ -102,7 +103,8 @@ pub fn serve(options: &ServeOptions<'_>) -> Result<()> {
     if options.max_supervisors == 0 || options.max_supervisors > MAX_DAEMON_SUPERVISORS {
         bail!("daemon supervisor limit is invalid");
     }
-    if options.workers_per_stack == 0 || options.workers_per_stack > MAX_STACK_TOTAL_REPLICAS {
+    if options.workers_per_stack == 0 || options.workers_per_stack > MAX_STACK_TOTAL_ACTIVE_REPLICAS
+    {
         bail!("daemon worker limit is invalid");
     }
 
