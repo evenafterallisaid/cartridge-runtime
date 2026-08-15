@@ -3418,6 +3418,15 @@ fn print_stack_plan(plan: &StackPlan) {
                 health.failure_threshold
             );
         }
+        println!(
+            "    update: {:?} surge={} unavailable={} min-ready={}ms progress={}ms drain={}ms",
+            instance.update.order,
+            instance.update.max_surge,
+            instance.update.max_unavailable,
+            instance.update.min_ready_ms,
+            instance.update.progress_deadline_ms,
+            instance.update.drain_timeout_ms
+        );
     }
     for warning in &plan.warnings {
         println!("warning: {warning}");

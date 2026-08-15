@@ -171,6 +171,11 @@ jobs:
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.stack.toml
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-timeout.stack.toml
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-liveness.stack.toml
+          cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.rolling.stack.toml
+          cargo run -p cartridge-cli -- stack plan tests/fixtures/Cartridge.rolling.stack.toml --library library --output rolling.stack-plan.json
+          grep '"format_version": 4' rolling.stack-plan.json
+          grep '"max_surge": 1' rolling.stack-plan.json
+          grep '"progress_deadline_ms": 180000' rolling.stack-plan.json
           cargo run -p cartridge-cli -- stack plan tests/fixtures/Cartridge.stack.toml --library library --output hello.stack-plan.json
           grep '"timeout_ms": 5000' hello.stack-plan.json
           cargo run -p cartridge-cli -- stack apply tests/fixtures/Cartridge.stack.toml --library library --root engine

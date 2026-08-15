@@ -42,6 +42,16 @@ interface PlannedInstance {
   allowed: string[];
   denied: string[];
   limits: RuntimeLimits;
+  update?: RollingUpdatePolicy;
+}
+
+interface RollingUpdatePolicy {
+  order: "start-first" | "stop-first";
+  max_surge: number;
+  max_unavailable: number;
+  min_ready_ms: number;
+  progress_deadline_ms: number;
+  drain_timeout_ms: number;
 }
 
 interface RuntimeLimits {
@@ -824,6 +834,21 @@ function planInstance(instance: PlannedInstance): HTMLElement {
   );
   card.append(limits);
   card.append(element("p", "restart-policy", `restart ${instance.restart} · up to ${instance.max_restarts} retries`));
+  const update = instance.update ?? {
+    order: "start-first",
+    max_surge: 1,
+    max_unavailable: 0,
+    min_ready_ms: 2000,
+    progress_deadline_ms: 300000,
+    drain_timeout_ms: 30000,
+  };
+  card.append(
+    element(
+      "p",
+      "restart-policy",
+      `update ${update.order} · surge ${update.max_surge} · unavailable ${update.max_unavailable} · ready ${update.min_ready_ms} ms · deadline ${update.progress_deadline_ms} ms · drain ${update.drain_timeout_ms} ms`,
+    ),
+  );
   card.append(capabilityRow("Allowed", instance.allowed, false));
   if (instance.denied.length > 0) card.append(capabilityRow("Denied", instance.denied, true));
   return card;

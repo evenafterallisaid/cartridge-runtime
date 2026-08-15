@@ -1,0 +1,38 @@
+format_version = 1
+name = "rolling-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "web"
+cartridge = "dev.cartridge.hello"
+version = "^0.1"
+replicas = 3
+restart = "on-failure"
+max_restarts = 3
+allow = ["clock", "assets", "storage"]
+args = ["Rolling"]
+
+[instances.health]
+startup_timeout_ms = 5000
+readiness_timeout_ms = 10000
+liveness_timeout_ms = 1000
+failure_threshold = 2
+
+[instances.update]
+order = "start-first"
+max_surge = 1
+max_unavailable = 0
+min_ready_ms = 5000
+progress_deadline_ms = 180000
+drain_timeout_ms = 15000
+
+[instances.limits]
+fuel = 5000000
+memory_bytes = 33554432
+timeout_ms = 5000
+storage_bytes = 524288
+storage_keys = 512
+storage_value_bytes = 131072

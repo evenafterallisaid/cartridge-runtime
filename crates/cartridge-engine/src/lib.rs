@@ -1,6 +1,7 @@
 mod daemon;
 mod health;
 mod probe;
+mod rolling;
 mod rollout;
 mod supervisor;
 
@@ -18,6 +19,11 @@ pub use probe::{
     ENGINE_PROBE_FORMAT_VERSION, MAX_PROBE_ENVELOPE_BYTES, MAX_PROBE_FAILURE_THRESHOLD,
     MAX_PROBE_TIMEOUT_MS, MIN_PROBE_TIMEOUT_MS, ProbeChannelKey, ProbeEnvelope, ProbeSignal,
     ProbeSignalKind,
+};
+pub use rolling::{
+    MAX_ROLLING_DRAIN_TIMEOUT_MS, MAX_ROLLING_MIN_READY_MS, MAX_ROLLING_PROGRESS_DEADLINE_MS,
+    MIN_ROLLING_PROGRESS_DEADLINE_MS, RollingAction, RollingObservation, RollingOrder,
+    RollingRollbackReason, RollingUpdatePolicy, RollingWaitReason,
 };
 pub use rollout::{
     ENGINE_ROLLOUT_FORMAT_VERSION, MAX_ROLLOUT_BYTES, MAX_ROLLOUT_HISTORY,
@@ -49,13 +55,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const STACK_FORMAT_VERSION: u32 = 1;
-pub const STACK_PLAN_FORMAT_VERSION: u32 = 3;
+pub const STACK_PLAN_FORMAT_VERSION: u32 = 4;
 pub const LEGACY_STACK_PLAN_FORMAT_VERSION: u32 = 2;
+pub const HEALTH_STACK_PLAN_FORMAT_VERSION: u32 = 3;
 pub const ENGINE_EVENT_FORMAT_VERSION: u32 = 1;
 pub const MAX_STACK_BYTES: u64 = 1024 * 1024;
 pub const MAX_STACK_INSTANCES: usize = 64;
 pub const MAX_STACK_REPLICAS: u16 = 32;
 pub const MAX_STACK_TOTAL_REPLICAS: u16 = 256;
+pub const MAX_STACK_TOTAL_SURGE_REPLICAS: u16 = 64;
 pub const MAX_STACK_RESTARTS: u16 = 64;
 pub const MAX_STACK_RESOURCES: usize = 128;
 pub const MAX_STACK_SECRETS: usize = 128;
@@ -149,6 +157,8 @@ pub struct InstanceSpec {
     pub limits: InstanceLimits,
     #[serde(default)]
     pub health: Option<HealthProbeSpec>,
+    #[serde(default)]
+    pub update: RollingUpdatePolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -345,6 +355,8 @@ pub struct PlannedInstance {
     pub limits: RuntimeLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthProbeSpec>,
+    #[serde(default, skip_serializing_if = "RollingUpdatePolicy::is_default")]
+    pub update: RollingUpdatePolicy,
     pub composition: CompositionLock,
 }
 
@@ -466,17 +478,22 @@ impl StackManifest {
         }
         let mut instances = BTreeSet::new();
         let mut total_replicas = 0_u16;
+        let mut total_surge = 0_u16;
         for instance in &self.instances {
             validate_instance(instance)?;
             total_replicas = total_replicas
                 .checked_add(instance.replicas)
                 .ok_or_else(|| "stack replica count overflow".to_string())?;
+            total_surge = total_surge
+                .checked_add(instance.update.max_surge)
+                .ok_or_else(|| "stack surge count overflow".to_string())?;
             if !instances.insert(instance.name.as_str()) {
                 return Err("stack instance names must be unique".into());
             }
         }
-        if total_replicas > MAX_STACK_TOTAL_REPLICAS {
-            return Err("stack exceeds its aggregate replica limit".into());
+        if total_replicas > MAX_STACK_TOTAL_REPLICAS || total_surge > MAX_STACK_TOTAL_SURGE_REPLICAS
+        {
+            return Err("stack exceeds its aggregate replica or surge limit".into());
         }
         let mut resources = BTreeSet::new();
         for resource in &self.resources {
@@ -583,12 +600,19 @@ impl StackPlan {
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(
             self.format_version,
-            LEGACY_STACK_PLAN_FORMAT_VERSION | STACK_PLAN_FORMAT_VERSION
+            LEGACY_STACK_PLAN_FORMAT_VERSION
+                | HEALTH_STACK_PLAN_FORMAT_VERSION
+                | STACK_PLAN_FORMAT_VERSION
         ) || (self.format_version == LEGACY_STACK_PLAN_FORMAT_VERSION
             && self
                 .instances
                 .iter()
-                .any(|instance| instance.health.is_some()))
+                .any(|instance| instance.health.is_some() || !instance.update.is_default()))
+            || (self.format_version == HEALTH_STACK_PLAN_FORMAT_VERSION
+                && self
+                    .instances
+                    .iter()
+                    .any(|instance| !instance.update.is_default()))
             || !valid_name(&self.stack)
             || self.instances.is_empty()
             || self.instances.len() > MAX_STACK_INSTANCES
@@ -1184,11 +1208,15 @@ fn validate_planned_instances(
     let mut names = BTreeSet::new();
     let mut previous_name = None;
     let mut total_replicas = 0_u16;
+    let mut total_surge = 0_u16;
     for instance in instances {
         validate_planned_instance(instance, profile, &declared_secrets)?;
         total_replicas = total_replicas
             .checked_add(instance.replicas)
             .ok_or_else(|| "stack plan replica count overflow".to_string())?;
+        total_surge = total_surge
+            .checked_add(instance.update.max_surge)
+            .ok_or_else(|| "stack plan surge count overflow".to_string())?;
         if previous_name.is_some_and(|previous| previous >= instance.name.as_str())
             || !names.insert(instance.name.clone())
         {
@@ -1196,8 +1224,8 @@ fn validate_planned_instances(
         }
         previous_name = Some(instance.name.as_str());
     }
-    if total_replicas > MAX_STACK_TOTAL_REPLICAS {
-        return Err("stack plan exceeds its aggregate replica limit".into());
+    if total_replicas > MAX_STACK_TOTAL_REPLICAS || total_surge > MAX_STACK_TOTAL_SURGE_REPLICAS {
+        return Err("stack plan exceeds its aggregate replica or surge limit".into());
     }
     Ok(names)
 }
@@ -1214,6 +1242,7 @@ fn validate_planned_instance(
     if let Some(health) = &instance.health {
         health.validate()?;
     }
+    instance.update.validate(instance.replicas)?;
     let argument_bytes = instance
         .args
         .iter()
@@ -1330,6 +1359,7 @@ fn validate_instance(value: &InstanceSpec) -> Result<(), String> {
     if let Some(health) = &value.health {
         health.validate()?;
     }
+    value.update.validate(value.replicas)?;
     let argument_bytes = value
         .args
         .iter()
@@ -1414,6 +1444,7 @@ fn plan_instance(
         secrets: spec.secrets.clone(),
         limits,
         health: spec.health.clone(),
+        update: spec.update.clone(),
         composition,
     })
 }
@@ -1970,6 +2001,7 @@ mod tests {
                 secrets: BTreeSet::from(["api-key".into()]),
                 limits: InstanceLimits::default(),
                 health: None,
+                update: RollingUpdatePolicy::default(),
             }],
             resources: vec![ResourceSpec {
                 name: "app-state".into(),
@@ -2026,6 +2058,38 @@ mod tests {
         plan.instances[0].health = Some(HealthProbeSpec::default());
         plan.plan_sha256 = plan.computed_sha256().unwrap();
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn rolling_policy_is_plan_bound_and_format_three_remains_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = package(directory.path(), "1.0.0", "clock = true");
+        let mut library = Library::open(directory.path().join("library")).unwrap();
+        library.install(&package).unwrap();
+
+        let mut stack = manifest(SandboxPolicy::Required);
+        stack.instances[0].health = Some(HealthProbeSpec::default());
+        let mut legacy = StackPlan::build(&stack, &library).unwrap();
+        legacy.format_version = HEALTH_STACK_PLAN_FORMAT_VERSION;
+        legacy.plan_sha256 = legacy.computed_sha256().unwrap();
+        legacy.validate().unwrap();
+
+        legacy.instances[0].update = RollingUpdatePolicy {
+            max_surge: 2,
+            max_unavailable: 1,
+            min_ready_ms: 5_000,
+            ..RollingUpdatePolicy::default()
+        };
+        legacy.plan_sha256 = legacy.computed_sha256().unwrap();
+        assert!(legacy.validate().is_err());
+
+        stack.instances[0].update = legacy.instances[0].update.clone();
+        let plan = StackPlan::build(&stack, &library).unwrap();
+        assert_eq!(plan.format_version, STACK_PLAN_FORMAT_VERSION);
+        assert_eq!(plan.instances[0].update.max_surge, 2);
+        let mut changed = plan.clone();
+        changed.instances[0].update.max_unavailable = 0;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
@@ -2302,6 +2366,21 @@ mod tests {
             let mut instance = template.clone();
             instance.name = format!("app-{index}");
             instance.replicas = MAX_STACK_REPLICAS;
+            value.instances.push(instance);
+        }
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn aggregate_surge_limit_prevents_replacement_fork_bombs() {
+        let mut value = manifest(SandboxPolicy::Required);
+        let mut template = value.instances[0].clone();
+        template.replicas = 2;
+        template.update.max_surge = 2;
+        value.instances.clear();
+        for index in 0..33 {
+            let mut instance = template.clone();
+            instance.name = format!("app-{index}");
             value.instances.push(instance);
         }
         assert!(value.validate().is_err());

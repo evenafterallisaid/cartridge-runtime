@@ -12,7 +12,7 @@ No known exploitable issue remains in the implemented portable operator-budget b
 
 | ID | Severity | Finding | Resolution |
 | --- | --- | --- | --- |
-| RGC-01 | high | stack policy could remove capabilities but could not reduce resource budgets requested by a package | every instance can declare bounded optional ceilings; planning resolves the minimum and binds all exact values into the current plan format (format 3 after application-health policy was added) |
+| RGC-01 | high | stack policy could remove capabilities but could not reduce resource budgets requested by a package | every instance can declare bounded optional ceilings; planning resolves the minimum and binds all exact values into the current plan format (format 4 after rolling policy was added) |
 | RGC-02 | high | a launch-path bug could have omitted a planned ceiling after review | the worker receives a bounded strict document through its cleared private control environment and `cartridge-runtime` intersects it again at the enforcement boundary |
 | RGC-03 | high | snapshot branches were constructed with package storage limits before a runtime ceiling could apply | branch construction now uses the effective storage byte, key, and value limits before any state operation |
 | RGC-04 | medium | a client with the daemon capability could recompute a valid plan digest after raising a resource ceiling; the supervisor rejected launch, but the altered desired plan could be journaled first | apply-time installed-package verification and the supervisor both reopen the exact package and reject any plan value that is not a ceiling before mutation or launch |

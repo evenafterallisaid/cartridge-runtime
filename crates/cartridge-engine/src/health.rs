@@ -355,6 +355,7 @@ mod tests {
                 secrets: BTreeSet::new(),
                 limits: RuntimeLimits::default(),
                 health: None,
+                update: crate::RollingUpdatePolicy::default(),
                 composition: CompositionLock::new(
                     LockedPackage {
                         cartridge_id: "dev.test.web".into(),

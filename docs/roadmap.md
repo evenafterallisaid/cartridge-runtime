@@ -1010,7 +1010,8 @@ The next concrete sequence is:
    - [implemented] strict/balanced/permissive capability policy with explicit grants and blocks
    - [implemented] add per-instance fuel, linear-memory, wall-time, storage, graphics, and audio ceilings
    - [implemented for guest signals] add bounded startup, readiness, and liveness health policy
-   - add service edges, kernel budgets, HTTP/command probes, jobs, ingress, and rollout policy
+   - add service edges, kernel budgets, HTTP/command probes, jobs, and ingress
+   - [implemented: policy and decision core] plan-bound start-first/stop-first rolling policy with bounded surge, unavailable, minimum-ready, progress-deadline, and drain-timeout values plus deterministic per-ordinal actions
    - add a semantic plan diff alongside the implemented canonical plan digest
 5. [partially implemented] Turn the local desired-state engine into a reconciler:
    - [implemented] globally locked, checksum-chained, idempotent apply/stop/remove journal
@@ -1021,7 +1022,8 @@ The next concrete sequence is:
    - [implemented with application readiness] deadline-gated automatic update commit with exact previous-generation rollback
    - [implemented: guest-signal slice] manifest-defined startup, readiness, and liveness deadlines, bounded encrypted reports, replay fencing, failure thresholds, restart integration, authenticated aggregate health, and rollout gating
    - add isolated command and scoped HTTP probe runners, success thresholds, jittered schedules, per-probe capability ceilings, and redacted bounded output retention
-   - add rollout policy for `max_surge`, `max_unavailable`, minimum ready time, progress deadlines, pause/resume, and per-instance ordering
+   - [implemented: scheduler core] enforce `max_surge`, `max_unavailable`, minimum ready time, progress deadlines, start-first/stop-first ordering, deterministic ordinal selection, and fail-closed observation validation; pause/resume remains
+   - persist scheduler observations and progress timestamps in crash-recoverable rollout checkpoints
    - retain old and new generation supervisors concurrently, route only to ready replicas, drain gracefully, and recover ownership after daemon failure
    - add deterministic canary cohorts, metric/trace gates, operator promotion, and automatic abort without widening package authority
    - require migration compatibility or a verified rollback receipt before updating stateful instances whose schema changes
