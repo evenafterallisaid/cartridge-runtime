@@ -399,7 +399,8 @@ fn load_settings(path: &Path) -> Result<AppSettings, String> {
 fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| "desktop settings path has no parent".to_string())?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err("desktop settings path is not a regular file".into());

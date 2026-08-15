@@ -1161,7 +1161,8 @@ fn write_bytes_new(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 fn sync_parent_directory(path: &Path) -> Result<(), String> {
     let directory = path
         .parent()
-        .ok_or_else(|| "durable identity path has no parent".to_string())?;
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
@@ -1190,6 +1191,12 @@ fn acquire_lock(file: &File) -> Result<(), String> {
 mod tests {
     use super::*;
     use cartridge_core::{PackOptions, pack};
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_durable_paths_sync_the_current_directory() {
+        sync_parent_directory(Path::new("relative.json")).unwrap();
+    }
 
     fn package(root: &Path, version: &str) -> PathBuf {
         let manifest = root.join(format!("{version}.toml"));

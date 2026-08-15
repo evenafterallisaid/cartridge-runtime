@@ -1046,7 +1046,8 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn sync_parent_directory(path: &Path) -> Result<(), String> {
     let directory = path
         .parent()
-        .ok_or_else(|| "durable library path has no parent".to_string())?;
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(|error| error.to_string())
