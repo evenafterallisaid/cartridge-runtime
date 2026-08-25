@@ -1040,7 +1040,9 @@ The next concrete sequence is:
    - [implemented] exact plan and permission review with server-retained digest and package re-verification before apply
    - [implemented] private native-backed appearance and new-stack preferences with light/dark/system themes, density, and reduced-motion control
    - [implemented] encrypted authenticated daemon client, fail-closed lifecycle mutations, live engine capacity, and observed per-replica lifecycle inspection
-   - add resource charts, semantic plan diff, package import, and secret prompts
+   - [implemented] native `.cartridge` import with bounded exact-byte installation and a re-verified package/version inspector
+   - add package grant/revoke controls, version lifecycle actions, signing/trust inspection, and update comparison
+   - add resource charts, semantic plan diff, and secret prompts
    - add live logs, health checks, trace inspection, and rollback controls
    - install and supervise the daemon through native per-user service managers, with explicit start/restart/recovery UX
    - no privileged background service by default; explicit elevation only for optional adapters

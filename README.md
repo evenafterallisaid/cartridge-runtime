@@ -195,7 +195,7 @@ npm ci
 npm run tauri dev
 ```
 
-The desktop connects to the same encrypted authenticated local daemon as the CLI. It shows daemon capacity plus live or last-recorded replica lifecycle, restart, run, and exit state. It can load a stack manifest, review exact hashes, resource ceilings, and effective permissions, then apply that reviewed digest, stop it, or tombstone it. Mutations fail closed while the daemon is unavailable; offline state remains inspectable. The backend keeps the control key and reviewed plan outside the webview and re-verifies every installed package before apply. Light, dark, density, motion, and new-stack defaults persist in the private app-data directory.
+The desktop connects to the same encrypted authenticated local daemon as the CLI. It shows daemon capacity plus live or last-recorded replica lifecycle, restart, run, and exit state. It can import a `.cartridge` through a native file picker, inspect its exact digest, limits, assets, state schema, and effective permissions, then use installed packages in reviewed stack plans. It can load a stack manifest, review exact hashes, resource ceilings, and effective permissions, then apply that reviewed digest, stop it, or tombstone it. Mutations fail closed while the daemon is unavailable; offline state remains inspectable. The backend keeps package paths, package bytes, the control key, and the reviewed plan outside the webview and re-verifies every installed package before showing details or applying a stack. Light, dark, density, motion, and new-stack defaults persist in the private app-data directory.
 
 Build and run the visual reference with a replayable screenshot sidecar:
 

@@ -5,7 +5,8 @@ use std::{
     sync::Mutex,
 };
 
-use cartridge_desktop::{Library, LibraryEntry};
+use cartridge_core::{CartridgeArchive, RuntimeLimits};
+use cartridge_desktop::{Capability, Library, LibraryEntry};
 use cartridge_engine::{
     ApplyReport, DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse, EngineEvent, EngineStore,
     MAX_DAEMON_EVENTS, StackManifest, StackPlan, StackRuntimeStatus, StackStatus, daemon_request,
@@ -49,6 +50,31 @@ struct EngineConnection {
 struct StackDetails {
     plan: Option<StackPlan>,
     runtime: Option<StackRuntimeStatus>,
+}
+
+#[derive(Serialize)]
+struct ImportedPackage {
+    cartridge_id: String,
+    version: String,
+    name: String,
+    package_sha256: String,
+    package_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct PackageDetails {
+    cartridge_id: String,
+    version: String,
+    name: String,
+    description: String,
+    package_sha256: String,
+    package_bytes: u64,
+    asset_count: usize,
+    state_schema: u32,
+    runtime: RuntimeLimits,
+    requested: Vec<Capability>,
+    granted: Vec<Capability>,
+    missing: Vec<Capability>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -118,6 +144,29 @@ fn dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
         packages,
         stacks,
     })
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn import_package(state: State<'_, AppState>) -> Result<Option<ImportedPackage>, String> {
+    let Some(package) = rfd::FileDialog::new()
+        .add_filter("Cartridge package", &["cartridge"])
+        .set_title("Import a cartridge package")
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    import_package_from_path(&state.library, &package).map(Some)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn package_details(
+    cartridge: String,
+    version: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<PackageDetails, String> {
+    load_package_details(&state.library, &cartridge, version.as_deref())
 }
 
 #[tauri::command]
@@ -275,6 +324,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             dashboard,
+            import_package,
+            package_details,
             plan_stack,
             apply_stack,
             stop_stack,
@@ -286,6 +337,64 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("cartridge desktop failed to start");
+}
+
+fn import_package_from_path(root: &Path, package: &Path) -> Result<ImportedPackage, String> {
+    let metadata = fs::symlink_metadata(package)
+        .map_err(|error| format!("could not inspect selected package: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("selected package must be a regular file".into());
+    }
+    let mut library = Library::open(root)?;
+    let installed = library.install(package)?;
+    let installed_path = root.join(&installed.relative_path);
+    let archive = CartridgeArchive::open(&installed_path)
+        .map_err(|error| format!("could not verify installed package: {error}"))?;
+    if archive.package_sha256 != installed.package_sha256
+        || archive.package_bytes != installed.package_bytes
+    {
+        return Err("installed package identity changed after import".into());
+    }
+    Ok(ImportedPackage {
+        cartridge_id: archive.manifest.cartridge.id,
+        version: archive.manifest.cartridge.version,
+        name: archive.manifest.cartridge.name,
+        package_sha256: archive.package_sha256,
+        package_bytes: archive.package_bytes,
+    })
+}
+
+fn load_package_details(
+    root: &Path,
+    cartridge: &str,
+    version: Option<&str>,
+) -> Result<PackageDetails, String> {
+    let library = Library::open(root)?;
+    let record = library.catalog_package(cartridge, version)?;
+    let preflight = library.preflight(cartridge, Some(&record.version))?;
+    let archive = CartridgeArchive::open(&record.path)
+        .map_err(|error| format!("could not verify installed package: {error}"))?;
+    if archive.manifest.cartridge.id != record.cartridge_id
+        || archive.manifest.cartridge.version != record.version
+        || archive.package_sha256 != record.package_sha256
+        || archive.package_bytes != record.package_bytes
+    {
+        return Err("installed package no longer matches the library catalog".into());
+    }
+    Ok(PackageDetails {
+        cartridge_id: record.cartridge_id,
+        version: record.version,
+        name: archive.manifest.cartridge.name,
+        description: archive.manifest.cartridge.description,
+        package_sha256: archive.package_sha256,
+        package_bytes: archive.package_bytes,
+        asset_count: archive.assets.len(),
+        state_schema: archive.manifest.state.schema,
+        runtime: archive.manifest.runtime,
+        requested: preflight.requested.into_iter().collect(),
+        granted: preflight.granted.into_iter().collect(),
+        missing: preflight.missing.into_iter().collect(),
+    })
 }
 
 fn engine_dashboard(root: &Path) -> Result<(EngineConnection, Vec<StackStatus>), String> {
@@ -472,6 +581,65 @@ fn create_private_directory(path: &std::path::Path) -> Result<(), std::io::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cartridge_core::{PackOptions, pack};
+
+    fn package(root: &Path) -> PathBuf {
+        let manifest = root.join("Cartridge.toml");
+        let component = root.join("component.wasm");
+        let output = root.join("desktop.cartridge");
+        fs::write(
+            &manifest,
+            "format_version = 1\n[cartridge]\nid = \"dev.test.desktop\"\nname = \"Desktop fixture\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(&component, b"\0asm\x01\0\0\0").unwrap();
+        pack(&PackOptions {
+            manifest,
+            component,
+            assets: None,
+            output: output.clone(),
+        })
+        .unwrap();
+        output
+    }
+
+    #[test]
+    fn package_import_and_details_bind_the_installed_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let imported = import_package_from_path(&library, &package(directory.path())).unwrap();
+        assert_eq!(imported.cartridge_id, "dev.test.desktop");
+        assert_eq!(imported.version, "1.0.0");
+
+        let details = load_package_details(&library, &imported.cartridge_id, None).unwrap();
+        assert_eq!(details.package_sha256, imported.package_sha256);
+        assert_eq!(details.package_bytes, imported.package_bytes);
+        assert!(details.missing.is_empty());
+    }
+
+    #[test]
+    fn package_details_reject_tampered_installed_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let library_root = directory.path().join("library");
+        let imported = import_package_from_path(&library_root, &package(directory.path())).unwrap();
+        let installed = Library::open(&library_root)
+            .unwrap()
+            .package_path(&imported.cartridge_id, Some(&imported.version))
+            .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(installed).unwrap();
+        file.write_all(b"tampered").unwrap();
+        file.sync_all().unwrap();
+
+        assert!(load_package_details(&library_root, &imported.cartridge_id, None).is_err());
+    }
+
+    #[test]
+    fn package_import_rejects_non_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+
+        assert!(import_package_from_path(&library, directory.path()).is_err());
+    }
 
     #[test]
     fn settings_round_trip_and_replace_atomically() {

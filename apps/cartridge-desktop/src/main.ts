@@ -20,6 +20,29 @@ interface LibraryEntry {
   safe_mode: boolean;
 }
 
+interface ImportedPackage {
+  cartridge_id: string;
+  version: string;
+  name: string;
+  package_sha256: string;
+  package_bytes: number;
+}
+
+interface PackageDetails {
+  cartridge_id: string;
+  version: string;
+  name: string;
+  description: string;
+  package_sha256: string;
+  package_bytes: number;
+  asset_count: number;
+  state_schema: number;
+  runtime: RuntimeLimits;
+  requested: string[];
+  granted: string[];
+  missing: string[];
+}
+
 interface StackStatus {
   stack: string;
   revision: number;
@@ -173,6 +196,7 @@ const defaultSettings: AppSettings = {
 const content = required<HTMLElement>("content");
 const inspector = required<HTMLElement>("inspector");
 const fileInput = required<HTMLInputElement>("stack-file");
+const importPackageButton = required<HTMLButtonElement>("import-package-button");
 const notice = required<HTMLElement>("notice");
 const title = required<HTMLElement>("view-title");
 const description = required<HTMLElement>("view-description");
@@ -195,6 +219,7 @@ let stackFilter: "all" | StackState = "all";
 let settings: AppSettings = defaultSettings;
 let settingsQueue: Promise<void> = Promise.resolve();
 let bannerDismissed = false;
+let inspectorRequest = 0;
 
 function required<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -300,6 +325,7 @@ function render(): void {
     button.classList.toggle("active", button.dataset.view === currentView);
   });
   required<HTMLElement>("load-button").classList.toggle("hidden", currentView !== "stacks");
+  importPackageButton.classList.toggle("hidden", currentView !== "library");
   required<HTMLElement>("page-refresh").classList.toggle("hidden", currentView === "settings");
   previewBanner.classList.toggle("hidden", bannerDismissed || currentView === "settings");
   if (currentView === "stacks") renderStacks();
@@ -585,6 +611,15 @@ function renderLibrary(): void {
   const body = element("tbody");
   for (const entry of packages) {
     const row = element("tr");
+    row.tabIndex = 0;
+    row.setAttribute("aria-label", `Inspect ${entry.name}`);
+    row.addEventListener("click", () => void showPackage(entry, entry.versions[0]));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        void showPackage(entry, entry.versions[0]);
+      }
+    });
     const packageName = element("td");
     const primary = element("div", "primary-cell");
     primary.append(element("span", "package-cube", entry.name.slice(0, 1).toUpperCase()), element("strong", undefined, entry.name));
@@ -596,7 +631,7 @@ function renderLibrary(): void {
       packageName,
       element("td", "mono-cell", entry.cartridge_id),
       element("td", "numeric", String(entry.versions.length)),
-      element("td", "mono-cell", entry.versions.at(-1) ?? "—"),
+      element("td", "mono-cell", entry.versions[0] ?? "—"),
       health,
     );
     body.append(row);
@@ -607,12 +642,113 @@ function renderLibrary(): void {
     shell.append(emptyState(
       dashboard.packages.length === 0 ? "No packages installed" : "No matching packages",
       dashboard.packages.length === 0
-        ? "Package import is the next desktop milestone. Installed CLI packages can already be planned and run."
+        ? "Import a verified .cartridge package to make it available to local stacks."
         : "Try a different search term.",
       "package",
     ));
   }
   content.replaceChildren(shell);
+}
+
+async function importPackage(): Promise<void> {
+  if (mutating) return;
+  mutating = true;
+  importPackageButton.disabled = true;
+  const label = importPackageButton.lastChild;
+  if (label) label.textContent = "Importing…";
+  try {
+    const imported = await invoke<ImportedPackage | null>("import_package");
+    if (!imported) return;
+    showNotice(`Imported ${imported.name} ${imported.version} · ${formatBytes(imported.package_bytes)}.`);
+    await refresh();
+    const entry = dashboard.packages.find((value) => value.cartridge_id === imported.cartridge_id);
+    if (entry) await showPackage(entry, imported.version);
+  } catch (error) {
+    showNotice(String(error), "error");
+  } finally {
+    mutating = false;
+    importPackageButton.disabled = false;
+    if (label) label.textContent = "Import package";
+  }
+}
+
+async function showPackage(entry: LibraryEntry, version?: string): Promise<void> {
+  const request = ++inspectorRequest;
+  const wrapper = element("div", "details-content");
+  wrapper.append(detailsHeader("Package", entry.name, closeInspector));
+  const body = element("div", "stack-detail-body");
+  body.append(loadingRow("Verifying installed package…"));
+  wrapper.append(body);
+  inspector.replaceChildren(wrapper);
+  inspector.classList.add("open");
+  try {
+    const details = await invoke<PackageDetails>("package_details", {
+      cartridge: entry.cartridge_id,
+      version: version ?? null,
+    });
+    if (request !== inspectorRequest) return;
+    body.replaceChildren(renderPackageDetails(entry, details));
+  } catch (error) {
+    if (request !== inspectorRequest) return;
+    body.replaceChildren(emptyState("Could not verify package", String(error), "error"));
+  }
+}
+
+function renderPackageDetails(entry: LibraryEntry, details: PackageDetails): HTMLElement {
+  const value = element("div", "package-details");
+  const status = element("div", "details-status");
+  status.append(statusBadge(entry.safe_mode ? "stopped" : "applied"));
+  status.lastElementChild!.lastChild!.textContent = entry.safe_mode ? "Safe mode" : "Verified";
+  status.append(element("span", undefined, details.cartridge_id));
+  value.append(status);
+
+  if (entry.versions.length > 1) {
+    const versions = element("div", "package-versions");
+    versions.append(element("span", undefined, "Version"));
+    const choices = element("div");
+    for (const version of entry.versions) {
+      const button = element("button", version === details.version ? "active" : "", version);
+      button.type = "button";
+      button.addEventListener("click", () => void showPackage(entry, version));
+      choices.append(button);
+    }
+    versions.append(choices);
+    value.append(versions);
+  }
+
+  if (details.description) value.append(element("p", "package-description", details.description));
+  const summary = element("div", "policy-grid");
+  summary.append(
+    detailMetric("Version", details.version),
+    detailMetric("Package size", formatBytes(details.package_bytes)),
+    detailMetric("Assets", String(details.asset_count)),
+    detailMetric("State schema", String(details.state_schema)),
+  );
+  value.append(summary);
+
+  const digest = element("section", "details-section");
+  digest.append(element("h3", undefined, "Exact package digest"), element("code", "full-digest", details.package_sha256));
+  value.append(digest);
+
+  const runtime = element("section", "details-section");
+  runtime.append(element("h3", undefined, "Runtime request"));
+  const limits = element("div", "package-limit-grid");
+  limits.append(
+    detailMetric("Fuel", details.runtime.fuel.toLocaleString()),
+    detailMetric("Memory", formatBytes(details.runtime.memory_bytes)),
+    detailMetric("Timeout", `${details.runtime.timeout_ms} ms`),
+    detailMetric("Storage", formatBytes(details.runtime.storage_bytes)),
+  );
+  runtime.append(limits);
+  value.append(runtime);
+
+  const permissions = element("section", "details-section");
+  permissions.append(element("h3", undefined, "Capability grants"));
+  permissions.append(capabilityRow("Requested", details.requested, false));
+  permissions.append(capabilityRow("Granted", details.granted, false));
+  if (details.missing.length > 0) permissions.append(capabilityRow("Needs approval", details.missing, true));
+  value.append(permissions);
+  return value;
 }
 
 async function renderResources(): Promise<void> {
@@ -722,6 +858,12 @@ function emptyState(heading: string, detail: string, kind: string): HTMLElement 
     const button = element("button", "button primary", "Create stack");
     button.type = "button";
     button.addEventListener("click", () => fileInput.click());
+    value.append(button);
+  }
+  if (kind === "package" && dashboard.packages.length === 0) {
+    const button = element("button", "button primary", "Import package");
+    button.type = "button";
+    button.addEventListener("click", () => void importPackage());
     value.append(button);
   }
   return value;
@@ -1063,6 +1205,7 @@ function confirmAction(heading: string, copy: string, action: string): Promise<b
 }
 
 function closeInspector(): void {
+  inspectorRequest += 1;
   inspector.classList.remove("open");
   inspector.replaceChildren(emptyState("No selection", "Select a stack or review a new manifest.", "details"));
 }
@@ -1071,6 +1214,7 @@ document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => {
   button.addEventListener("click", () => switchView(button.dataset.view as View));
 });
 required<HTMLButtonElement>("load-button").addEventListener("click", () => fileInput.click());
+importPackageButton.addEventListener("click", () => void importPackage());
 required<HTMLButtonElement>("refresh-button").addEventListener("click", () => void refresh());
 required<HTMLButtonElement>("page-refresh").addEventListener("click", () => void refresh());
 required<HTMLButtonElement>("dismiss-banner").addEventListener("click", () => {

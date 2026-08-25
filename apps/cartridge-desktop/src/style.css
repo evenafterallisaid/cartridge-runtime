@@ -209,6 +209,15 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 .definition-list dt { color: #66707a; font-size: 9px; }
 .definition-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #46505a; font: 9px/1.45 "SFMono-Regular", Consolas, monospace; }
 .stack-detail-body { padding-bottom: 10px; }
+.package-description { margin: 15px 0 0; color: #59636e; font-size: 10px; line-height: 1.55; }
+.package-versions { display: grid; grid-template-columns: 52px 1fr; align-items: start; gap: 8px; padding: 13px 0; border-bottom: 1px solid var(--border-soft); }
+.package-versions > span { padding-top: 5px; color: #66707a; font-size: 9px; }
+.package-versions > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.package-versions button { padding: 4px 7px; border: 1px solid var(--border); border-radius: 6px; color: #59636e; background: var(--surface); font: 9px/1.2 "SFMono-Regular", Consolas, monospace; cursor: pointer; }
+.package-versions button:hover { border-color: #8aa89f; color: var(--deep-green); }
+.package-versions button.active { border-color: #78a39a; color: var(--deep-green); background: var(--pale-green); }
+.package-limit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.package-limit-grid .detail-metric { border: 1px solid var(--border-soft); border-radius: 6px; }
 .replica-card { margin-top: 8px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 7px; background: #fafbfc; }
 .replica-head, .replica-facts { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .replica-head > div { display: grid; gap: 3px; min-width: 0; }
@@ -344,6 +353,9 @@ kbd { padding: 2px 5px; border: 1px solid #d1d5da; border-radius: 4px; backgroun
 :root[data-theme="dark"] .capability-row b.denied { border-color: #713943; color: #ff9aa4; background: #30181c; }
 :root[data-theme="dark"] .capability-row b.muted { border-color: #454a47; color: #aeb4b0; background: #252927; }
 :root[data-theme="dark"] .replica-card { background: #1c201e; }
+:root[data-theme="dark"] .package-description, :root[data-theme="dark"] .package-versions > span { color: #9da39f; }
+:root[data-theme="dark"] .package-versions button { border-color: #454a47; color: #aeb4b0; background: #202422; }
+:root[data-theme="dark"] .package-versions button:hover, :root[data-theme="dark"] .package-versions button.active { border-color: #538a75; color: #b7ebc7; background: #183126; }
 :root[data-theme="dark"] .replica-head strong { color: #f3f3ef; }
 :root[data-theme="dark"] .replica-head span, :root[data-theme="dark"] .replica-facts, :root[data-theme="dark"] .replica-detail, :root[data-theme="dark"] .restart-policy { color: #9da39f; }
 :root[data-theme="dark"] .replica-phase { color: #aeb4b0; background: #292d2b; }

@@ -2,11 +2,13 @@
 
 Date: 2026-08-14
 
+Package-import follow-up: 2026-08-26
+
 Scope: the Tauri desktop shell, its webview-to-Rust command boundary, authenticated daemon integration, reviewed-plan lifecycle, local application data path, frontend build, and dependency graphs.
 
 ## Result
 
-No known exploitable issue remains in the reviewed desktop boundary on the current Windows and macOS targets. The app now controls the rootless daemon and inspects supervisor state, but does not broker secrets, import packages, expose its own listener, or enter a privileged OS context.
+No known exploitable issue remains in the reviewed desktop boundary on the current Windows and macOS targets. The app now controls the rootless daemon, inspects supervisor state, and imports packages through a native-only boundary, but does not broker secrets, expose its own listener, or enter a privileged OS context.
 
 ## Finding fixed during review
 
@@ -24,6 +26,9 @@ The package re-verification boundary is implemented in `cartridge-engine` and ha
 - The window loads bundled local assets and has a restrictive content security policy. No remote URL is configured.
 - The app enables no filesystem, shell, HTTP, process, clipboard, updater, or dialog plugin permissions.
 - The webview never supplies library or engine roots. Rust derives both from the per-user application data directory.
+- Package selection is host-owned. The native picker returns the path directly to Rust; neither the selected path nor package bytes cross into the webview.
+- Package import rejects links and non-files before bounded staging. The library hashes the staged bytes, validates that exact archive, installs it at a content-addressed path, then the shell reopens the installed destination and compares its digest and byte length with the catalog result.
+- Package inspection resolves only catalog-owned paths and repeats regular-file, byte-length, digest, manifest-id, and manifest-version checks before returning bounded metadata to the webview.
 - The daemon endpoint key remains in the Rust backend. The webview receives only bounded status models and never sees endpoint paths, keys, nonces, or authenticated frames.
 - Lifecycle mutations have no direct-store fallback. An absent, stale, malformed, or unauthenticated daemon endpoint fails closed while read-only local inspection remains available.
 - Stack selection uses a normal HTML file input. The frontend rejects files over 1 MiB and the Rust parser enforces the same limit again.
@@ -46,11 +51,11 @@ The package re-verification boundary is implemented in `cartridge-engine` and ha
 - native preference round-trip, replacement, oversized-input, unknown-field, and non-file regression tests
 - authenticated shared-client round-trip and bounded framing regression test
 - offline dashboard behavior and bounded control-safe webview error regression tests
+- exact-byte package import/details binding, non-file rejection, and post-install tampering regression tests
 
 ## Residual and future gates
 
 - Every future execution path must re-verify package identity and trusted signature immediately before worker activation; apply-time verification is not a launch-time guarantee.
-- Package import should use a narrow native picker command that accepts only bounded regular `.cartridge` files and never exposes general filesystem read capability to the webview.
 - Native service-manager integration must preserve the private per-user endpoint directory and start no privileged service by default.
 - Secret values must remain in a native broker. They must not cross the webview IPC boundary or enter plan/event JSON.
 - Logs and traces require bounded streaming, redaction, and terminal-safe rendering before they are displayed.
