@@ -1026,8 +1026,13 @@ The next concrete sequence is:
    - [implemented] persist bounded checksummed topology, per-ordinal start/drain intent, monotonic action sequences, and progress timestamps in crash-recoverable rollout checkpoints
    - [implemented] authorize exact old and candidate generations concurrently with separate supervisor leases, runtime status, probe roots, and generation-keyed mutable state
    - [implemented] translate scheduler actions into daemon-owned candidate starts and graceful previous-generation drains, then recover in-flight ownership after daemon failure
-   - route only to ready replicas and remove a generation from routing before its drain deadline begins
-   - add deterministic canary cohorts, metric/trace gates, operator promotion, and automatic abort without widening package authority
+   - [implemented: local membership plane] publish bounded epoch- and sequence-fenced ready-only targets, reject stale or changed snapshots, and remove old replicas before drain intent becomes supervisor-visible; the inbound ingress proxy remains
+   - add deterministic canary rollout stages without widening package authority:
+     - bind stable cohort selection and route weight to stack, rollout, generation, instance, and ordinal identities
+     - persist bounded observation windows with authenticated metric/trace provenance, missing-data policy, and explicit pass/fail thresholds
+     - make pause, resume, promote, and abort monotonic daemon mutations with idempotent operator receipts
+     - return traffic to the previous ready set before abort drain, then retain enough evidence to explain the decision
+     - add soak and fault-injection matrices for crash recovery, probe disagreement, clock movement, partial telemetry, and ingress restart
    - require migration compatibility or a verified rollback receipt before updating stateful instances whose schema changes
    - compact long journals through signed checkpoints without losing auditability
 6. Complete the external 1.0 security gates in parallel:

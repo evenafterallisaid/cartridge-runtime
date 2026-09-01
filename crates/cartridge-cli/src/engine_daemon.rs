@@ -168,6 +168,7 @@ pub fn serve(options: &ServeOptions<'_>) -> Result<()> {
             accept_clients(&listener, &state, &active_clients)?;
             if Instant::now() >= next_reconcile {
                 reconcile_rollouts(&state)?;
+                reconcile_routing(&state)?;
                 reconcile_supervisors(&state, &executable, &mut supervisors, &mut retries)?;
                 next_reconcile = Instant::now() + RECONCILE_INTERVAL;
             }
@@ -310,6 +311,12 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
                 .runtime_status(&stack)
                 .map_err(anyhow::Error::msg)?,
         )),
+        DaemonRequest::Routes { stack } => Ok(DaemonResponse::Routes(
+            EngineStore::open(&state.root)
+                .map_err(anyhow::Error::msg)?
+                .routing_snapshot(&stack)
+                .map_err(anyhow::Error::msg)?,
+        )),
         DaemonRequest::Events { stack, tail } => {
             let mut events = EngineStore::open(&state.root)
                 .map_err(anyhow::Error::msg)?
@@ -350,18 +357,28 @@ fn execute_stack_mutation(state: &DaemonState, request: DaemonRequest) -> Result
             let library = Library::open(&state.library).map_err(anyhow::Error::msg)?;
             plan.verify_installed(&library)
                 .map_err(anyhow::Error::msg)?;
-            Ok(DaemonResponse::Applied(
-                engine
-                    .apply(&plan, allow_insecure)
-                    .map_err(anyhow::Error::msg)?,
-            ))
+            let report = engine
+                .apply(&plan, allow_insecure)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&plan.stack, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Applied(report))
         }
-        DaemonRequest::Stop { stack } => Ok(DaemonResponse::Stopped(
-            engine.stop(&stack).map_err(anyhow::Error::msg)?,
-        )),
-        DaemonRequest::Remove { stack } => Ok(DaemonResponse::Removed(
-            engine.remove(&stack).map_err(anyhow::Error::msg)?,
-        )),
+        DaemonRequest::Stop { stack } => {
+            let report = engine.stop(&stack).map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&stack, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Stopped(report))
+        }
+        DaemonRequest::Remove { stack } => {
+            let report = engine.remove(&stack).map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&stack, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            Ok(DaemonResponse::Removed(report))
+        }
         _ => bail!("request is not a stack mutation"),
     }
 }
@@ -407,6 +424,9 @@ fn execute_rollout_request(state: &DaemonState, request: DaemonRequest) -> Resul
             let record = engine
                 .activate_rollout(&stack, &rollout_id, current_time_ms()?)
                 .map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&stack, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
             Ok(DaemonResponse::Rollout(Some(
                 cartridge_engine::RolloutStatus::from_record(&record)
                     .map_err(anyhow::Error::msg)?,
@@ -414,9 +434,12 @@ fn execute_rollout_request(state: &DaemonState, request: DaemonRequest) -> Resul
         }
         DaemonRequest::RolloutCommit { stack, rollout_id } => {
             let _mutation = lock_mutation(state)?;
-            let record = EngineStore::open(&state.root)
-                .map_err(anyhow::Error::msg)?
+            let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+            let record = engine
                 .commit_rollout(&stack, &rollout_id, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&stack, current_time_ms()?)
                 .map_err(anyhow::Error::msg)?;
             Ok(DaemonResponse::Rollout(Some(
                 cartridge_engine::RolloutStatus::from_record(&record)
@@ -435,6 +458,9 @@ fn execute_rollout_request(state: &DaemonState, request: DaemonRequest) -> Resul
             }
             let record = engine
                 .rollback_rollout(&stack, &rollout_id, current_time_ms()?)
+                .map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(&stack, current_time_ms()?)
                 .map_err(anyhow::Error::msg)?;
             Ok(DaemonResponse::Rollout(Some(
                 cartridge_engine::RolloutStatus::from_record(&record)
@@ -611,6 +637,9 @@ fn reconcile_rollout_phase(
             engine
                 .commit_rollout(stack, &record.rollout_id, now_ms)
                 .map_err(anyhow::Error::msg)?;
+            engine
+                .publish_routing_snapshot(stack, now_ms)
+                .map_err(anyhow::Error::msg)?;
             progress
                 .set_phase(RolloutExecutionPhase::Completed, now_ms)
                 .map_err(anyhow::Error::msg)?;
@@ -622,6 +651,9 @@ fn reconcile_rollout_phase(
                 .set_phase(RolloutExecutionPhase::RollingBack, now_ms)
                 .map_err(anyhow::Error::msg)?;
             engine
+                .publish_routing_snapshot_for_progress(progress, now_ms)
+                .map_err(anyhow::Error::msg)?;
+            engine
                 .save_rollout_progress(progress)
                 .map_err(anyhow::Error::msg)?;
         }
@@ -631,6 +663,9 @@ fn reconcile_rollout_phase(
         verify_rollback_target(record, &state.library)?;
         engine
             .rollback_rollout(stack, &record.rollout_id, now_ms)
+            .map_err(anyhow::Error::msg)?;
+        engine
+            .publish_routing_snapshot(stack, now_ms)
             .map_err(anyhow::Error::msg)?;
         progress
             .set_phase(RolloutExecutionPhase::RolledBack, now_ms)
@@ -694,6 +729,9 @@ fn advance_active_rollout(
         RollingAction::Wait { .. } => return Ok(()),
     }
     engine
+        .publish_routing_snapshot_for_progress(progress, now_ms)
+        .map_err(anyhow::Error::msg)?;
+    engine
         .save_rollout_progress(progress)
         .map_err(anyhow::Error::msg)
 }
@@ -714,6 +752,18 @@ fn verify_rollback_target(record: &cartridge_engine::RolloutRecord, library: &Pa
         previous
             .verify_installed(&library)
             .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+fn reconcile_routing(state: &DaemonState) -> Result<()> {
+    let _mutation = lock_mutation(state)?;
+    let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+    let now_ms = current_time_ms()?;
+    for status in engine.list().map_err(anyhow::Error::msg)? {
+        if let Err(error) = engine.publish_routing_snapshot(&status.stack, now_ms) {
+            eprintln!("routing reconcile failed for {}: {error}", status.stack);
+        }
     }
     Ok(())
 }
@@ -1109,6 +1159,14 @@ mod tests {
         let engine = EngineStore::open(&root).unwrap();
         let mut progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
         assert_eq!(progress.instances[0].candidate_enabled, BTreeSet::from([1]));
+        let routes = engine.routing_snapshot("daemon-rollout").unwrap().unwrap();
+        assert_eq!(routes.targets.len(), 2);
+        assert!(
+            routes
+                .targets
+                .iter()
+                .all(|target| target.generation == old_generation)
+        );
 
         let mut candidate_status = engine
             .runtime_status_for_generation("daemon-rollout", candidate_generation)
@@ -1123,6 +1181,24 @@ mod tests {
         let engine = EngineStore::open(&root).unwrap();
         progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
         assert_eq!(progress.instances[0].previous_draining.len(), 1);
+        let draining = *progress.instances[0]
+            .previous_draining
+            .keys()
+            .next()
+            .unwrap();
+        let routes = engine.routing_snapshot("daemon-rollout").unwrap().unwrap();
+        assert_eq!(routes.targets.len(), 2);
+        assert!(
+            routes
+                .targets
+                .iter()
+                .any(|target| { target.generation == candidate_generation && target.ordinal == 1 })
+        );
+        assert!(
+            !routes.targets.iter().any(|target| {
+                target.generation == old_generation && target.ordinal == draining
+            })
+        );
 
         let mut old_status = engine
             .runtime_status_for_generation("daemon-rollout", &old_generation)
@@ -1165,6 +1241,14 @@ mod tests {
         let progress = engine.rollout_progress("daemon-rollout").unwrap().unwrap();
         assert_eq!(record.phase, RolloutPhase::Committed);
         assert_eq!(progress.phase, RolloutExecutionPhase::Completed);
+        let routes = engine.routing_snapshot("daemon-rollout").unwrap().unwrap();
+        assert_eq!(routes.targets.len(), 2);
+        assert!(
+            routes
+                .targets
+                .iter()
+                .all(|target| target.generation == candidate_generation)
+        );
     }
 
     #[test]

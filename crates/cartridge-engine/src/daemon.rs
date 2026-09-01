@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use super::{
-    ApplyReport, EngineEvent, RolloutStatus, StackHealthReport, StackManifest, StackPlan,
-    StackRuntimeStatus, StackStatus, ensure_directory, is_digest, is_regular_file, private_options,
-    valid_name, valid_text, validate_health_reports,
+    ApplyReport, EngineEvent, RolloutStatus, RoutingSnapshot, StackHealthReport, StackManifest,
+    StackPlan, StackRuntimeStatus, StackStatus, ensure_directory, is_digest, is_regular_file,
+    private_options, valid_name, valid_text, validate_health_reports,
 };
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 pub const DAEMON_ENDPOINT_FILE: &str = "daemon.json";
 pub const MAX_DAEMON_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DAEMON_EVENTS: u16 = 256;
@@ -90,6 +90,9 @@ pub enum DaemonRequest {
     RuntimeStatus {
         stack: String,
     },
+    Routes {
+        stack: String,
+    },
     Events {
         stack: String,
         tail: u16,
@@ -145,6 +148,7 @@ pub enum DaemonResponse {
     Stacks(Vec<StackStatus>),
     Status(StackStatus),
     RuntimeStatus(Option<StackRuntimeStatus>),
+    Routes(Option<RoutingSnapshot>),
     Events(Vec<EngineEvent>),
     Health(Vec<StackHealthReport>),
     Planned(Box<StackPlan>),
@@ -271,6 +275,7 @@ impl DaemonRequest {
             Self::Ping | Self::Info | Self::List | Self::Shutdown => Ok(()),
             Self::Status { stack }
             | Self::RuntimeStatus { stack }
+            | Self::Routes { stack }
             | Self::RolloutStatus { stack }
             | Self::Stop { stack }
             | Self::Remove { stack }
@@ -307,9 +312,12 @@ impl DaemonResponse {
             Self::Stacks(stacks) => validate_stack_responses(stacks),
             Self::Status(status) => validate_stack_responses(std::slice::from_ref(status)),
             Self::RuntimeStatus(Some(status)) => status.validate(),
-            Self::Pong | Self::ShuttingDown | Self::RuntimeStatus(None) | Self::Rollout(None) => {
-                Ok(())
-            }
+            Self::Routes(Some(routes)) => routes.validate(),
+            Self::Pong
+            | Self::ShuttingDown
+            | Self::RuntimeStatus(None)
+            | Self::Routes(None)
+            | Self::Rollout(None) => Ok(()),
             Self::Events(events) => {
                 if events.len() > usize::from(MAX_DAEMON_EVENTS) {
                     return Err("daemon response contains too many events".into());

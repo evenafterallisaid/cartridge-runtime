@@ -30,7 +30,7 @@ No known exploitable issue remains in the implemented whole-generation rollout t
 - Active transactions serialize with all other daemon mutations and also fence direct `EngineStore` mutation calls.
 - Rollback after an activated or committed candidate restores the previous plan, stopped plan, or tombstone exactly.
 - Automatic `engine update` keeps readiness and the stability observation inside its deadline, rolls back when activation, readiness, stability, or commit fails, and reports a second error if rollback itself cannot be proven.
-- Protocol version 2 prevents an older daemon/client pair from silently misinterpreting rollout messages.
+- Protocol versioning, currently version 3, prevents an older daemon/client pair from silently misinterpreting rollout or routing messages.
 - Complete checkpoints contain package identities, policy, arguments, and secret names, but never secret values or daemon credentials. Authenticated clients receive only compact rollout status documents.
 
 ## Verification

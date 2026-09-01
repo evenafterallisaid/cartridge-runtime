@@ -961,6 +961,14 @@ enum EngineCommand {
         #[arg(long)]
         json: bool,
     },
+    /// inspect the daemon's ready-only routing table
+    Routes {
+        stack: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// show the latest checksum-chained stack events
     Events {
         stack: String,
@@ -1739,6 +1747,42 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
                 print_runtime_status(&runtime);
             } else {
                 println!("{stack} has no observed runtime state");
+            }
+            Ok(())
+        }
+        EngineCommand::Routes { stack, root, json } => {
+            let DaemonResponse::Routes(routes) = engine_daemon::request(
+                &root,
+                DaemonRequest::Routes {
+                    stack: stack.clone(),
+                },
+            )?
+            else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&routes)?);
+            } else if let Some(routes) = routes {
+                println!(
+                    "{} routing epoch={} sequence={} ready={}",
+                    routes.stack,
+                    &routes.routing_epoch[..12],
+                    routes.sequence,
+                    routes.targets.len()
+                );
+                for target in routes.targets {
+                    println!(
+                        "{}#{} revision={} generation={} run={} ready-at={}",
+                        target.instance,
+                        target.ordinal,
+                        target.revision,
+                        target.generation,
+                        target.run_id,
+                        target.ready_at_ms
+                    );
+                }
+            } else {
+                println!("{stack} has no published routing state");
             }
             Ok(())
         }

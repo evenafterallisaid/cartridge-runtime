@@ -4,6 +4,7 @@ mod probe;
 mod rolling;
 mod rollout;
 mod rollout_progress;
+mod routing;
 mod supervisor;
 
 pub use daemon::{
@@ -34,6 +35,9 @@ pub use rollout::{
 pub use rollout_progress::{
     DrainIntent, ENGINE_ROLLOUT_PROGRESS_FORMAT_VERSION, MAX_ROLLOUT_PROGRESS_BYTES,
     RolloutExecutionPhase, RolloutInstanceProgress, RolloutProgress,
+};
+pub use routing::{
+    ENGINE_ROUTING_FORMAT_VERSION, MAX_ENGINE_ROUTING_BYTES, RouteTarget, RoutingSnapshot,
 };
 pub use supervisor::{
     LEGACY_SUPERVISOR_STATUS_FORMAT_VERSION, ProbePhase, ReplicaId, ReplicaPhase,

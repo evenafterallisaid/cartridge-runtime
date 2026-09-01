@@ -31,6 +31,7 @@ fn growing_engine_commands_keep_cli_construction_bounded() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("wait"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("update"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("rollout"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("routes"));
 }
 
 #[test]

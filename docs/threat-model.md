@@ -35,6 +35,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 7. Distribution: Ed25519 trust authenticates packages and runtime releases; content addresses and transparency chains detect replacement.
 8. Peer mesh: X25519 identities derive authenticated session keys; sequence numbers and AEAD reject forgery and replay.
 9. Local engine control: a private random per-boot capability authenticates bounded encrypted loopback frames; instance ids, request ids, freshness checks, replay state, mutation serialization, and daemon leases prevent cross-generation or replayed control.
+10. Routing membership: ingress consumers must use the authenticated daemon response, which recomputes membership from desired state, rollout progress, and generation-scoped runtime health before returning a bounded snapshot.
 
 ## Main defenses
 
@@ -57,6 +58,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - The daemon protocol is confidential and authenticated, but it does not yet use Unix peer credentials or Windows named-pipe ACLs. A local process without the endpoint capability cannot issue a valid command, though it can still consume the small bounded unauthenticated connection pool until its short authentication deadline.
 - A guest is authoritative about its own semantic readiness and can lie; probes prevent accidental or failed applications from being promoted, not a malicious workload from claiming health. Another process already running as the same user may deny service to the ephemeral probe path, but cannot forge an accepted signal without the per-run key. Native per-worker authority isolation remains the stronger boundary.
 - Rollout checkpoints are mutable recovery state, not the source of desired-state truth. Activation and rollback must be adjacent immutable journal events, active transactions fence other mutations, and any checkpoint/journal divergence outside the two recognized crash windows fails closed.
+- Routing snapshots are derived mutable state, not authority. They are checksummed and fenced by a random epoch plus monotonic sequence, but a same-user process can still deny service by replacing them. Stale, changed, non-regular, or state-divergent snapshots fail closed; the daemon repairs regular-file corruption into a new epoch.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.
 - Local state and trace files are integrity-protected where documented but not generally encrypted at rest.
