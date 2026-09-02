@@ -164,6 +164,13 @@ impl EngineStore {
         Ok(Some(snapshot))
     }
 
+    pub fn route_target_is_ready(&self, stack: &str, target: &RouteTarget) -> Result<bool, String> {
+        target.validate()?;
+        let progress = self.active_routing_progress(stack)?;
+        let (_, targets) = self.routing_targets(stack, progress.as_ref())?;
+        Ok(targets.contains(target))
+    }
+
     fn publish_routing_snapshot_inner(
         &self,
         stack: &str,

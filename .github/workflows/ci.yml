@@ -76,6 +76,7 @@ jobs:
           cargo build --manifest-path examples/visual-cartridge/Cargo.toml --target wasm32-wasip2 --release
           cargo build --manifest-path examples/synth-cartridge/Cargo.toml --target wasm32-wasip2 --release
           cargo build --manifest-path examples/effect-cartridge/Cargo.toml --target wasm32-wasip2 --release
+          cargo build --manifest-path examples/service-cartridge/Cargo.toml --target wasm32-wasip2 --release
 
       - name: Build timeout regression component
         run: cargo build --manifest-path tests/fixtures/timeout-cartridge/Cargo.toml --target wasm32-wasip2 --release
@@ -168,6 +169,8 @@ jobs:
           cargo run -p cartridge-cli -- library install hello.cartridge --root library
           cargo run -p cartridge-cli -- pack tests/fixtures/timeout-cartridge/Cartridge.toml --component tests/fixtures/timeout-cartridge/target/wasm32-wasip2/release/timeout_cartridge.wasm --output timeout.cartridge
           cargo run -p cartridge-cli -- library install timeout.cartridge --root library
+          cargo run -p cartridge-cli -- pack examples/service-cartridge/Cartridge.toml --component examples/service-cartridge/target/wasm32-wasip2/release/service_cartridge.wasm --output service.cartridge
+          cargo run -p cartridge-cli -- library install service.cartridge --root library
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.stack.toml
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-timeout.stack.toml
           cargo run -p cartridge-cli -- stack validate tests/fixtures/Cartridge.probe-liveness.stack.toml
@@ -221,6 +224,11 @@ jobs:
           "$binary" engine health hello-stack --root daemon-engine --json | grep '"report_sha256"'
           "$binary" engine ps hello-stack --root daemon-engine --json | grep -E '"phase": "(running|succeeded)"'
           "$binary" engine events hello-stack --root daemon-engine --tail 1 --json | grep '"revision": 1'
+          "$binary" engine apply tests/fixtures/Cartridge.service.stack.toml --root daemon-engine --json | grep '"state": "applied"'
+          "$binary" engine wait service-stack --root daemon-engine --timeout-ms 15000 --json | grep '"state": "healthy"'
+          "$binary" engine invoke service-stack api --root daemon-engine --path /health --timeout-ms 5000 | grep 'GET /health'
+          "$binary" engine stop service-stack --root daemon-engine
+          "$binary" engine remove service-stack --root daemon-engine
           "$binary" engine stop hello-stack --root daemon-engine
           "$binary" engine remove hello-stack --root daemon-engine
           set +e

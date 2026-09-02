@@ -1,7 +1,7 @@
 mod storage;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +14,7 @@ use cartridge_media::{
 };
 use cartridge_network::{
     HttpMethod as NetworkHttpMethod, HttpPolicy, HttpRequest, HttpResponse, HttpTransport,
+    InvocationBroker,
 };
 use cartridge_storage::{StorageBackend, StorageLimits};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -73,6 +74,8 @@ pub(crate) struct HostState {
     http_transport: Option<Arc<dyn HttpTransport>>,
     health_reporter: Option<Arc<dyn HealthReporter>>,
     health_reports: u32,
+    invocation_broker: Option<Arc<dyn InvocationBroker>>,
+    service_requests: BTreeSet<String>,
 }
 
 impl HostState {
@@ -168,6 +171,8 @@ impl HostState {
             http_transport: None,
             health_reporter: None,
             health_reports: 0,
+            invocation_broker: None,
+            service_requests: BTreeSet::new(),
         }
     }
 
@@ -181,6 +186,14 @@ impl HostState {
 
     pub(crate) fn with_http_transport(mut self, transport: Option<Arc<dyn HttpTransport>>) -> Self {
         self.http_transport = transport;
+        self
+    }
+
+    pub(crate) fn with_invocation_broker(
+        mut self,
+        broker: Option<Arc<dyn InvocationBroker>>,
+    ) -> Self {
+        self.invocation_broker = broker;
         self
     }
 
@@ -736,6 +749,118 @@ impl cartridge::api::host::Host for HostState {
         })
     }
 
+    fn serve_next(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<Option<cartridge::api::host::ServiceRequest>, String> {
+        if !self.permissions.serve {
+            return Err("serve capability was not granted".into());
+        }
+        if self.replay.is_some() {
+            return Err("service invocations are unavailable during replay".into());
+        }
+        if !(cartridge_network::MIN_SERVICE_TIMEOUT_MS..=cartridge_network::MAX_SERVICE_TIMEOUT_MS)
+            .contains(&timeout_ms)
+        {
+            return Err("service receive timeout is outside its limits".into());
+        }
+        if !self.service_requests.is_empty() {
+            return Err("the previous service request has not been answered".into());
+        }
+        let remaining = self.deadline.saturating_duration_since(StdInstant::now());
+        if remaining.is_zero() {
+            return Err("cartridge wall-clock deadline exceeded".into());
+        }
+        let broker = self
+            .invocation_broker
+            .as_ref()
+            .ok_or_else(|| "no host invocation broker is configured".to_owned())?;
+        let request = broker.receive(Duration::from_millis(timeout_ms).min(remaining))?;
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        request.validate()?;
+        self.service_requests.insert(request.id.clone());
+        self.record(
+            "serve",
+            "receive",
+            json!({
+                "id": request.id,
+                "method": request.method,
+                "path": request.path,
+                "body_bytes": request.body.len(),
+                "body_sha256": hex::encode(Sha256::digest(&request.body)),
+            }),
+        );
+        Ok(Some(cartridge::api::host::ServiceRequest {
+            id: request.id,
+            method: network_method_to_guest(request.method),
+            path: request.path,
+            headers: request
+                .headers
+                .into_iter()
+                .map(|(name, value)| cartridge::api::host::HttpHeader { name, value })
+                .collect(),
+            body: request.body,
+        }))
+    }
+
+    fn serve_respond(
+        &mut self,
+        request_id: String,
+        response: cartridge::api::host::ServiceResponse,
+    ) -> Result<(), String> {
+        if !self.permissions.serve {
+            return Err("serve capability was not granted".into());
+        }
+        if request_id.len() != 64
+            || !request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("service response identity is invalid".into());
+        }
+        if !self.service_requests.contains(&request_id) {
+            return Err("service response does not match the active request".into());
+        }
+        if response.headers.len() > cartridge_network::MAX_HTTP_HEADERS
+            || response.body.len() > cartridge_network::MAX_SERVICE_RESPONSE_BYTES
+        {
+            return Err("service response exceeds its limits".into());
+        }
+        let mut headers = BTreeMap::new();
+        let mut normalized = std::collections::BTreeSet::new();
+        for header in response.headers {
+            if !normalized.insert(header.name.to_ascii_lowercase())
+                || headers.insert(header.name, header.value).is_some()
+            {
+                return Err("duplicate HTTP header names are not allowed".into());
+            }
+        }
+        let response = cartridge_network::ServiceResponse {
+            status: response.status,
+            headers,
+            body: response.body,
+        };
+        response.validate()?;
+        self.invocation_broker
+            .as_ref()
+            .ok_or_else(|| "no host invocation broker is configured".to_owned())?
+            .respond(&request_id, &response)?;
+        self.service_requests.remove(&request_id);
+        self.record(
+            "serve",
+            "respond",
+            json!({
+                "id": request_id,
+                "status": response.status,
+                "body_bytes": response.body.len(),
+                "body_sha256": hex::encode(Sha256::digest(&response.body)),
+            }),
+        );
+        Ok(())
+    }
+
     fn storage_get(&mut self, key: String) -> Result<Option<Vec<u8>>, String> {
         self.get_storage(&key)
     }
@@ -1072,6 +1197,17 @@ impl cartridge::api::host::Host for HostState {
     }
 }
 
+fn network_method_to_guest(method: NetworkHttpMethod) -> cartridge::api::host::HttpMethod {
+    match method {
+        NetworkHttpMethod::Get => cartridge::api::host::HttpMethod::Get,
+        NetworkHttpMethod::Head => cartridge::api::host::HttpMethod::Head,
+        NetworkHttpMethod::Post => cartridge::api::host::HttpMethod::Post,
+        NetworkHttpMethod::Put => cartridge::api::host::HttpMethod::Put,
+        NetworkHttpMethod::Patch => cartridge::api::host::HttpMethod::Patch,
+        NetworkHttpMethod::Delete => cartridge::api::host::HttpMethod::Delete,
+    }
+}
+
 fn frame_receipt(receipt: MediaFrameReceipt) -> Result<cartridge::api::host::FrameReceipt, String> {
     Ok(cartridge::api::host::FrameReceipt {
         window: receipt.window,
@@ -1154,6 +1290,33 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct FixedInvocation {
+        requests: Mutex<VecDeque<cartridge_network::ServiceRequest>>,
+        responses: Mutex<Vec<(String, cartridge_network::ServiceResponse)>>,
+    }
+
+    impl InvocationBroker for FixedInvocation {
+        fn receive(
+            &self,
+            _: Duration,
+        ) -> Result<Option<cartridge_network::ServiceRequest>, String> {
+            Ok(self.requests.lock().unwrap().pop_front())
+        }
+
+        fn respond(
+            &self,
+            request_id: &str,
+            response: &cartridge_network::ServiceResponse,
+        ) -> Result<(), String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((request_id.into(), response.clone()));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct RecordedHealth(Mutex<Vec<(GuestHealthState, String)>>);
 
     impl HealthReporter for RecordedHealth {
@@ -1217,6 +1380,88 @@ mod tests {
         assert_eq!(reports.len(), MAX_HEALTH_REPORTS_PER_RUN as usize);
         assert_eq!(reports[0], (GuestHealthState::Ready, "ready".into()));
         assert!(state.events.is_empty());
+    }
+
+    #[test]
+    fn service_invocations_require_permission_and_one_response() {
+        let broker = Arc::new(FixedInvocation::default());
+        broker
+            .requests
+            .lock()
+            .unwrap()
+            .push_back(cartridge_network::ServiceRequest {
+                id: "a".repeat(64),
+                method: NetworkHttpMethod::Post,
+                path: "/check".into(),
+                headers: BTreeMap::new(),
+                body: b"ping".to_vec(),
+            });
+        let mut denied = HostState::new(
+            &manifest(Permissions::default()),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        )
+        .with_invocation_broker(Some(broker.clone()));
+        assert!(<HostState as cartridge::api::host::Host>::serve_next(&mut denied, 10).is_err());
+
+        let permissions = Permissions {
+            serve: true,
+            ..Permissions::default()
+        };
+        let mut state = HostState::new(
+            &manifest(permissions),
+            BTreeMap::new(),
+            Arc::new(MemoryStorage::new()),
+            None,
+        )
+        .with_invocation_broker(Some(broker.clone()));
+        let request = <HostState as cartridge::api::host::Host>::serve_next(&mut state, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.path, "/check");
+        assert!(<HostState as cartridge::api::host::Host>::serve_next(&mut state, 10).is_err());
+        assert!(
+            <HostState as cartridge::api::host::Host>::serve_respond(
+                &mut state,
+                "b".repeat(64),
+                cartridge::api::host::ServiceResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            <HostState as cartridge::api::host::Host>::serve_respond(
+                &mut state,
+                request.id.clone(),
+                cartridge::api::host::ServiceResponse {
+                    status: 200,
+                    headers: (0..=cartridge_network::MAX_HTTP_HEADERS)
+                        .map(|index| cartridge::api::host::HttpHeader {
+                            name: format!("x-{index}"),
+                            value: String::new(),
+                        })
+                        .collect(),
+                    body: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(broker.responses.lock().unwrap().is_empty());
+        <HostState as cartridge::api::host::Host>::serve_respond(
+            &mut state,
+            request.id,
+            cartridge::api::host::ServiceResponse {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(broker.responses.lock().unwrap().len(), 1);
     }
 
     #[test]

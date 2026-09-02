@@ -23,6 +23,7 @@ cartridge-trace = { path = "../cartridge-trace" }
 clap.workspace = true
 ctrlc.workspace = true
 hex.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

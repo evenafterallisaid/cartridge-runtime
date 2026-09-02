@@ -57,7 +57,7 @@ These should remain separate crates or applications. The CLI must not depend on 
 
 ## Release line
 
-Current development state: milestones 0.1 through 0.9 and the portable 1.0 candidate boundary are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, transport-independent encrypted device-mesh primitives, capability negotiation, authenticated durable-storage principals, signed runtime updates, rollback, and supervised stability tooling. External 1.0 release gates remain, while implementation has started on the 1.1 composition graph. Release labels here describe compatibility milestones, not published versions.
+Current development state: milestones 0.1 through 0.9 and the portable 1.0 candidate boundary are implemented at the library and reference-host level. The runtime now includes package identity, immutable signed distribution, scoped replayable HTTP, transport-independent encrypted device-mesh primitives, capability negotiation, authenticated durable-storage principals, signed runtime updates, rollback, and supervised stability tooling. External 1.0 release gates remain. Implementation has started on the 1.1 composition graph and the 1.2 engine now has ready-only local service invocation as the safe substrate for typed edges and declared HTTP ingress. Release labels here describe compatibility milestones, not published versions.
 
 ### 0.1 — package and execute
 
@@ -514,7 +514,8 @@ Work:
 - restart policies, exponential backoff, circuit breaking, graceful shutdown, and kill deadlines
 - named state and blob resources with ownership, retention, snapshot, restore, and clone policies
 - secret slots exposed as opaque operation handles rather than files or environment variables
-- typed service routing and declared HTTP ingress without ambient private networks
+- [implemented first inbound slice] permission-gated local invocation of exact ready replicas with bounded queues, deadlines, route-loss cancellation, and no guest sockets
+- typed inter-cartridge service routing and declared HTTP ingress without ambient private networks
 - bounded structured logs, metrics, traces, and engine events with redaction policies
 - [implemented for per-instance portable work ceilings] resource accounting and quotas per instance, stack, publisher, and user
 - orphan detection, content/store garbage collection, and disk-pressure behavior
@@ -1026,7 +1027,7 @@ The next concrete sequence is:
    - [implemented] persist bounded checksummed topology, per-ordinal start/drain intent, monotonic action sequences, and progress timestamps in crash-recoverable rollout checkpoints
    - [implemented] authorize exact old and candidate generations concurrently with separate supervisor leases, runtime status, probe roots, and generation-keyed mutable state
    - [implemented] translate scheduler actions into daemon-owned candidate starts and graceful previous-generation drains, then recover in-flight ownership after daemon failure
-   - [implemented: local membership plane] publish bounded epoch- and sequence-fenced ready-only targets, reject stale or changed snapshots, and remove old replicas before drain intent becomes supervisor-visible; the inbound ingress proxy remains
+   - [implemented: local membership and invocation plane] publish bounded epoch- and sequence-fenced ready-only targets, remove old replicas before drain intent becomes supervisor-visible, and deliver permission-gated deadline-bound requests to exact ready runs; the network ingress proxy remains
    - add deterministic canary rollout stages without widening package authority:
      - bind stable cohort selection and route weight to stack, rollout, generation, instance, and ordinal identities
      - persist bounded observation windows with authenticated metric/trace provenance, missing-data policy, and explicit pass/fail thresholds

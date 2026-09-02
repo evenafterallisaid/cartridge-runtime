@@ -201,6 +201,7 @@ pub struct Permissions {
     pub audio: bool,
     pub midi: bool,
     pub http: bool,
+    pub serve: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -295,7 +296,7 @@ pub fn negotiate_platform(manifest: &PackageManifest) -> Result<NegotiatedPlatfo
 
 fn host_capabilities() -> BTreeMap<&'static str, Version> {
     [
-        "assets", "audio", "clock", "graphics", "http", "midi", "random", "storage",
+        "assets", "audio", "clock", "graphics", "http", "midi", "random", "serve", "storage",
     ]
     .into_iter()
     .map(|name| (name, Version::new(1, 0, 0)))
@@ -312,6 +313,7 @@ fn permission_map(value: &Permissions) -> BTreeMap<&'static str, bool> {
         ("audio", value.audio),
         ("midi", value.midi),
         ("http", value.http),
+        ("serve", value.serve),
     ])
 }
 

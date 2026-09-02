@@ -1,5 +1,6 @@
 mod capsule;
 mod engine_daemon;
+mod invocation_broker;
 mod migration_receipt;
 mod process_control;
 
@@ -37,7 +38,7 @@ use cartridge_identity::{
     DeveloperKey, KeyRotation, Registry, RevocationRecord, TrustStore, read_revocation,
     read_rotation, read_signature, write_revocation, write_rotation, write_signature,
 };
-use cartridge_network::HttpFixtures;
+use cartridge_network::{HttpFixtures, HttpMethod, ServiceRequest};
 use cartridge_release::{ReleaseArtifact, ReleasePayload, SignedRelease, Updater};
 use cartridge_runtime::{
     BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind, BlobStore,
@@ -73,6 +74,10 @@ const WORKER_LIMIT_CEILING_ENV: &str = "CARTRIDGE_LIMIT_CEILING";
 const WORKER_PROBE_PATH_ENV: &str = "CARTRIDGE_PROBE_PATH";
 const WORKER_PROBE_KEY_ENV: &str = "CARTRIDGE_PROBE_KEY";
 const WORKER_PROBE_RUN_ENV: &str = "CARTRIDGE_PROBE_RUN";
+const WORKER_INVOCATION_ROOT_ENV: &str = "CARTRIDGE_INVOCATION_ROOT";
+const WORKER_INVOCATION_STACK_ENV: &str = "CARTRIDGE_INVOCATION_STACK";
+const WORKER_INVOCATION_DIR_ENV: &str = "CARTRIDGE_INVOCATION_DIR";
+const WORKER_INVOCATION_TARGET_ENV: &str = "CARTRIDGE_INVOCATION_TARGET";
 
 #[derive(Clone, Copy)]
 struct RunCommandOptions<'a> {
@@ -147,6 +152,32 @@ fn configure_health_reporter(runtime: Runtime) -> Result<Runtime> {
             })))
         }
         _ => bail!("worker application health channel is incomplete"),
+    }
+}
+
+fn configure_invocation_broker(runtime: Runtime) -> Result<Runtime> {
+    let root = std::env::var_os(WORKER_INVOCATION_ROOT_ENV);
+    let stack = std::env::var(WORKER_INVOCATION_STACK_ENV).ok();
+    let directory = std::env::var_os(WORKER_INVOCATION_DIR_ENV);
+    let target = std::env::var(WORKER_INVOCATION_TARGET_ENV).ok();
+    match (root, stack, directory, target) {
+        (None, None, None, None) => Ok(runtime),
+        (Some(root), Some(stack), Some(directory), Some(target)) => {
+            if target.len() > 4096 {
+                bail!("worker invocation identity exceeds its byte limit");
+            }
+            let target =
+                serde_json::from_str(&target).context("worker invocation identity is invalid")?;
+            let broker = invocation_broker::FileInvocationBroker::new(
+                PathBuf::from(root),
+                stack,
+                PathBuf::from(directory),
+                target,
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(runtime.with_invocation_broker(Arc::new(broker)))
+        }
+        _ => bail!("worker invocation channel is incomplete"),
     }
 }
 
@@ -660,6 +691,30 @@ enum PermissionName {
     Audio,
     Midi,
     Http,
+    Serve,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ServiceMethod {
+    Get,
+    Head,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl From<ServiceMethod> for HttpMethod {
+    fn from(value: ServiceMethod) -> Self {
+        match value {
+            ServiceMethod::Get => Self::Get,
+            ServiceMethod::Head => Self::Head,
+            ServiceMethod::Post => Self::Post,
+            ServiceMethod::Put => Self::Put,
+            ServiceMethod::Patch => Self::Patch,
+            ServiceMethod::Delete => Self::Delete,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -966,6 +1021,25 @@ enum EngineCommand {
         stack: String,
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// invoke a ready service replica through the authenticated engine
+    Invoke {
+        stack: String,
+        instance: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value_t = ServiceMethod::Get)]
+        method: ServiceMethod,
+        #[arg(long, default_value = "/")]
+        path: String,
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(10..=30_000))]
+        timeout_ms: u64,
         #[arg(long)]
         json: bool,
     },
@@ -1783,6 +1857,65 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
                 }
             } else {
                 println!("{stack} has no published routing state");
+            }
+            Ok(())
+        }
+        EngineCommand::Invoke {
+            stack,
+            instance,
+            root,
+            method,
+            path,
+            headers,
+            body,
+            timeout_ms,
+            json,
+        } => {
+            let mut parsed_headers = BTreeMap::new();
+            let mut normalized = BTreeSet::new();
+            for header in headers {
+                let (name, value) = header
+                    .split_once('=')
+                    .context("headers must use NAME=VALUE")?;
+                if !normalized.insert(name.to_ascii_lowercase())
+                    || parsed_headers.insert(name.into(), value.into()).is_some()
+                {
+                    bail!("duplicate header names are not allowed");
+                }
+            }
+            let request = ServiceRequest {
+                id: hex::encode(rand::random::<[u8; 32]>()),
+                method: method.into(),
+                path,
+                headers: parsed_headers,
+                body: body.into_bytes(),
+            };
+            request.validate().map_err(anyhow::Error::msg)?;
+            let response = daemon_request_with_timeout(
+                &root,
+                DaemonRequest::Invoke {
+                    stack,
+                    instance,
+                    request,
+                    timeout_ms,
+                },
+                Duration::from_millis(timeout_ms.saturating_add(2_000)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let DaemonResponse::Invoked(response) = response else {
+                bail!("engine returned an unexpected response");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                eprintln!("status: {}", response.status);
+                for (name, value) in response.headers {
+                    eprintln!("{name}: {}", terminal_safe(&value));
+                }
+                println!(
+                    "{}",
+                    terminal_safe(&String::from_utf8_lossy(&response.body))
+                );
             }
             Ok(())
         }
@@ -2771,6 +2904,17 @@ struct ActiveStackWorker {
     run_id: String,
     deadline: Instant,
     probe: Option<ActiveProbe>,
+    invocation: Option<PathBuf>,
+}
+
+struct StackWorkerIdentity<'a> {
+    root: &'a Path,
+    stack: &'a str,
+    generation: &'a str,
+    id: &'a ReplicaId,
+    revision: u64,
+    run_id: &'a str,
+    invocation: Option<&'a Path>,
 }
 
 #[derive(Debug)]
@@ -2799,7 +2943,7 @@ impl ActiveStackWorkers {
     fn terminate_all(&mut self) {
         for worker in self.0.values_mut() {
             let _ = worker.child.terminate(TERMINATION_GRACE);
-            cleanup_probe_file(worker);
+            cleanup_worker_channels(worker);
         }
         self.0.clear();
     }
@@ -2812,6 +2956,63 @@ fn cleanup_probe_file(worker: &ActiveStackWorker) {
         && !metadata.file_type().is_symlink()
     {
         let _ = fs::remove_file(&probe.path);
+    }
+}
+
+fn cleanup_worker_channels(worker: &ActiveStackWorker) {
+    cleanup_probe_file(worker);
+    if let Some(directory) = &worker.invocation {
+        cleanup_invocation_directory(directory);
+    }
+}
+
+fn cleanup_invocation_directory(directory: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(directory) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory).and_then(Iterator::collect) else {
+        return;
+    };
+    let entries: Vec<fs::DirEntry> = entries;
+    if entries.len() > cartridge_engine::MAX_INVOCATIONS_PER_REPLICA.saturating_mul(3) {
+        return;
+    }
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return;
+        };
+        let valid = name.get(..64).is_some_and(valid_daemon_instance)
+            && name.get(64..).is_some_and(|suffix| {
+                matches!(suffix, ".request" | ".active" | ".response")
+                    || suffix.starts_with(".pending-")
+                    || suffix.starts_with(".tmp-")
+            });
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            return;
+        };
+        if !valid || metadata.file_type().is_symlink() || !metadata.is_file() {
+            return;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+    let _ = fs::remove_dir(directory);
+    remove_empty_invocation_parent(directory.parent());
+    remove_empty_invocation_parent(directory.parent().and_then(Path::parent));
+}
+
+fn remove_empty_invocation_parent(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_symlink() && metadata.is_dir() {
+        let _ = fs::remove_dir(path);
     }
 }
 
@@ -3116,7 +3317,7 @@ fn supervise_stack(
             };
             if let Some((success, code, detail)) = outcome {
                 let worker = active.0.remove(&id).context("active worker disappeared")?;
-                cleanup_probe_file(&worker);
+                cleanup_worker_channels(&worker);
                 status
                     .mark_exit(&id, &worker.run_id, success, code, detail, now_ms)
                     .map_err(anyhow::Error::msg)?;
@@ -3185,36 +3386,60 @@ fn supervise_stack(
             } else {
                 None
             };
-            match spawn_stack_worker(&executable, template, probe.as_ref(), &run_id) {
-                Ok(child) => {
-                    let has_probe = probe.is_some();
-                    active.0.insert(
-                        id.clone(),
-                        ActiveStackWorker {
-                            child,
-                            run_id: run_id.clone(),
-                            deadline: Instant::now() + WORKER_STARTUP_BUDGET + template.timeout,
-                            probe,
-                        },
-                    );
-                    if !has_probe {
-                        status
-                            .mark_running(&id, &run_id, now_ms)
-                            .map_err(anyhow::Error::msg)?;
-                    }
-                }
-                Err(_) => {
+            let invocation_root = fs::canonicalize(root)
+                .context("could not resolve the engine root for a service worker")?;
+            let invocation = if template.permissions.serve {
+                let invocation_root = &invocation_root;
+                Some(
+                    EngineStore::open(invocation_root)
+                        .map_err(anyhow::Error::msg)?
+                        .replica_invocation_directory(stack, &generation, &id, &run_id)
+                        .map_err(anyhow::Error::msg)?,
+                )
+            } else {
+                None
+            };
+            let identity = StackWorkerIdentity {
+                root: &invocation_root,
+                stack,
+                generation: &generation,
+                id: &id,
+                revision: status.revision,
+                run_id: &run_id,
+                invocation: invocation.as_deref(),
+            };
+            let spawned = spawn_stack_worker(&executable, template, probe.as_ref(), &identity);
+            if let Ok(child) = spawned {
+                let has_probe = probe.is_some();
+                active.0.insert(
+                    id.clone(),
+                    ActiveStackWorker {
+                        child,
+                        run_id: run_id.clone(),
+                        deadline: Instant::now() + WORKER_STARTUP_BUDGET + template.timeout,
+                        probe,
+                        invocation,
+                    },
+                );
+                if !has_probe {
                     status
-                        .mark_exit(
-                            &id,
-                            &run_id,
-                            false,
-                            None,
-                            "worker process could not be started",
-                            now_ms,
-                        )
+                        .mark_running(&id, &run_id, now_ms)
                         .map_err(anyhow::Error::msg)?;
                 }
+            } else {
+                if let Some(directory) = &invocation {
+                    cleanup_invocation_directory(directory);
+                }
+                status
+                    .mark_exit(
+                        &id,
+                        &run_id,
+                        false,
+                        None,
+                        "worker process could not be started",
+                        now_ms,
+                    )
+                    .map_err(anyhow::Error::msg)?;
             }
             persist_runtime_status(root, &status)?;
         }
@@ -3256,7 +3481,7 @@ fn stop_active_workers(
                 .terminate(TERMINATION_GRACE)
                 .context("could not terminate interrupted worker")?
         };
-        cleanup_probe_file(&worker);
+        cleanup_worker_channels(&worker);
         status
             .mark_exit(
                 &id,
@@ -3354,7 +3579,7 @@ fn apply_rollout_drains(
                     .terminate(Duration::from_millis(grace_ms))
                     .context("could not drain rollout worker")?;
             }
-            cleanup_probe_file(&worker);
+            cleanup_worker_channels(&worker);
             status
                 .mark_drained(id, Some(&worker.run_id), observed_at_ms)
                 .map_err(anyhow::Error::msg)?;
@@ -3464,6 +3689,7 @@ fn stack_permissions(instance: &PlannedInstance) -> Permissions {
         audio: instance.allowed.contains(&StackCapability::Audio),
         midi: instance.allowed.contains(&StackCapability::Midi),
         http: instance.allowed.contains(&StackCapability::Http),
+        serve: instance.allowed.contains(&StackCapability::Serve),
     }
 }
 
@@ -3471,7 +3697,7 @@ fn spawn_stack_worker(
     executable: &Path,
     template: &StackWorkerTemplate,
     probe: Option<&ActiveProbe>,
-    run_id: &str,
+    identity: &StackWorkerIdentity<'_>,
 ) -> Result<ContainedChild> {
     let mut arguments = vec![
         OsString::from("__worker-run"),
@@ -3502,7 +3728,25 @@ fn spawn_stack_worker(
         command
             .env(WORKER_PROBE_PATH_ENV, &probe.path)
             .env(WORKER_PROBE_KEY_ENV, probe.key.expose_hex())
-            .env(WORKER_PROBE_RUN_ENV, run_id);
+            .env(WORKER_PROBE_RUN_ENV, identity.run_id);
+    }
+    if let Some(directory) = identity.invocation {
+        let target = cartridge_engine::RouteTarget {
+            instance: identity.id.instance.clone(),
+            ordinal: identity.id.ordinal,
+            revision: identity.revision,
+            generation: identity.generation.into(),
+            run_id: identity.run_id.into(),
+            ready_at_ms: 0,
+        };
+        command
+            .env(WORKER_INVOCATION_ROOT_ENV, identity.root)
+            .env(WORKER_INVOCATION_STACK_ENV, identity.stack)
+            .env(WORKER_INVOCATION_DIR_ENV, directory)
+            .env(
+                WORKER_INVOCATION_TARGET_ENV,
+                serde_json::to_string(&target)?,
+            );
     }
     spawn_contained(&mut command, true).context("could not start the cartridge worker")
 }
@@ -3733,6 +3977,7 @@ fn capability(value: PermissionName) -> Capability {
         PermissionName::Audio => Capability::Audio,
         PermissionName::Midi => Capability::Midi,
         PermissionName::Http => Capability::Http,
+        PermissionName::Serve => Capability::Serve,
     }
 }
 
@@ -5064,10 +5309,11 @@ fn permissions_mask(permissions: &Permissions) -> u16 {
         | (u16::from(permissions.audio) << 5)
         | (u16::from(permissions.midi) << 6)
         | (u16::from(permissions.http) << 7)
+        | (u16::from(permissions.serve) << 8)
 }
 
 fn permissions_from_mask(mask: u16) -> Result<Permissions> {
-    if mask & !0xff != 0 {
+    if mask & !0x1ff != 0 {
         bail!("capability ceiling contains unknown bits");
     }
     Ok(Permissions {
@@ -5079,6 +5325,7 @@ fn permissions_from_mask(mask: u16) -> Result<Permissions> {
         audio: mask & (1 << 5) != 0,
         midi: mask & (1 << 6) != 0,
         http: mask & (1 << 7) != 0,
+        serve: mask & (1 << 8) != 0,
     })
 }
 
@@ -5396,6 +5643,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
         let runtime = configure_health_reporter(runtime)?;
+        let runtime = configure_invocation_broker(runtime)?;
         branch = Some(storage);
         runtime.run(archive, options.args)?
     } else {
@@ -5408,6 +5656,7 @@ fn run_command(options: RunCommandOptions<'_>) -> Result<()> {
         let runtime = apply_permission_ceiling(runtime, options.permission_ceiling);
         let runtime = apply_limit_ceiling(runtime, options.limit_ceiling)?;
         let runtime = configure_health_reporter(runtime)?;
+        let runtime = configure_invocation_broker(runtime)?;
         runtime.run(archive, options.args)?
     };
     println!("{}", terminal_safe(&report.output));

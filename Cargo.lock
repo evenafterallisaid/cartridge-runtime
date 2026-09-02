@@ -220,6 +220,7 @@ dependencies = [
  "command-group",
  "ctrlc",
  "hex",
+ "rand",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -275,6 +276,7 @@ version = "0.1.0"
 dependencies = [
  "cartridge-core",
  "cartridge-desktop",
+ "cartridge-network",
  "chacha20poly1305",
  "fs4",
  "hex",

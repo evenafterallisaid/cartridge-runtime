@@ -1,0 +1,29 @@
+format_version = 1
+name = "service-stack"
+
+[security]
+profile = "strict"
+sandbox = "required"
+
+[[instances]]
+name = "api"
+cartridge = "dev.cartridge.service"
+version = "^0.1"
+replicas = 2
+restart = "on-failure"
+max_restarts = 2
+allow = ["serve"]
+
+[instances.health]
+startup_timeout_ms = 5000
+readiness_timeout_ms = 10000
+liveness_timeout_ms = 1000
+failure_threshold = 2
+
+[instances.limits]
+fuel = 100000000
+memory_bytes = 33554432
+timeout_ms = 30000
+storage_bytes = 1048576
+storage_keys = 1024
+storage_value_bytes = 262144

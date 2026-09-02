@@ -13,7 +13,7 @@ pub use cartridge_media::{
     GraphicsLimits, InputEvent, MidiEvent, ParameterEvent, RealtimeBuffer, RenderedFrame,
     SAMPLE_RATE, Waveform, WindowConfig,
 };
-use cartridge_network::HttpTransport;
+use cartridge_network::{HttpTransport, InvocationBroker};
 pub use cartridge_storage::{
     BLOB_REACHABILITY_FORMAT_VERSION, BlobAuditIssue, BlobAuditReport, BlobGcReport, BlobInfo,
     BlobInventory, BlobReachabilityManifest, BlobReachabilitySource, BlobReachabilitySourceKind,
@@ -71,6 +71,7 @@ pub struct Runtime {
     permission_ceiling: Option<Permissions>,
     limit_ceiling: Option<RuntimeLimits>,
     health_reporter: Option<Arc<dyn HealthReporter>>,
+    invocation_broker: Option<Arc<dyn InvocationBroker>>,
 }
 
 impl Runtime {
@@ -109,6 +110,7 @@ impl Runtime {
             permission_ceiling: None,
             limit_ceiling: None,
             health_reporter: None,
+            invocation_broker: None,
         })
     }
 
@@ -152,6 +154,12 @@ impl Runtime {
     #[must_use]
     pub fn with_health_reporter(mut self, reporter: Arc<dyn HealthReporter>) -> Self {
         self.health_reporter = Some(reporter);
+        self
+    }
+
+    #[must_use]
+    pub fn with_invocation_broker(mut self, broker: Arc<dyn InvocationBroker>) -> Self {
+        self.invocation_broker = Some(broker);
         self
     }
 
@@ -230,6 +238,7 @@ impl Runtime {
             permission_ceiling: self.permission_ceiling.clone(),
             limit_ceiling: self.limit_ceiling.clone(),
             health_reporter: self.health_reporter.clone(),
+            invocation_broker: self.invocation_broker.clone(),
         };
         let run = runtime.execute(archive, args, Some(trace), true)?;
         let snapshot = branch.export_snapshot()?;
@@ -269,6 +278,7 @@ impl Runtime {
         )
         .with_health_reporter(self.health_reporter.clone())
         .with_http_transport(self.http_transport.clone())
+        .with_invocation_broker(self.invocation_broker.clone())
         .with_media_input(&self.input_events, &self.midi_events)
         .map_err(|error| anyhow!(error))?;
         if apply_replay_storage {
@@ -463,6 +473,7 @@ impl Runtime {
             audio: requested.audio && ceiling.audio,
             midi: requested.midi && ceiling.midi,
             http: requested.http && ceiling.http,
+            serve: requested.serve && ceiling.serve,
         }
     }
 

@@ -325,6 +325,7 @@ version = "0.1.0"
 dependencies = [
  "cartridge-core",
  "cartridge-desktop",
+ "cartridge-network",
  "chacha20poly1305",
  "fs4",
  "hex",

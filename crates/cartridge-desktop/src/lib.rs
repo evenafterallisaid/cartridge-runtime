@@ -86,6 +86,7 @@ pub enum Capability {
     Audio,
     Midi,
     Http,
+    Serve,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -782,6 +783,7 @@ fn capabilities(value: &Permissions) -> BTreeSet<Capability> {
         (Capability::Audio, value.audio),
         (Capability::Midi, value.midi),
         (Capability::Http, value.http),
+        (Capability::Serve, value.serve),
     ]
     .into_iter()
     .filter_map(|(name, enabled)| enabled.then_some(name))
@@ -810,6 +812,10 @@ fn permission_row(capability: Capability) -> PermissionRow {
         ),
         Capability::Midi => ("MIDI", "Receive events from approved MIDI devices."),
         Capability::Http => ("HTTP", "Send bounded requests only to declared URL scopes."),
+        Capability::Serve => (
+            "Local service",
+            "Receive bounded requests through the engine.",
+        ),
     };
     PermissionRow {
         capability,
@@ -830,6 +836,7 @@ fn capability_request_digest(value: &BTreeSet<Capability>) -> String {
             Capability::Audio => b"audio".as_slice(),
             Capability::Midi => b"midi".as_slice(),
             Capability::Http => b"http".as_slice(),
+            Capability::Serve => b"serve".as_slice(),
         };
         digest.update((label.len() as u64).to_le_bytes());
         digest.update(label);

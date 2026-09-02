@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use cartridge_network::{ServiceRequest, ServiceResponse};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
@@ -23,7 +24,7 @@ use super::{
     private_options, valid_name, valid_text, validate_health_reports,
 };
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 4;
 pub const DAEMON_ENDPOINT_FILE: &str = "daemon.json";
 pub const MAX_DAEMON_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DAEMON_EVENTS: u16 = 256;
@@ -31,7 +32,7 @@ pub const MAX_DAEMON_SUPERVISORS: u16 = 64;
 const MAX_DAEMON_ENDPOINT_BYTES: u64 = 4096;
 const DAEMON_DIRECTION_REQUEST: &[u8] = b"cartridge-daemon-request-v1";
 const DAEMON_DIRECTION_RESPONSE: &[u8] = b"cartridge-daemon-response-v1";
-const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 static ENDPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +94,12 @@ pub enum DaemonRequest {
     Routes {
         stack: String,
     },
+    Invoke {
+        stack: String,
+        instance: String,
+        request: ServiceRequest,
+        timeout_ms: u64,
+    },
     Events {
         stack: String,
         tail: u16,
@@ -149,6 +156,7 @@ pub enum DaemonResponse {
     Status(StackStatus),
     RuntimeStatus(Option<StackRuntimeStatus>),
     Routes(Option<RoutingSnapshot>),
+    Invoked(ServiceResponse),
     Events(Vec<EngineEvent>),
     Health(Vec<StackHealthReport>),
     Planned(Box<StackPlan>),
@@ -283,6 +291,19 @@ impl DaemonRequest {
             {
                 Ok(())
             }
+            Self::Invoke {
+                stack,
+                instance,
+                request,
+                timeout_ms,
+            } if valid_name(stack)
+                && valid_name(instance)
+                && (cartridge_network::MIN_SERVICE_TIMEOUT_MS
+                    ..=cartridge_network::MAX_SERVICE_TIMEOUT_MS)
+                    .contains(timeout_ms) =>
+            {
+                request.validate()
+            }
             Self::Events { stack, tail }
                 if valid_name(stack) && *tail > 0 && *tail <= MAX_DAEMON_EVENTS =>
             {
@@ -313,6 +334,7 @@ impl DaemonResponse {
             Self::Status(status) => validate_stack_responses(std::slice::from_ref(status)),
             Self::RuntimeStatus(Some(status)) => status.validate(),
             Self::Routes(Some(routes)) => routes.validate(),
+            Self::Invoked(response) => response.validate(),
             Self::Pong
             | Self::ShuttingDown
             | Self::RuntimeStatus(None)

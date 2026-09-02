@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,9 +14,11 @@ use anyhow::{Context, Result, bail};
 use cartridge_desktop::Library;
 use cartridge_engine::{
     DAEMON_PROTOCOL_VERSION, DaemonCodec, DaemonInfo, DaemonLease, DaemonRequest, DaemonResponse,
-    EngineStackState, EngineStore, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES,
-    MAX_DAEMON_SUPERVISORS, MAX_STACK_TOTAL_ACTIVE_REPLICAS, ReplicaPhase, RollingAction,
-    RolloutExecutionPhase, RolloutPhase, RolloutProgress, RolloutRecord, StackPlan, daemon_request,
+    ENGINE_INVOCATION_FORMAT_VERSION, EngineStackState, EngineStore, InvocationRequestEnvelope,
+    InvocationResponseEnvelope, MAX_DAEMON_EVENTS, MAX_DAEMON_FRAME_BYTES, MAX_DAEMON_SUPERVISORS,
+    MAX_INVOCATION_ENVELOPE_BYTES, MAX_INVOCATIONS_PER_REPLICA, MAX_STACK_TOTAL_ACTIVE_REPLICAS,
+    ReplicaPhase, RollingAction, RolloutExecutionPhase, RolloutPhase, RolloutProgress,
+    RolloutRecord, StackPlan, daemon_request,
 };
 
 use crate::process_control::{
@@ -25,7 +28,7 @@ use crate::process_control::{
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 const AUTH_TIMEOUT: Duration = Duration::from_millis(500);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
 const REQUEST_MAX_SKEW_MS: u64 = 30_000;
 const REPLAY_RETENTION_MS: u64 = 60_000;
 const MAX_REPLAY_IDS: usize = 4096;
@@ -35,6 +38,8 @@ const MAX_SUPERVISOR_RETRY_DELAY: Duration = Duration::from_secs(30);
 const SUPERVISOR_STABLE_WINDOW: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const INVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+static INVOCATION_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct ServeOptions<'a> {
     pub root: &'a Path,
@@ -317,6 +322,12 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
                 .routing_snapshot(&stack)
                 .map_err(anyhow::Error::msg)?,
         )),
+        DaemonRequest::Invoke {
+            stack,
+            instance,
+            request,
+            timeout_ms,
+        } => execute_invocation(state, &stack, &instance, &request, timeout_ms),
         DaemonRequest::Events { stack, tail } => {
             let mut events = EngineStore::open(&state.root)
                 .map_err(anyhow::Error::msg)?
@@ -344,6 +355,197 @@ fn execute_request(state: &DaemonState, request: DaemonRequest) -> Result<Daemon
         | DaemonRequest::Remove { .. }) => execute_stack_mutation(state, request),
         DaemonRequest::Shutdown => Ok(DaemonResponse::ShuttingDown),
     }
+}
+
+fn execute_invocation(
+    state: &DaemonState,
+    stack: &str,
+    instance: &str,
+    request: &cartridge_network::ServiceRequest,
+    timeout_ms: u64,
+) -> Result<DaemonResponse> {
+    request.validate().map_err(anyhow::Error::msg)?;
+    let mutation = lock_mutation(state)?;
+    let engine = EngineStore::open(&state.root).map_err(anyhow::Error::msg)?;
+    let routes = engine
+        .publish_routing_snapshot(stack, current_time_ms()?)
+        .map_err(anyhow::Error::msg)?;
+    let mut targets = routes
+        .targets
+        .iter()
+        .filter(|target| target.instance == instance)
+        .cloned()
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        bail!("instance has no ready service replicas");
+    }
+    let offset = usize::from_str_radix(&request.id[..8], 16).unwrap_or(0) % targets.len();
+    targets.rotate_left(offset);
+    let issued_at_ms = current_time_ms()?;
+    let deadline_at_ms = issued_at_ms
+        .checked_add(timeout_ms)
+        .context("invocation deadline overflow")?;
+    let mut selected = None;
+    for target in targets {
+        let directory = engine
+            .invocation_directory(stack, &target)
+            .map_err(anyhow::Error::msg)?;
+        if invocation_entry_count(&directory)? >= MAX_INVOCATIONS_PER_REPLICA {
+            continue;
+        }
+        let envelope = InvocationRequestEnvelope {
+            format_version: ENGINE_INVOCATION_FORMAT_VERSION,
+            stack: stack.into(),
+            routing_epoch: routes.routing_epoch.clone(),
+            routing_sequence: routes.sequence,
+            target: target.clone(),
+            issued_at_ms,
+            deadline_at_ms,
+            request: request.clone(),
+        };
+        envelope.validate().map_err(anyhow::Error::msg)?;
+        let request_path = directory.join(format!("{}.request", request.id));
+        match write_invocation_new(&request_path, &serde_json::to_vec(&envelope)?) {
+            Ok(()) => {
+                selected = Some((target, directory, request_path));
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("could not publish invocation request"),
+        }
+    }
+    drop(engine);
+    drop(mutation);
+    let (target, directory, request_path) =
+        selected.context("all ready service replicas are busy")?;
+    let active_path = directory.join(format!("{}.active", request.id));
+    let response_path = directory.join(format!("{}.response", request.id));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let result = (|| -> Result<DaemonResponse> {
+        loop {
+            if state.stopping.load(Ordering::Acquire) {
+                break Err(anyhow::anyhow!("engine daemon is shutting down"));
+            }
+            if response_path.exists() {
+                let bytes = read_invocation_file(&response_path)?;
+                let envelope: InvocationResponseEnvelope = serde_json::from_slice(&bytes)?;
+                envelope.validate().map_err(anyhow::Error::msg)?;
+                if envelope.stack != stack
+                    || envelope.target != target
+                    || envelope.request_id != request.id
+                    || envelope.responded_at_ms > deadline_at_ms
+                {
+                    break Err(anyhow::anyhow!("invocation response identity is invalid"));
+                }
+                break Ok(DaemonResponse::Invoked(envelope.response));
+            }
+            if Instant::now() >= deadline {
+                break Err(anyhow::anyhow!("service invocation timed out"));
+            }
+            if !EngineStore::open(&state.root)
+                .map_err(anyhow::Error::msg)?
+                .route_target_is_ready(stack, &target)
+                .map_err(anyhow::Error::msg)?
+            {
+                break Err(anyhow::anyhow!("service route changed during invocation"));
+            }
+            thread::sleep(
+                INVOCATION_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    })();
+    let cleanup = remove_invocation_file(&request_path)
+        .and(remove_invocation_file(&active_path))
+        .and(remove_invocation_file(&response_path));
+    cleanup.and(result)
+}
+
+fn invocation_entry_count(directory: &Path) -> Result<usize> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("invocation channel directory is unsafe");
+    }
+    let entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    if entries.len() > MAX_INVOCATIONS_PER_REPLICA.saturating_mul(3) {
+        bail!("invocation channel entry limit exceeded");
+    }
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".request") || name.ends_with(".active"))
+        })
+        .count())
+}
+
+fn write_invocation_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_INVOCATION_ENVELOPE_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invocation envelope exceeds its limit",
+        ));
+    }
+    if path.exists() {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "invocation already exists",
+        ));
+    }
+    let sequence = INVOCATION_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("pending-{}-{sequence}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_invocation_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_INVOCATION_ENVELOPE_BYTES
+    {
+        bail!("invocation response is not a bounded regular file");
+    }
+    let capacity = usize::try_from(metadata.len()).context("invocation response size overflow")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)?
+        .take(MAX_INVOCATION_ENVELOPE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INVOCATION_ENVELOPE_BYTES {
+        bail!("invocation response exceeded its limit while reading");
+    }
+    Ok(bytes)
+}
+
+fn remove_invocation_file(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("invocation cleanup path is unsafe");
+    }
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 fn execute_stack_mutation(state: &DaemonState, request: DaemonRequest) -> Result<DaemonResponse> {

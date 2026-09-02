@@ -1,0 +1,27 @@
+format_version = 1
+
+[cartridge]
+id = "dev.cartridge.service"
+name = "Service Cartridge"
+version = "0.1.0"
+description = "bounded local service example"
+
+[permissions]
+serve = true
+
+[compatibility]
+host_api = "^0.4"
+
+[compatibility.capabilities]
+serve = "^1"
+
+[runtime]
+fuel = 100000000
+memory_bytes = 33554432
+timeout_ms = 30000
+storage_bytes = 1048576
+storage_keys = 1024
+storage_value_bytes = 262144
+
+[state]
+schema = 0

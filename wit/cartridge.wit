@@ -80,6 +80,20 @@ interface host {
         body: list<u8>,
     }
 
+    record service-request {
+        id: string,
+        method: http-method,
+        path: string,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
+    record service-response {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
     log: func(level: log-level, message: string);
     health-report: func(state: health-state, detail: string);
     wall-clock-ms: func() -> result<u64, string>;
@@ -100,6 +114,8 @@ interface host {
     audio-render: func(document: list<u8>) -> result<audio-receipt, string>;
     midi-next: func() -> result<option<list<u8>>, string>;
     http-fetch: func(request: http-request) -> result<http-response, string>;
+    serve-next: func(timeout-ms: u64) -> result<option<service-request>, string>;
+    serve-respond: func(request-id: string, response: service-response) -> result<_, string>;
 }
 world cartridge {
     import host;

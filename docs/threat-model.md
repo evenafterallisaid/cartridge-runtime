@@ -36,6 +36,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 8. Peer mesh: X25519 identities derive authenticated session keys; sequence numbers and AEAD reject forgery and replay.
 9. Local engine control: a private random per-boot capability authenticates bounded encrypted loopback frames; instance ids, request ids, freshness checks, replay state, mutation serialization, and daemon leases prevent cross-generation or replayed control.
 10. Routing membership: ingress consumers must use the authenticated daemon response, which recomputes membership from desired state, rollout progress, and generation-scoped runtime health before returning a bounded snapshot.
+11. Local invocation: authenticated callers submit bounded records to a permission-gated ready run; both daemon and worker revalidate the exact generation, ordinal, run id, and readiness identity, while deadlines and queue limits bound abandoned work.
 
 ## Main defenses
 
@@ -59,6 +60,7 @@ The last adversary is partially outside the portable boundary. Content hashes de
 - A guest is authoritative about its own semantic readiness and can lie; probes prevent accidental or failed applications from being promoted, not a malicious workload from claiming health. Another process already running as the same user may deny service to the ephemeral probe path, but cannot forge an accepted signal without the per-run key. Native per-worker authority isolation remains the stronger boundary.
 - Rollout checkpoints are mutable recovery state, not the source of desired-state truth. Activation and rollback must be adjacent immutable journal events, active transactions fence other mutations, and any checkpoint/journal divergence outside the two recognized crash windows fails closed.
 - Routing snapshots are derived mutable state, not authority. They are checksummed and fenced by a random epoch plus monotonic sequence, but a same-user process can still deny service by replacing them. Stale, changed, non-regular, or state-divergent snapshots fail closed; the daemon repairs regular-file corruption into a new epoch.
+- Invocation mailboxes are private, ephemeral engine state rather than a confidentiality boundary against another process already running as the same user. A same-user process can inspect or deny them; exact target checks and response correlation prevent such files from granting a cartridge broader host authority.
 - The reference HTTP transport is offline fixtures. A production live adapter must defend DNS rebinding, proxy confusion, redirect scope changes, TLS policy, and connection pooling separately.
 - Canonical CPU rendering is deterministic; native GPU presentation is not claimed byte-identical across drivers.
 - Local state and trace files are integrity-protected where documented but not generally encrypted at rest.

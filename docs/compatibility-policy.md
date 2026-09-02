@@ -1,6 +1,6 @@
 # Compatibility policy
 
-The repository is still pre-1.0. Package container format `1` and the `cartridge:api@0.4.0` guest API are development formats until the 1.0 freeze; changes before that freeze must still preserve the checked-in compatibility corpus or ship an explicit migration. The additive health-report host function keeps components importing the earlier 0.4 interface subset runnable, while older runtimes are not expected to run newly built health-reporting components.
+The repository is still pre-1.0. Package container format `1` and the `cartridge:api@0.4.0` guest API are development formats until the 1.0 freeze; changes before that freeze must still preserve the checked-in compatibility corpus or ship an explicit migration. The additive health-report and local-service host functions keep components importing the earlier 0.4 interface subset runnable, while older runtimes are not expected to run newly built components that import those functions.
 
 Engine plan format 4 adds plan-bound rolling policy. The reader preserves format 2 only when application health and rolling policy are absent, and format 3 only when rolling policy is absent. Default rolling fields are omitted from canonical serialization so legacy plan hashes remain verifiable.
 

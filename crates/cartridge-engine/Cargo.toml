@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 cartridge-core = { path = "../cartridge-core" }
 cartridge-desktop = { path = "../cartridge-desktop" }
+cartridge-network = { path = "../cartridge-network" }
 chacha20poly1305.workspace = true
 fs4 = "1.1.0"
 hex.workspace = true

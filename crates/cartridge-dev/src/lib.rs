@@ -349,6 +349,7 @@ fn permission_names(value: &Permissions) -> Vec<String> {
         ("audio", value.audio),
         ("midi", value.midi),
         ("http", value.http),
+        ("serve", value.serve),
     ]
     .into_iter()
     .filter(|(_, enabled)| *enabled)

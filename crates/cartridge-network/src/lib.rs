@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    time::Duration,
+};
 
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -15,6 +18,11 @@ pub const MAX_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 128;
 pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_SERVICE_REQUEST_BYTES: usize = 256 * 1024;
+pub const MAX_SERVICE_RESPONSE_BYTES: usize = 256 * 1024;
+pub const MAX_SERVICE_PATH_BYTES: usize = 8192;
+pub const MIN_SERVICE_TIMEOUT_MS: u64 = 10;
+pub const MAX_SERVICE_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_HTTP_SCOPES: usize = 128;
 pub const MAX_FIXTURES: usize = 4096;
 pub const MAX_CHANNEL_MESSAGES: usize = 4096;
@@ -185,6 +193,59 @@ pub struct HttpResponse {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRequest {
+    pub id: String,
+    pub method: HttpMethod,
+    pub path: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body: Vec<u8>,
+}
+
+impl ServiceRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.len() != 64
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("service request identity is invalid".into());
+        }
+        if !valid_service_path(&self.path) || self.body.len() > MAX_SERVICE_REQUEST_BYTES {
+            return Err("service request exceeds its limits".into());
+        }
+        validate_headers(&self.headers)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceResponse {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body: Vec<u8>,
+}
+
+impl ServiceResponse {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(100..=599).contains(&self.status) || self.body.len() > MAX_SERVICE_RESPONSE_BYTES {
+            return Err("service response exceeds its limits".into());
+        }
+        validate_headers(&self.headers)
+    }
+}
+
+pub trait InvocationBroker: Send + Sync + std::fmt::Debug {
+    fn receive(&self, timeout: Duration) -> Result<Option<ServiceRequest>, String>;
+    fn respond(&self, request_id: &str, response: &ServiceResponse) -> Result<(), String>;
 }
 
 pub trait HttpTransport: Send + Sync + std::fmt::Debug {
@@ -790,6 +851,25 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), String> {
     }
     Ok(())
 }
+fn valid_service_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > MAX_SERVICE_PATH_BYTES
+        || !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains('\\')
+        || path.contains('#')
+        || path.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
+        return false;
+    }
+    path.split('?')
+        .next()
+        .is_some_and(|value| value.split('/').all(|part| part != "." && part != ".."))
+}
 fn path_prefix_matches(prefix: &str, path: &str) -> bool {
     prefix == "/"
         || path == prefix
@@ -977,5 +1057,47 @@ mod tests {
             config.simulate(packets.clone()).unwrap(),
             config.simulate(packets).unwrap()
         );
+    }
+
+    #[test]
+    fn service_requests_reject_ambiguous_paths_and_host_headers() {
+        let request = ServiceRequest {
+            id: "a".repeat(64),
+            method: HttpMethod::Get,
+            path: "/v1/items?limit=2".into(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        assert!(request.validate().is_ok());
+
+        for path in [
+            "//other-host/path",
+            "/../secret",
+            "/%2e%2e/secret",
+            "/ok#fragment",
+        ] {
+            let mut changed = request.clone();
+            changed.path = path.into();
+            assert!(changed.validate().is_err(), "accepted {path}");
+        }
+
+        let mut changed = request;
+        changed.headers.insert("host".into(), "elsewhere".into());
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn service_responses_are_bounded() {
+        let mut response = ServiceResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: vec![0; MAX_SERVICE_RESPONSE_BYTES],
+        };
+        assert!(response.validate().is_ok());
+        response.body.push(0);
+        assert!(response.validate().is_err());
+        response.body.clear();
+        response.status = 99;
+        assert!(response.validate().is_err());
     }
 }

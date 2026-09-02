@@ -1,5 +1,6 @@
 mod daemon;
 mod health;
+mod invocation;
 mod probe;
 mod rolling;
 mod rollout;
@@ -16,6 +17,10 @@ pub use daemon::{
 pub use health::{
     ENGINE_HEALTH_FORMAT_VERSION, MAX_ENGINE_HEALTH_REPORTS, SUPERVISOR_STALE_AFTER_MS,
     StackHealthReport, StackHealthState, validate_health_reports,
+};
+pub use invocation::{
+    ENGINE_INVOCATION_FORMAT_VERSION, InvocationRequestEnvelope, InvocationResponseEnvelope,
+    MAX_INVOCATION_ENVELOPE_BYTES, MAX_INVOCATIONS_PER_REPLICA,
 };
 pub use probe::{
     ENGINE_PROBE_FORMAT_VERSION, MAX_PROBE_ENVELOPE_BYTES, MAX_PROBE_FAILURE_THRESHOLD,
@@ -287,6 +292,7 @@ pub enum StackCapability {
     Audio,
     Midi,
     Http,
+    Serve,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1840,6 +1846,7 @@ fn capabilities(manifest: &PackageManifest) -> BTreeSet<StackCapability> {
         (value.audio, StackCapability::Audio),
         (value.midi, StackCapability::Midi),
         (!manifest.http.scopes.is_empty(), StackCapability::Http),
+        (manifest.permissions.serve, StackCapability::Serve),
     ]
     .into_iter()
     .filter_map(|(enabled, capability)| enabled.then_some(capability))
