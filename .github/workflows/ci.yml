@@ -226,7 +226,7 @@ jobs:
           "$binary" engine events hello-stack --root daemon-engine --tail 1 --json | grep '"revision": 1'
           "$binary" engine apply tests/fixtures/Cartridge.service.stack.toml --root daemon-engine --json | grep '"state": "applied"'
           "$binary" engine wait service-stack --root daemon-engine --timeout-ms 15000 --json | grep '"state": "healthy"'
-          "$binary" engine invoke service-stack api --root daemon-engine --path /health --timeout-ms 5000 | grep 'GET /health'
+          MSYS2_ARG_CONV_EXCL='*' "$binary" engine invoke service-stack api --root daemon-engine --path /health --timeout-ms 5000 | grep 'GET /health'
           "$binary" engine stop service-stack --root daemon-engine
           "$binary" engine remove service-stack --root daemon-engine
           "$binary" engine stop hello-stack --root daemon-engine
