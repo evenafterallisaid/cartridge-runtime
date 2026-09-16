@@ -28,4 +28,4 @@ The worker still has no ambient TCP, UDP, DNS, directory, environment, terminal,
 
 The engine-root files are private to the current user, but they do not protect against another process already running as that user. Such a process can inspect or deny the mailbox just as it can interfere with other mutable engine state. Native restricted-token/AppContainer and Unix authority sandboxes remain the release boundary that narrows this same-user risk.
 
-This slice does not open an HTTP listener, terminate TLS, accept remote traffic, provide rate-limit policy, stream bodies, or connect one cartridge's declared WIT service edge to another. Those layers must reuse this ready-only, deadline-bound handoff rather than granting raw sockets.
+The [loopback HTTP gateway](http-ingress.md) reuses this handoff for authenticated local API clients. TLS, remote traffic, rate-limit policy, streaming bodies, and declared WIT service edges remain future layers.

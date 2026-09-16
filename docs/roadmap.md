@@ -21,6 +21,10 @@ The runtime should be useful for small tools and plugins first, then grow toward
 
 ## Product shape
 
+Latest completed milestone: authenticated foreground loopback HTTP ingress over the ready-only invocation broker. One gateway exposes one instance with a separate bearer token, strict Host/browser checks, bounded clients and framing, absolute I/O deadlines, and cross-platform end-to-end coverage. See [HTTP ingress](http-ingress.md).
+
+Next: persist declared ingress policy in exact stack plans, let the daemon own listener lifecycle across apply/stop/rollback, and make listener conflicts and authentication rotation visible to operators. Then wire declared cartridge-to-cartridge service edges with caller/provider authority separation. Browser sessions, streaming, remote TLS, and per-route rate limits follow explicit policy support.
+
 The mature project will contain several related products that share the same formats and APIs:
 
 ```text
@@ -1027,7 +1031,7 @@ The next concrete sequence is:
    - [implemented] persist bounded checksummed topology, per-ordinal start/drain intent, monotonic action sequences, and progress timestamps in crash-recoverable rollout checkpoints
    - [implemented] authorize exact old and candidate generations concurrently with separate supervisor leases, runtime status, probe roots, and generation-keyed mutable state
    - [implemented] translate scheduler actions into daemon-owned candidate starts and graceful previous-generation drains, then recover in-flight ownership after daemon failure
-   - [implemented: local membership and invocation plane] publish bounded epoch- and sequence-fenced ready-only targets, remove old replicas before drain intent becomes supervisor-visible, and deliver permission-gated deadline-bound requests to exact ready runs; the network ingress proxy remains
+   - [implemented: local membership and invocation plane] publish bounded epoch- and sequence-fenced ready-only targets, remove old replicas before drain intent becomes supervisor-visible, and deliver permission-gated deadline-bound requests to exact ready runs; a foreground authenticated loopback HTTP gateway reuses it; daemon-owned declared ingress remains
    - add deterministic canary rollout stages without widening package authority:
      - bind stable cohort selection and route weight to stack, rollout, generation, instance, and ordinal identities
      - persist bounded observation windows with authenticated metric/trace provenance, missing-data policy, and explicit pass/fail thresholds

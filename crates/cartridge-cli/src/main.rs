@@ -1,5 +1,6 @@
 mod capsule;
 mod engine_daemon;
+mod ingress;
 mod invocation_broker;
 mod migration_receipt;
 mod process_control;
@@ -1024,6 +1025,19 @@ enum EngineCommand {
         #[arg(long)]
         json: bool,
     },
+    /// expose one service on authenticated loopback HTTP
+    Ingress {
+        stack: String,
+        instance: String,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(10..=30_000))]
+        timeout_ms: u64,
+    },
     /// invoke a ready service replica through the authenticated engine
     Invoke {
         stack: String,
@@ -1860,6 +1874,14 @@ fn run_engine_command(command: EngineCommand) -> Result<()> {
             }
             Ok(())
         }
+        EngineCommand::Ingress {
+            stack,
+            instance,
+            root,
+            token_file,
+            port,
+            timeout_ms,
+        } => ingress::serve(&root, &stack, &instance, &token_file, port, timeout_ms),
         EngineCommand::Invoke {
             stack,
             instance,
