@@ -1,5 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as nativeInvoke, isTauri } from "@tauri-apps/api/core";
 import "./style.css";
+
+const preview = import.meta.env.DEV && !isTauri() && new URLSearchParams(location.search).get("preview") === "1";
+async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (preview) return (await import("./preview")).previewInvoke(command, args) as T;
+  return nativeInvoke<T>(command, args);
+}
 
 const MAX_STACK_BYTES = 1024 * 1024;
 
@@ -220,6 +226,16 @@ let settings: AppSettings = defaultSettings;
 let settingsQueue: Promise<void> = Promise.resolve();
 let bannerDismissed = false;
 let inspectorRequest = 0;
+let liveUpdates = true;
+let stackSort: "name" | "replicas" | "revision" = "name";
+let pinnedOnly = false;
+const pinnedStacks = new Set<string>();
+try {
+  const saved: unknown = JSON.parse(localStorage.getItem("cartridge.pins") ?? "[]");
+  if (Array.isArray(saved)) saved.slice(0, 256).forEach((name) => {
+    if (typeof name === "string" && name.length <= 128) pinnedStacks.add(name);
+  });
+} catch { /* local preferences are optional */ }
 
 function required<T extends HTMLElement>(id: string): T {
   const value = document.getElementById(id);
@@ -473,7 +489,7 @@ function updateSettings(patch: Partial<AppSettings>): void {
   const next = { ...settings, ...patch };
   settings = next;
   applySettings();
-  renderSettings();
+  render();
   settingsQueue = settingsQueue.then(async () => {
     await invoke<AppSettings>("save_settings", { settings: next });
   }).catch((error) => showNotice(String(error), "error"));
@@ -491,11 +507,13 @@ function renderStacks(): void {
   const stacks = dashboard.stacks.filter((stack) => {
     const matchesQuery = stack.stack.toLowerCase().includes(normalized);
     const matchesState = stackFilter === "all" || stack.state === stackFilter;
-    return matchesQuery && matchesState;
-  });
+    return matchesQuery && matchesState && (!pinnedOnly || pinnedStacks.has(stack.stack));
+  }).sort((a, b) => Number(pinnedStacks.has(b.stack)) - Number(pinnedStacks.has(a.stack))
+    || (stackSort === "replicas" ? b.desired_replicas - a.desired_replicas : stackSort === "revision" ? b.revision - a.revision : 0)
+    || a.stack.localeCompare(b.stack));
   const shell = tableShell();
   shell.prepend(stackToolbar());
-  const table = element("table", "data-table");
+  const table = element("table", "data-table stack-table");
   table.append(tableHead(["Name", "Status", "Instances", "Desired replicas", "Revision", "Plan", ""]));
   const body = element("tbody");
   for (const stack of stacks) body.append(stackRow(stack));
@@ -510,7 +528,25 @@ function renderStacks(): void {
       "stack",
     ));
   }
-  content.replaceChildren(shell);
+  content.replaceChildren(workloadOverview(), shell);
+}
+
+function workloadOverview(): HTMLElement {
+  const overview = element("section", "workload-overview");
+  overview.setAttribute("aria-label", "Workspace summary");
+  const active = dashboard.stacks.filter((stack) => stack.state === "applied");
+  const metrics: Array<[string, string, string]> = [
+    ["Applied stacks", String(active.length), "Desired state · not a health check"],
+    ["Desired replicas", String(active.reduce((sum, stack) => sum + stack.desired_replicas, 0)), "Across applied stacks"],
+    ["Installed packages", String(dashboard.packages.length), "Ready in your local library"],
+    ["Supervisor capacity", dashboard.engine.info ? `${dashboard.engine.info.active_supervisors} / ${dashboard.engine.info.max_supervisors}` : "—", dashboard.engine.state === "online" ? "Engine connected" : "Engine unavailable"],
+  ];
+  for (const [label, value, detail] of metrics) {
+    const card = element("div", "overview-card");
+    card.append(element("span", "overview-label", label), element("strong", undefined, value), element("small", undefined, detail));
+    overview.append(card);
+  }
+  return overview;
 }
 
 function stackToolbar(): HTMLElement {
@@ -525,6 +561,7 @@ function stackToolbar(): HTMLElement {
   for (const [value, label, count] of counts) {
     const button = element("button", value === stackFilter ? "active" : "");
     button.type = "button";
+    button.setAttribute("aria-pressed", String(value === stackFilter));
     button.append(document.createTextNode(label), element("b", undefined, String(count)));
     button.addEventListener("click", () => {
       stackFilter = value;
@@ -532,8 +569,18 @@ function stackToolbar(): HTMLElement {
     });
     tabs.append(button);
   }
-  const summary = element("span", "table-summary", `${dashboard.stacks.length} total`);
-  toolbar.append(tabs, summary);
+  const controls = element("div", "workload-controls");
+  const pins = element("button", `button compact-button${pinnedOnly ? " selected" : ""}`, "Pinned");
+  pins.setAttribute("aria-pressed", String(pinnedOnly));
+  pins.addEventListener("click", () => { pinnedOnly = !pinnedOnly; renderStacks(); });
+  const sort = selectControl([["name", "Name A–Z"], ["replicas", "Most replicas"], ["revision", "Latest revision"]] as const, stackSort, (value) => { stackSort = value; renderStacks(); });
+  sort.setAttribute("aria-label", "Sort stacks");
+  const live = element("button", `button compact-button${liveUpdates ? " live" : ""}`, liveUpdates ? "● Live" : "Resume updates");
+  live.setAttribute("aria-pressed", String(liveUpdates));
+  live.title = "Refresh stack data every five seconds";
+  live.addEventListener("click", () => { liveUpdates = !liveUpdates; renderStacks(); if (liveUpdates) void refresh(); });
+  controls.append(pins, sort, live);
+  toolbar.append(tabs, controls);
   return toolbar;
 }
 
@@ -554,7 +601,10 @@ function stackRow(stack: StackStatus): HTMLTableRowElement {
   row.tabIndex = 0;
   row.addEventListener("click", () => void showStack(stack));
   row.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") void showStack(stack);
+    if (event.target === row && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      void showStack(stack);
+    }
   });
   const name = element("td");
   const identity = element("div", "primary-cell");
@@ -578,9 +628,37 @@ function stackRow(stack: StackStatus): HTMLTableRowElement {
     event.stopPropagation();
     void showStack(stack);
   });
-  actions.append(menu);
+  const group = element("div", "row-actions");
+  const pin = element("button", `row-menu pin-button${pinnedStacks.has(stack.stack) ? " pinned" : ""}`, pinnedStacks.has(stack.stack) ? "★" : "☆");
+  pin.setAttribute("aria-label", `${pinnedStacks.has(stack.stack) ? "Unpin" : "Pin"} ${stack.stack}`);
+  pin.setAttribute("aria-pressed", String(pinnedStacks.has(stack.stack)));
+  pin.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (pinnedStacks.has(stack.stack)) pinnedStacks.delete(stack.stack);
+    else if (pinnedStacks.size < 256) pinnedStacks.add(stack.stack);
+    try { localStorage.setItem("cartridge.pins", JSON.stringify([...pinnedStacks])); } catch { showNotice("Pins could not be saved on this device.", "error"); }
+    renderStacks();
+  });
+  group.append(pin);
+  if (stack.state === "applied") {
+    const stop = element("button", "row-menu", "■");
+    stop.setAttribute("aria-label", `Stop ${stack.stack}`);
+    stop.title = "Stop stack";
+    stop.disabled = mutating || dashboard.engine.state !== "online";
+    stop.addEventListener("click", (event) => { event.stopPropagation(); void stopFromRow(stack.stack); });
+    group.append(stop);
+  }
+  group.append(menu);
+  actions.append(group);
   row.append(actions);
   return row;
+}
+
+async function stopFromRow(stack: string): Promise<void> {
+  if (mutating || confirmDialog.open) return;
+  if (await confirmAction(`Stop ${stack}?`, "Running replicas will be stopped. Installed packages and retained state are kept.", "Stop stack")) {
+    await mutateStack("stop_stack", stack);
+  }
 }
 
 function statusBadge(state: StackState): HTMLElement {
@@ -1195,6 +1273,7 @@ async function mutateStack(command: "stop_stack" | "remove_stack", stack: string
 }
 
 function confirmAction(heading: string, copy: string, action: string): Promise<boolean> {
+  confirmDialog.returnValue = "cancel";
   required<HTMLElement>("confirm-title").textContent = heading;
   required<HTMLElement>("confirm-copy").textContent = copy;
   required<HTMLElement>("confirm-button").textContent = action;
@@ -1233,9 +1312,9 @@ search.addEventListener("input", () => {
 document.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
-    search.focus();
+    openCommandPalette();
   }
-  if (event.key === "Escape" && inspector.classList.contains("open")) closeInspector();
+  if (event.key === "Escape" && !document.querySelector("dialog[open]") && inspector.classList.contains("open")) closeInspector();
 });
 
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -1255,5 +1334,58 @@ async function initialize(): Promise<void> {
 void initialize();
 
 window.setInterval(() => {
-  if (!document.hidden && currentView === "stacks" && !mutating && !refreshing) void refresh();
+  if (!document.hidden && liveUpdates && currentView === "stacks" && !mutating && !refreshing && !document.querySelector("dialog[open]") && !content.contains(document.activeElement)) void refresh();
 }, 5000);
+
+function openCommandPalette(): void {
+  if (document.querySelector("dialog[open]")) return;
+  const dialog = element("dialog", "command-palette");
+  dialog.setAttribute("aria-label", "Quick actions and navigation");
+  const input = element("input", "command-input");
+  input.placeholder = "Search actions, stacks, packages…";
+  input.setAttribute("aria-label", "Search commands");
+  const results = element("div", "command-results");
+  const actions: Array<{ label: string; detail: string; run: () => void }> = [
+    ...(["stacks", "library", "resources", "activity", "settings"] as View[]).map((view) => ({ label: `Go to ${view}`, detail: "Navigate", run: () => switchView(view) })),
+    { label: "Create stack", detail: "Import manifest", run: () => fileInput.click() },
+    { label: "Import package", detail: "Local .cartridge file", run: () => void importPackage() },
+    { label: "Refresh workspace", detail: "Read engine state", run: () => void refresh() },
+    { label: "Toggle light / dark theme", detail: "Appearance", run: () => updateSettings({ theme: document.documentElement.dataset.theme === "dark" ? "light" : "dark" }) },
+    ...dashboard.stacks.map((stack) => ({ label: stack.stack, detail: `Stack · ${stack.state}`, run: () => { switchView("stacks"); void showStack(stack); } })),
+    ...dashboard.packages.map((entry) => ({ label: entry.name, detail: entry.cartridge_id, run: () => { switchView("library"); void showPackage(entry); } })),
+  ];
+  const draw = () => {
+    results.replaceChildren();
+    for (const action of actions.filter((item) => `${item.label} ${item.detail}`.toLowerCase().includes(input.value.toLowerCase())).slice(0, 30)) {
+      const button = element("button", "command-result");
+      button.append(element("strong", undefined, action.label), element("span", undefined, action.detail));
+      button.addEventListener("click", () => { dialog.close(); action.run(); });
+      results.append(button);
+    }
+    if (!results.children.length) results.append(element("p", "command-empty", "No matches. Try a stack name or an action."));
+  };
+  input.addEventListener("input", draw);
+  dialog.addEventListener("keydown", (event) => {
+    const buttons = [...results.querySelectorAll("button")];
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const next = event.key === "ArrowDown" ? index + 1 : index < 0 ? buttons.length - 1 : index - 1;
+      buttons[(next + buttons.length) % buttons.length]?.focus();
+    }
+    if (event.key === "Enter" && event.target === input) { event.preventDefault(); buttons[0]?.click(); }
+  });
+  const previous = document.activeElement as HTMLElement | null;
+  dialog.addEventListener("close", () => { dialog.remove(); previous?.focus(); }, { once: true });
+  dialog.append(input, results, element("footer", undefined, "↑ ↓ navigate   ↵ open   esc close"));
+  document.body.append(dialog);
+  draw();
+  dialog.showModal();
+  input.focus();
+}
+
+const commandButton = element("button", "button compact-button command-trigger", "Quick actions");
+commandButton.title = "Quick actions (Ctrl / ⌘ K)";
+commandButton.addEventListener("click", openCommandPalette);
+document.querySelector(".app-bar-actions")?.prepend(commandButton);
+if (preview) document.querySelector(".app-version")!.textContent = "DEMO · sample data";

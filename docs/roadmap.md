@@ -1051,6 +1051,7 @@ The next concrete sequence is:
    - [implemented] private native-backed appearance and new-stack preferences with light/dark/system themes, density, and reduced-motion control
    - [implemented] encrypted authenticated daemon client, fail-closed lifecycle mutations, live engine capacity, and observed per-replica lifecycle inspection
    - [implemented] native `.cartridge` import with bounded exact-byte installation and a re-verified package/version inspector
+   - [implemented] workspace summaries, device-local pins, sorting, confirmed row stop actions, pausable live updates, and keyboard quick actions; restrained glass controls with accessible light/dark themes
    - add package grant/revoke controls, version lifecycle actions, signing/trust inspection, and update comparison
    - add resource charts, semantic plan diff, and secret prompts
    - add live logs, health checks, trace inspection, and rollback controls
