@@ -503,6 +503,8 @@ function applySettings(): void {
 }
 
 function renderStacks(): void {
+  const active = document.activeElement instanceof HTMLElement && content.contains(document.activeElement)
+    ? document.activeElement.dataset.focusKey : undefined;
   const normalized = query.toLowerCase();
   const stacks = dashboard.stacks.filter((stack) => {
     const matchesQuery = stack.stack.toLowerCase().includes(normalized);
@@ -512,7 +514,7 @@ function renderStacks(): void {
     || (stackSort === "replicas" ? b.desired_replicas - a.desired_replicas : stackSort === "revision" ? b.revision - a.revision : 0)
     || a.stack.localeCompare(b.stack));
   const shell = tableShell();
-  shell.prepend(stackToolbar());
+  shell.prepend(stackToolbar(stacks.length));
   const table = element("table", "data-table stack-table");
   table.append(tableHead(["Name", "Status", "Instances", "Desired replicas", "Revision", "Plan", ""]));
   const body = element("tbody");
@@ -520,15 +522,33 @@ function renderStacks(): void {
   table.append(body);
   shell.append(table);
   if (stacks.length === 0) {
-    shell.append(emptyState(
+    const empty = emptyState(
       dashboard.stacks.length === 0 ? "No stacks" : "No matching stacks",
       dashboard.stacks.length === 0
         ? "Create a stack from a Cartridge.stack.toml manifest to record its desired state."
-        : "Try a different search term or status filter.",
+        : "Try a different search term, status, or pinned filter.",
       "stack",
-    ));
+    );
+    if (dashboard.stacks.length > 0) {
+      const clear = element("button", "button secondary", "Clear filters");
+      clear.addEventListener("click", () => {
+        query = "";
+        search.value = "";
+        stackFilter = "all";
+        pinnedOnly = false;
+        renderStacks();
+        search.focus();
+      });
+      empty.append(clear);
+    }
+    shell.append(empty);
   }
   content.replaceChildren(workloadOverview(), shell);
+  if (active) {
+    const controls = [...content.querySelectorAll<HTMLElement>("[data-focus-key]")];
+    (controls.find((control) => control.dataset.focusKey === active)
+      ?? controls.find((control) => control.dataset.focusKey === "pinned-filter"))?.focus({ preventScroll: true });
+  }
 }
 
 function workloadOverview(): HTMLElement {
@@ -549,7 +569,7 @@ function workloadOverview(): HTMLElement {
   return overview;
 }
 
-function stackToolbar(): HTMLElement {
+function stackToolbar(visibleCount: number): HTMLElement {
   const toolbar = element("div", "table-toolbar");
   const tabs = element("div", "filter-tabs");
   const counts: Array<["all" | StackState, string, number]> = [
@@ -561,6 +581,7 @@ function stackToolbar(): HTMLElement {
   for (const [value, label, count] of counts) {
     const button = element("button", value === stackFilter ? "active" : "");
     button.type = "button";
+    button.dataset.focusKey = `filter-${value}`;
     button.setAttribute("aria-pressed", String(value === stackFilter));
     button.append(document.createTextNode(label), element("b", undefined, String(count)));
     button.addEventListener("click", () => {
@@ -571,15 +592,18 @@ function stackToolbar(): HTMLElement {
   }
   const controls = element("div", "workload-controls");
   const pins = element("button", `button compact-button${pinnedOnly ? " selected" : ""}`, "Pinned");
+  pins.dataset.focusKey = "pinned-filter";
   pins.setAttribute("aria-pressed", String(pinnedOnly));
   pins.addEventListener("click", () => { pinnedOnly = !pinnedOnly; renderStacks(); });
-  const sort = selectControl([["name", "Name A–Z"], ["replicas", "Most replicas"], ["revision", "Latest revision"]] as const, stackSort, (value) => { stackSort = value; renderStacks(); });
+  const sort = selectControl([["name", "Name A–Z"], ["replicas", "Most replicas"], ["revision", "Highest revision"]] as const, stackSort, (value) => { stackSort = value; renderStacks(); });
+  sort.dataset.focusKey = "sort-stacks";
   sort.setAttribute("aria-label", "Sort stacks");
   const live = element("button", `button compact-button${liveUpdates ? " live" : ""}`, liveUpdates ? "● Live" : "Resume updates");
+  live.dataset.focusKey = "live-updates";
   live.setAttribute("aria-pressed", String(liveUpdates));
   live.title = "Refresh stack data every five seconds";
   live.addEventListener("click", () => { liveUpdates = !liveUpdates; renderStacks(); if (liveUpdates) void refresh(); });
-  controls.append(pins, sort, live);
+  controls.append(element("span", "table-summary", `${visibleCount} of ${dashboard.stacks.length}`), pins, sort, live);
   toolbar.append(tabs, controls);
   return toolbar;
 }
@@ -630,12 +654,14 @@ function stackRow(stack: StackStatus): HTMLTableRowElement {
   });
   const group = element("div", "row-actions");
   const pin = element("button", `row-menu pin-button${pinnedStacks.has(stack.stack) ? " pinned" : ""}`, pinnedStacks.has(stack.stack) ? "★" : "☆");
+  pin.dataset.focusKey = `pin-${stack.stack}`;
   pin.setAttribute("aria-label", `${pinnedStacks.has(stack.stack) ? "Unpin" : "Pin"} ${stack.stack}`);
   pin.setAttribute("aria-pressed", String(pinnedStacks.has(stack.stack)));
   pin.addEventListener("click", (event) => {
     event.stopPropagation();
     if (pinnedStacks.has(stack.stack)) pinnedStacks.delete(stack.stack);
     else if (pinnedStacks.size < 256) pinnedStacks.add(stack.stack);
+    else { showNotice("You can pin up to 256 stacks. Unpin one before adding another.", "error"); return; }
     try { localStorage.setItem("cartridge.pins", JSON.stringify([...pinnedStacks])); } catch { showNotice("Pins could not be saved on this device.", "error"); }
     renderStacks();
   });
