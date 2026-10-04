@@ -323,7 +323,7 @@ assets = true
         .unwrap();
         let report = crate::CartridgeArchive::verify_asset(&output, "message.txt").unwrap();
 
-        assert!(!packed.integrity.assets_root_sha256.is_empty());
+        assert_ne!(packed.integrity.assets_root_sha256, "");
         assert_eq!(report.bytes, 5);
         assert_eq!(report.path, "message.txt");
         assert_eq!(

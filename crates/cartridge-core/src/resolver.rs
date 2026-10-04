@@ -377,7 +377,10 @@ mod tests {
 
         let plan = resolve_dependencies(&root, &[]).unwrap();
 
-        assert!(plan.resolved.is_empty());
+        assert_eq!(
+            plan.resolved,
+            [] as [crate::resolver::ResolvedDependency; 0]
+        );
         assert_eq!(plan.unavailable_optional.len(), 1);
     }
 

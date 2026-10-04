@@ -1158,6 +1158,9 @@ mod tests {
         value.validate().unwrap();
         assert!(value.migration_plan(0).is_err());
         assert_eq!(value.migration_plan(1).unwrap().steps.len(), 1);
-        assert!(value.migration_plan(2).unwrap().steps.is_empty());
+        assert_eq!(
+            value.migration_plan(2).unwrap().steps,
+            [] as [crate::manifest::StateMigration; 0]
+        );
     }
 }

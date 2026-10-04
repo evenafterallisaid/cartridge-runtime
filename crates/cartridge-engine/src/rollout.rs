@@ -950,7 +950,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(cancelled.phase, RolloutPhase::Cancelled);
-        assert!(engine.events("new-stack").unwrap().is_empty());
+        assert_eq!(
+            engine.events("new-stack").unwrap(),
+            [] as [crate::EngineEvent; 0]
+        );
     }
 
     #[test]

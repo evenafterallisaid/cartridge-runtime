@@ -1379,7 +1379,7 @@ mod tests {
         let reports = reporter.0.lock().unwrap();
         assert_eq!(reports.len(), MAX_HEALTH_REPORTS_PER_RUN as usize);
         assert_eq!(reports[0], (GuestHealthState::Ready, "ready".into()));
-        assert!(state.events.is_empty());
+        assert_eq!(state.events, [] as [cartridge_trace::TraceEvent; 0]);
     }
 
     #[test]
@@ -1479,7 +1479,7 @@ mod tests {
             json!({ "value": "x".repeat(MAX_TRACE_BYTES) }),
         );
 
-        assert!(state.events.is_empty());
+        assert_eq!(state.events, [] as [cartridge_trace::TraceEvent; 0]);
         assert!(matches!(
             state.finish_replay(),
             Err(ReplayError::TraceLimitExceeded { .. })
@@ -1929,7 +1929,10 @@ mod tests {
             replayed.finish_replay(),
             Err(ReplayError::Divergence { .. })
         ));
-        assert!(storage.list("dev.example.host", "").unwrap().is_empty());
+        assert_eq!(
+            storage.list("dev.example.host", "").unwrap(),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(storage.revision("dev.example.host").unwrap(), 0);
     }
 

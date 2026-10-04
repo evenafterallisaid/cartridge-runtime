@@ -582,7 +582,7 @@ mod tests {
         engine.save_runtime_status_for_generation(&status).unwrap();
 
         let waiting = engine.publish_routing_snapshot("demo", 11).unwrap();
-        assert!(waiting.targets.is_empty());
+        assert_eq!(waiting.targets, [] as [crate::routing::RouteTarget; 0]);
         status
             .mark_probe_signal(&id, &run_id, 1, ProbeSignalKind::Ready, 12)
             .unwrap();
@@ -594,12 +594,9 @@ mod tests {
         status.mark_probe_timeout(&id, &run_id, 14).unwrap();
         engine.save_runtime_status_for_generation(&status).unwrap();
         assert!(engine.routing_snapshot("demo").is_err());
-        assert!(
-            engine
-                .publish_routing_snapshot("demo", 15)
-                .unwrap()
-                .targets
-                .is_empty()
+        assert_eq!(
+            engine.publish_routing_snapshot("demo", 15).unwrap().targets,
+            [] as [crate::routing::RouteTarget; 0]
         );
     }
 
@@ -752,7 +749,7 @@ mod tests {
 
         engine.stop("demo").unwrap();
         let stopped = engine.publish_routing_snapshot("demo", 62).unwrap();
-        assert!(stopped.targets.is_empty());
+        assert_eq!(stopped.targets, [] as [crate::routing::RouteTarget; 0]);
         assert_eq!(stopped.sequence, ready.sequence + 1);
         assert_eq!(stopped.routing_epoch, ready.routing_epoch);
     }

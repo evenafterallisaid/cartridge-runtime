@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(action, state.next(policy).unwrap());
         match action {
             RollingAction::StartCandidate { ordinals } => {
-                assert!(!ordinals.is_empty());
+                assert_ne!(ordinals, [] as [u16; 0]);
                 assert!(
                     ordinals
                         .iter()
@@ -463,7 +463,7 @@ mod tests {
                 );
             }
             RollingAction::DrainPrevious { ordinals, .. } => {
-                assert!(!ordinals.is_empty());
+                assert_ne!(ordinals, [] as [u16; 0]);
                 assert!(
                     ordinals
                         .iter()

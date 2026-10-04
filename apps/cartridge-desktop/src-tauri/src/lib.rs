@@ -614,7 +614,7 @@ mod tests {
         let details = load_package_details(&library, &imported.cartridge_id, None).unwrap();
         assert_eq!(details.package_sha256, imported.package_sha256);
         assert_eq!(details.package_bytes, imported.package_bytes);
-        assert!(details.missing.is_empty());
+        assert_eq!(details.missing, [] as [cartridge_desktop::Capability; 0]);
     }
 
     #[test]
@@ -685,7 +685,7 @@ mod tests {
 
         assert_eq!(connection.state, EngineConnectionState::Offline);
         assert!(connection.info.is_none());
-        assert!(stacks.is_empty());
+        assert_eq!(stacks, [] as [cartridge_engine::StackStatus; 0]);
         assert!(!root.join("daemon.json").exists());
     }
 

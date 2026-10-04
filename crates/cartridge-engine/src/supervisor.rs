@@ -756,12 +756,18 @@ mod tests {
                 .unwrap();
             if attempt < 3 {
                 let deadline = status.replicas[0].next_start_at_ms.unwrap();
-                assert!(status.eligible_starts(deadline - 1).is_empty());
+                assert_eq!(
+                    status.eligible_starts(deadline - 1),
+                    [] as [crate::supervisor::ReplicaId; 0]
+                );
                 assert_eq!(status.eligible_starts(deadline), vec![id.clone()]);
             }
         }
         assert_eq!(status.replicas[0].phase, ReplicaPhase::Exhausted);
-        assert!(status.eligible_starts(u64::MAX).is_empty());
+        assert_eq!(
+            status.eligible_starts(u64::MAX),
+            [] as [crate::supervisor::ReplicaId; 0]
+        );
     }
 
     #[test]

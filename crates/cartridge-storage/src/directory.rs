@@ -1161,7 +1161,10 @@ mod tests {
             Err(Error::QuotaExceeded { .. })
         ));
         assert_eq!(storage.revision("dev.example.test").unwrap(), revision);
-        assert!(storage.list("dev.example.test", "").unwrap().is_empty());
+        assert_eq!(
+            storage.list("dev.example.test", "").unwrap(),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(state_files(&namespace).unwrap().len(), 1);
     }
 

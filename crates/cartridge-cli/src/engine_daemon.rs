@@ -222,6 +222,10 @@ fn accept_clients(
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "try_update requires Rust 1.95; retain the declared MSRV"
+)]
 fn reserve_client(active: &AtomicUsize) -> bool {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
