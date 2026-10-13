@@ -221,6 +221,117 @@ const MAX_TRANSITIVE_DEPTH: usize = 64;
 const MAX_GRAPH_NODES: usize = 256;
 const MAX_GRAPH_EDGES: usize = 1024;
 
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EdgeKind {
+    Session,
+    Persistent,
+    PolicyProvided,
+    Revoked,
+}
+
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipGrant {
+    pub caller_instance: String,
+    pub provider_instance: String,
+    pub interfaces: Vec<String>,
+    pub scope: String,
+    pub kind: EdgeKind,
+    pub expiry_ms: Option<u64>,
+    pub approval_generation: u64,
+}
+
+impl RelationshipGrant {
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_alias(&self.caller_instance)
+            || !is_alias(&self.provider_instance)
+            || self.interfaces.is_empty()
+            || self.interfaces.len() > 64
+            || self
+                .interfaces
+                .iter()
+                .any(|i| !is_bounded_text(i, 256, false) || validate_interface(i).is_err())
+            || !is_bounded_text(&self.scope, 256, false)
+        {
+            return Err("relationship grant is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipAuthority {
+    pub format_version: u32,
+    pub grants: Vec<RelationshipGrant>,
+}
+
+impl RelationshipAuthority {
+    pub fn from_graph(graph: &ApprovedGraph, generation: u64) -> Result<Self, String> {
+        let mut grants = Vec::with_capacity(graph.edges.len());
+        for edge in &graph.edges {
+            grants.push(RelationshipGrant {
+                caller_instance: edge.caller_instance.clone(),
+                provider_instance: edge.provider_instance.clone(),
+                interfaces: edge.interfaces.clone(),
+                scope: edge.alias.clone(),
+                kind: EdgeKind::Session,
+                expiry_ms: None,
+                approval_generation: generation,
+            });
+        }
+        let authority = Self {
+            format_version: APPROVED_GRAPH_FORMAT_VERSION,
+            grants,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.format_version != APPROVED_GRAPH_FORMAT_VERSION {
+            return Err("relationship authority format version is invalid".into());
+        }
+        if self.grants.len() > MAX_GRAPH_EDGES {
+            return Err("relationship authority exceeds grant limit".into());
+        }
+        for grant in &self.grants {
+            grant.validate()?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn active_grants_for_caller(&self, caller: &str) -> Vec<&RelationshipGrant> {
+        self.grants
+            .iter()
+            .filter(|g| g.caller_instance == caller && g.kind != EdgeKind::Revoked)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn provider_authority_is_isolated(&self) -> bool {
+        for grant in &self.grants {
+            if grant.kind == EdgeKind::Revoked {
+                continue;
+            }
+            let caller_grants: Vec<_> = self
+                .grants
+                .iter()
+                .filter(|g| g.caller_instance == grant.provider_instance && g.kind != EdgeKind::Revoked)
+                .collect();
+            for caller_grant in caller_grants {
+                if caller_grant.provider_instance == grant.caller_instance {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("dependency cycle detected: {0}")]

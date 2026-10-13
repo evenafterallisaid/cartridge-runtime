@@ -12,6 +12,7 @@ pub use manifest::{
 };
 pub use pack::{PackOptions, pack};
 pub use resolver::{
+    EdgeKind, RelationshipAuthority, RelationshipGrant,
     APPROVED_GRAPH_FORMAT_VERSION, COMPOSITION_LOCK_FORMAT_VERSION, ApprovedGraph,
     CompositionLock, GraphEdge, GraphError, GraphNode, LockedPackage, MAX_RESOLUTION_CANDIDATES,
     ResolutionPlan, ResolveError, ResolvedDependency, UnavailableDependency,
