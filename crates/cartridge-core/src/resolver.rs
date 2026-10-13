@@ -148,6 +148,255 @@ impl CompositionLock {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphNode {
+    pub instance: String,
+    pub cartridge_id: String,
+    pub version: String,
+    pub interfaces: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEdge {
+    pub caller_instance: String,
+    pub provider_instance: String,
+    pub alias: String,
+    pub interfaces: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedGraph {
+    pub format_version: u32,
+    pub root_instance: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub unavailable_optional: Vec<UnavailableDependency>,
+}
+
+impl ApprovedGraph {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.format_version != APPROVED_GRAPH_FORMAT_VERSION {
+            return Err("approved graph format version is invalid".into());
+        }
+        if self.nodes.len() > MAX_GRAPH_NODES || self.edges.len() > MAX_GRAPH_EDGES {
+            return Err("approved graph exceeds node or edge limits".into());
+        }
+        let mut node_instances = BTreeSet::new();
+        for node in &self.nodes {
+            if !is_alias(&node.instance)
+                || !is_cartridge_id(&node.cartridge_id)
+                || !is_bounded_text(&node.version, 64, false)
+                || Version::parse(&node.version).is_err()
+                || !node_instances.insert(node.instance.as_str())
+            {
+                return Err("approved graph node is invalid".into());
+            }
+        }
+        if !node_instances.contains(self.root_instance.as_str()) {
+            return Err("approved graph root instance is missing from nodes".into());
+        }
+        for edge in &self.edges {
+            if !node_instances.contains(edge.caller_instance.as_str())
+                || !node_instances.contains(edge.provider_instance.as_str())
+                || !is_alias(&edge.alias)
+                || edge.interfaces.is_empty()
+                || edge.interfaces.len() > 64
+                || edge
+                    .interfaces
+                    .iter()
+                    .any(|i| !is_bounded_text(i, 256, false) || validate_interface(i).is_err())
+            {
+                return Err("approved graph edge is invalid".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const APPROVED_GRAPH_FORMAT_VERSION: u32 = 1;
+const MAX_TRANSITIVE_DEPTH: usize = 64;
+const MAX_GRAPH_NODES: usize = 256;
+const MAX_GRAPH_EDGES: usize = 1024;
+
+#[derive(Debug, Error)]
+pub enum GraphError {
+    #[error("dependency cycle detected: {0}")]
+    Cycle(String),
+    #[error("transitive dependency depth exceeded {MAX_TRANSITIVE_DEPTH}")]
+    DepthExceeded,
+    #[error("graph node limit exceeded {MAX_GRAPH_NODES}")]
+    NodeLimit,
+    #[error("resolution error: {0}")]
+    Resolution(#[from] ResolveError),
+}
+
+pub fn build_approved_graph(
+    root: &PackageManifest,
+    candidates: &[PackageManifest],
+) -> Result<ApprovedGraph, GraphError> {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut visited = BTreeMap::new();
+    let mut path = BTreeSet::new();
+    let mut unavailable_optional = Vec::new();
+    let mut instance_counts = BTreeMap::new();
+
+    let root_instance = "root".to_string();
+    let root_interfaces: Vec<String> = root
+        .services
+        .provides
+        .iter()
+        .filter(|s| s.visibility != ServiceVisibility::Private)
+        .map(|s| s.interface.clone())
+        .collect();
+    nodes.push(GraphNode {
+        instance: root_instance.clone(),
+        cartridge_id: root.cartridge.id.clone(),
+        version: root.cartridge.version.clone(),
+        interfaces: root_interfaces,
+    });
+    visited.insert(
+        (root.cartridge.id.clone(), root.cartridge.version.clone()),
+        root_instance.clone(),
+    );
+
+    expand_graph(
+        root,
+        &root_instance,
+        candidates,
+        &mut nodes,
+        &mut edges,
+        &mut visited,
+        &mut path,
+        &mut instance_counts,
+        &mut unavailable_optional,
+        0,
+    )?;
+
+    Ok(ApprovedGraph {
+        format_version: APPROVED_GRAPH_FORMAT_VERSION,
+        root_instance,
+        nodes,
+        edges,
+        unavailable_optional,
+    })
+}
+
+fn next_instance_id(cartridge_id: &str, counts: &mut BTreeMap<String, usize>) -> String {
+    let count = counts.entry(cartridge_id.to_string()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        cartridge_id.replace('.', "-")
+    } else {
+        format!("{}-{}", cartridge_id.replace('.', "-"), count)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_graph(
+    manifest: &PackageManifest,
+    parent_instance: &str,
+    candidates: &[PackageManifest],
+    nodes: &mut Vec<GraphNode>,
+    edges: &mut Vec<GraphEdge>,
+    visited: &mut BTreeMap<(String, String), String>,
+    path: &mut BTreeSet<(String, String)>,
+    instance_counts: &mut BTreeMap<String, usize>,
+    unavailable_optional: &mut Vec<UnavailableDependency>,
+    depth: usize,
+) -> Result<(), GraphError> {
+    if depth > MAX_TRANSITIVE_DEPTH {
+        return Err(GraphError::DepthExceeded);
+    }
+    if nodes.len() > MAX_GRAPH_NODES {
+        return Err(GraphError::NodeLimit);
+    }
+
+    let plan = resolve_dependencies(manifest, candidates)?;
+    unavailable_optional.extend(plan.unavailable_optional);
+
+    for dep in &plan.resolved {
+        let key = (dep.cartridge.clone(), dep.version.clone());
+
+        if path.contains(&key) {
+            return Err(GraphError::Cycle(format!(
+                "{} -> {}",
+                parent_instance, dep.alias
+            )));
+        }
+
+        let provider_instance = if let Some(existing) = visited.get(&key) {
+            existing.clone()
+        } else {
+            let major = Version::parse(&dep.version)
+                .map_or(0, |v| v.major);
+            let base = next_instance_id(&dep.cartridge, instance_counts);
+            let inst = if major > 0 {
+                format!("{base}-v{major}")
+            } else {
+                base
+            };
+
+            let provider_manifest = candidates
+                .iter()
+                .find(|c| c.cartridge.id == dep.cartridge && c.cartridge.version == dep.version)
+                .ok_or_else(|| {
+                    GraphError::Resolution(ResolveError::RequiredUnavailable {
+                        alias: dep.alias.clone(),
+                        cartridge: dep.cartridge.clone(),
+                        version: dep.version.clone(),
+                        reason: "provider vanished during graph expansion".into(),
+                    })
+                })?;
+
+            let provided_interfaces: Vec<String> = provider_manifest
+                .services
+                .provides
+                .iter()
+                .filter(|s| s.visibility != ServiceVisibility::Private)
+                .map(|s| s.interface.clone())
+                .collect();
+
+            nodes.push(GraphNode {
+                instance: inst.clone(),
+                cartridge_id: dep.cartridge.clone(),
+                version: dep.version.clone(),
+                interfaces: provided_interfaces,
+            });
+            visited.insert(key.clone(), inst.clone());
+
+            path.insert(key.clone());
+            expand_graph(
+                provider_manifest,
+                &inst,
+                candidates,
+                nodes,
+                edges,
+                visited,
+                path,
+                instance_counts,
+                unavailable_optional,
+                depth + 1,
+            )?;
+            path.remove(&key);
+
+            inst
+        };
+
+        edges.push(GraphEdge {
+            caller_instance: parent_instance.to_string(),
+            provider_instance,
+            alias: dep.alias.clone(),
+            interfaces: dep.interfaces.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 pub fn resolve_dependencies(
     root: &PackageManifest,
     candidates: &[PackageManifest],
